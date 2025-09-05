@@ -39,6 +39,13 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -r --filter=x402 --filter=x402-axios --filter=x402-fetch --filter=x402-express --filter=x402-hono --filter=x402-next run build
 
+      - name: Ensure jq is available
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
       - name: Prepare @payai package.json rewrites (name + nightly version)
         run: |
           set -euo pipefail
@@ -47,43 +54,48 @@ jobs:
           GIT_SHA=$(git rev-parse --short HEAD)
           NIGHTLY_SUFFIX=nightly.$DATE_TAG.$GIT_SHA
 
-          rewrite_pkg() {
+          rewrite_pkg_with_jq() {
             PKG_DIR=$1
             BASE_NAME=$(node -p "require('$PKG_DIR/package.json').name")
             VERSION=$(node -p "require('$PKG_DIR/package.json').version")
-
-            # New scoped name
             NEW_NAME=@payai/$BASE_NAME
-            # Add nightly pre-release (keep semver compatibility)
             NEW_VERSION=${VERSION%-*}-${NIGHTLY_SUFFIX}
 
-            node -e "
-const fs=require('fs');
-const p='$PKG_DIR/package.json';
-const j=JSON.parse(fs.readFileSync(p,'utf8'));
-j.name=''+process.env.NEW_NAME;
-j.version=''+process.env.NEW_VERSION;
-// Update internal deps on x402 to scoped nightly variant
-for (const field of ['dependencies','devDependencies','peerDependencies','optionalDependencies']){
-  if (j[field] && j[field]['x402']){
-    j[field]['@payai/x402']=''+process.env.X402_VERSION;
-    delete j[field]['x402'];
-  }
-}
-fs.writeFileSync(p, JSON.stringify(j, null, 2)+'\n');
-" \
-            NEW_NAME="$NEW_NAME" NEW_VERSION="$NEW_VERSION" X402_VERSION="^$NEW_VERSION"
+            # Prepare temp file for atomic write
+            TMP_FILE=$(mktemp)
+            jq \
+              --arg newName "$NEW_NAME" \
+              --arg newVersion "$NEW_VERSION" \
+              --arg x402Ver "^$CORE_X402_VERSION" \
+              '
+              .name = $newName | .version = $newVersion |
+              (if .dependencies and .dependencies.x402 then .dependencies["@payai/x402"] = $x402Ver | del(.dependencies.x402) else . end) |
+              (if .devDependencies and .devDependencies.x402 then .devDependencies["@payai/x402"] = $x402Ver | del(.devDependencies.x402) else . end) |
+              (if .peerDependencies and .peerDependencies.x402 then .peerDependencies["@payai/x402"] = $x402Ver | del(.peerDependencies.x402) else . end) |
+              (if .optionalDependencies and .optionalDependencies.x402 then .optionalDependencies["@payai/x402"] = $x402Ver | del(.optionalDependencies.x402) else . end)
+              ' "$PKG_DIR/package.json" > "$TMP_FILE"
+            mv "$TMP_FILE" "$PKG_DIR/package.json"
+
+            # Output new version for chaining if needed
+            echo "$NEW_VERSION"
           }
 
           # First rewrite core x402 so others can depend on the version
-          rewrite_pkg "$TS_ROOT/x402"
-          X402_VERSION=$(node -p "require('$TS_ROOT/x402/package.json').version")
+          CORE_BASE_NAME=$(node -p "require('$TS_ROOT/x402/package.json').name")
+          CORE_VERSION=$(node -p "require('$TS_ROOT/x402/package.json').version")
+          CORE_NEW_VERSION=${CORE_VERSION%-*}-${NIGHTLY_SUFFIX}
+          CORE_NEW_NAME=@payai/$CORE_BASE_NAME
+          TMP_FILE=$(mktemp)
+          jq --arg newName "$CORE_NEW_NAME" --arg newVersion "$CORE_NEW_VERSION" '.name = $newName | .version = $newVersion' "$TS_ROOT/x402/package.json" > "$TMP_FILE"
+          mv "$TMP_FILE" "$TS_ROOT/x402/package.json"
+          CORE_X402_VERSION=$CORE_NEW_VERSION
 
+          # Rewrite adapters referencing x402
           for pkg in x402-axios x402-fetch x402-express x402-hono x402-next; do
-            rewrite_pkg "$TS_ROOT/$pkg"
+            rewrite_pkg_with_jq "$TS_ROOT/$pkg" > /dev/null
           done
 
-          echo "Prepared @payai scoped packages with nightly version: $X402_VERSION"
+          echo "Prepared @payai scoped packages with nightly version: $CORE_X402_VERSION"
 
       - name: Rewrite adapter dist imports to @payai/x402
         run: |
@@ -91,7 +103,7 @@ fs.writeFileSync(p, JSON.stringify(j, null, 2)+'\n');
           for pkg in x402-axios x402-fetch x402-express x402-hono x402-next; do
             PKG_DIR=./typescript/packages/$pkg
             # Replace import specifiers in built outputs
-            if compgen -G "$PKG_DIR/dist/**/*.*js" > /dev/null; then
+            if [ -d "$PKG_DIR/dist" ]; then
               find "$PKG_DIR/dist" -type f \( -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.d.ts" -o -name "*.d.mts" -o -name "*.d.cts" \) -print0 | xargs -0 sed -i 's/\"x402\"/\"@payai\/x402\"/g'
               find "$PKG_DIR/dist" -type f \( -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.d.ts" -o -name "*.d.mts" -o -name "*.d.cts" \) -print0 | xargs -0 sed -i "s/'x402'/'@payai\/x402'/g"
             fi
@@ -116,4 +128,3 @@ fs.writeFileSync(p, JSON.stringify(j, null, 2)+'\n');
       - name: Summary
         run: |
           echo "Published nightly @payai packages"
-
