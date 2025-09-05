@@ -1,0 +1,119 @@
+name: Nightly publish @payai TypeScript packages
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  publish-nightly:
+    # Only run from fork under PayAINetwork to avoid publishing from upstream accidentally
+    if: github.repository_owner == 'PayAINetwork'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.PAYAI_NPM_TOKEN }}
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+        with:
+          version: 10.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: "pnpm"
+          cache-dependency-path: ./typescript
+
+      - name: Install and build all TypeScript packages
+        working-directory: ./typescript
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -r --filter=x402 --filter=x402-axios --filter=x402-fetch --filter=x402-express --filter=x402-hono --filter=x402-next run build
+
+      - name: Prepare @payai package.json rewrites (name + nightly version)
+        run: |
+          set -euo pipefail
+          TS_ROOT=./typescript/packages
+          DATE_TAG=$(date -u +%Y%m%d)
+          GIT_SHA=$(git rev-parse --short HEAD)
+          NIGHTLY_SUFFIX=nightly.$DATE_TAG.$GIT_SHA
+
+          rewrite_pkg() {
+            PKG_DIR=$1
+            BASE_NAME=$(node -p "require('$PKG_DIR/package.json').name")
+            VERSION=$(node -p "require('$PKG_DIR/package.json').version")
+
+            # New scoped name
+            NEW_NAME=@payai/$BASE_NAME
+            # Add nightly pre-release (keep semver compatibility)
+            NEW_VERSION=${VERSION%-*}-${NIGHTLY_SUFFIX}
+
+            node -e "
+const fs=require('fs');
+const p='$PKG_DIR/package.json';
+const j=JSON.parse(fs.readFileSync(p,'utf8'));
+j.name=''+process.env.NEW_NAME;
+j.version=''+process.env.NEW_VERSION;
+// Update internal deps on x402 to scoped nightly variant
+for (const field of ['dependencies','devDependencies','peerDependencies','optionalDependencies']){
+  if (j[field] && j[field]['x402']){
+    j[field]['@payai/x402']=''+process.env.X402_VERSION;
+    delete j[field]['x402'];
+  }
+}
+fs.writeFileSync(p, JSON.stringify(j, null, 2)+'\n');
+" \
+            NEW_NAME="$NEW_NAME" NEW_VERSION="$NEW_VERSION" X402_VERSION="^$NEW_VERSION"
+          }
+
+          # First rewrite core x402 so others can depend on the version
+          rewrite_pkg "$TS_ROOT/x402"
+          X402_VERSION=$(node -p "require('$TS_ROOT/x402/package.json').version")
+
+          for pkg in x402-axios x402-fetch x402-express x402-hono x402-next; do
+            rewrite_pkg "$TS_ROOT/$pkg"
+          done
+
+          echo "Prepared @payai scoped packages with nightly version: $X402_VERSION"
+
+      - name: Rewrite adapter dist imports to @payai/x402
+        run: |
+          set -euo pipefail
+          for pkg in x402-axios x402-fetch x402-express x402-hono x402-next; do
+            PKG_DIR=./typescript/packages/$pkg
+            # Replace import specifiers in built outputs
+            if compgen -G "$PKG_DIR/dist/**/*.*js" > /dev/null; then
+              find "$PKG_DIR/dist" -type f \( -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.d.ts" -o -name "*.d.mts" -o -name "*.d.cts" \) -print0 | xargs -0 sed -i 's/\"x402\"/\"@payai\/x402\"/g'
+              find "$PKG_DIR/dist" -type f \( -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.d.ts" -o -name "*.d.mts" -o -name "*.d.cts" \) -print0 | xargs -0 sed -i "s/'x402'/'@payai\/x402'/g"
+            fi
+          done
+
+      - name: Publish @payai/x402 (core)
+        working-directory: ./typescript/packages/x402
+        run: |
+          echo "Publishing $(node -p "require('./package.json').name")@$(node -p "require('./package.json').version")"
+          pnpm publish --provenance --access public --no-git-checks
+
+      - name: Publish @payai adapters
+        run: |
+          set -euo pipefail
+          for pkg in x402-axios x402-fetch x402-express x402-hono x402-next; do
+            pushd ./typescript/packages/$pkg > /dev/null
+            echo "Publishing $(node -p "require('./package.json').name")@$(node -p "require('./package.json').version")"
+            pnpm publish --provenance --access public --no-git-checks
+            popd > /dev/null
+          done
+
+      - name: Summary
+        run: |
+          echo "Published nightly @payai packages"
+
