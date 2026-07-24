@@ -38,7 +38,7 @@ This step packages the x402 logic into a single zip file ready for AWS deploymen
 **1a. Clone the repository**
 
 ```bash
-git clone https://github.com/coinbase/x402.git
+git clone https://github.com/x402-foundation/x402.git
 cd x402/examples/typescript/servers/cloudfront-lambda-edge/lambda
 ```
 
