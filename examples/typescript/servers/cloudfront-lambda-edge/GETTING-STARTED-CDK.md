@@ -21,7 +21,7 @@ This guide deploys the same architecture as the [Console guide](./GETTING-STARTE
   aws sts get-caller-identity  # verify it works
   ```
 - **Node.js 20+** and **pnpm** — verify with `node --version` and `pnpm --version`
-- **Wallet addresses on Base Sepolia and Solana Devnet** — use an Ethereum wallet such as [MetaMask](https://metamask.io) and a Solana wallet. Both networks are testnets — no real money required.
+- **Wallet addresses on Base Sepolia and Solana Devnet** — use an Ethereum wallet such as [MetaMask](https://metamask.io) and a Solana wallet such as [Phantom](https://phantom.com) or [Solflare](https://solflare.com). Both networks are testnets — no real money required.
 
 ---
 
@@ -268,7 +268,7 @@ export const SVM_PAY_TO = 'YourSolanaMainnetWalletAddress';
 export const FACILITATOR_URL = 'https://your-mainnet-facilitator-url';
 ```
 
-Mainnet requires a facilitator that supports your networks. The CDP facilitator supports Base and Solana mainnet and requires CDP API keys; pass its authenticated `facilitatorConfig` through the middleware as described in the [README](./README.md#running-on-mainnet). The [PayAI facilitator](https://facilitator.payai.network) supports both mainnets with no API keys. See the [full facilitator list](../../../../docs/dev-tools/facilitators.md).
+Mainnet requires a facilitator that supports your networks, and each may have different authentication requirements. If yours requires auth, pass its `facilitatorConfig` through the middleware as described in the [README](./README.md#running-on-mainnet). Browse available facilitators at the [x402 Ecosystem — Facilitators](https://www.x402.org/ecosystem?filter=facilitators).
 
 Rebuild and redeploy:
 

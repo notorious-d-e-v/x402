@@ -151,7 +151,7 @@ import { originRequestHandler, originResponseHandler } from './index';
 
 ## Running on Mainnet
 
-To accept real payments, you need a facilitator that supports your mainnet networks. The CDP facilitator supports Base and Solana mainnet and requires CDP API keys. The [PayAI facilitator](https://facilitator.payai.network) also supports both mainnets and requires no API keys. See the [full facilitator list](../../../../docs/dev-tools/facilitators.md).
+To accept real payments, you need a mainnet facilitator that supports your networks. Each facilitator may have different authentication requirements. Browse available facilitators at the [x402 Ecosystem — Facilitators](https://www.x402.org/ecosystem?filter=facilitators).
 
 Update `config.ts` with your chosen facilitator, both mainnet networks, and your wallet addresses:
 
