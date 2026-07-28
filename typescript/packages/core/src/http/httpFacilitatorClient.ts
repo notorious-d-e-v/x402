@@ -14,13 +14,20 @@ import { safeBase64Decode } from "../utils";
 const DEFAULT_FACILITATOR_URL = "https://x402.org/facilitator";
 /** Default per-request timeout for facilitator HTTP calls, in milliseconds */
 const DEFAULT_TIMEOUT_MS = 30_000;
+/**
+ * Upper bound for timeoutMs (2^31 - 1). AbortSignal.timeout() requires an
+ * integer, and larger values overflow Node's 32-bit timers, which would
+ * silently fire after ~1ms while reporting the configured duration.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 export interface FacilitatorConfig {
   url?: string;
   /**
    * Timeout in milliseconds applied to each facilitator HTTP request —
    * `verify()`, `settle()`, and every `getSupported()` attempt — covering both
-   * response headers and body consumption. Must be a positive finite number.
+   * response headers and body consumption. Must be a positive integer no
+   * greater than 2_147_483_647 (2^31 - 1, about 24.8 days).
    * Defaults to 30_000 (30 seconds), matching the Go and Python facilitator clients.
    *
    * On expiry the operation rejects with {@link FacilitatorTimeoutError}. For
@@ -331,9 +338,9 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
     // when constructing endpoint paths like `${url}/supported`
     this.url = (config?.url || DEFAULT_FACILITATOR_URL).replace(/\/+$/, "");
     const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
       throw new RangeError(
-        `timeoutMs must be a positive finite number of milliseconds, got ${timeoutMs}`,
+        `timeoutMs must be a positive integer number of milliseconds no greater than ${MAX_TIMEOUT_MS}, got ${timeoutMs}`,
       );
     }
     this.timeoutMs = timeoutMs;
@@ -491,7 +498,15 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
           };
         }
 
-        const errorText = await response.text().catch(() => response.statusText);
+        const errorText = await response.text().catch((cause: unknown) => {
+          // A deadline abort during the error-body read must surface as a
+          // timeout, not be masked as a generic HTTP failure (which would be
+          // retried for 429). statusText covers other body-read failures.
+          if (isAbortOrTimeoutError(cause)) {
+            throw cause;
+          }
+          return response.statusText;
+        });
         return {
           kind: "http-error" as const,
           status: response.status,

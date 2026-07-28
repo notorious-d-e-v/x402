@@ -378,10 +378,16 @@ describe("request timeout", () => {
     expect(new HTTPFacilitatorClient({ timeoutMs: 5_000 }).timeoutMs).toBe(5_000);
   });
 
-  it("rejects a non-positive or non-finite timeoutMs", () => {
-    for (const timeoutMs of [0, -5, NaN, Infinity]) {
+  it("rejects a timeoutMs that AbortSignal.timeout cannot honor", () => {
+    // Non-integers throw ERR_OUT_OF_RANGE at request time, and values above
+    // 2^31 - 1 overflow Node's 32-bit timers into an effective ~1ms deadline.
+    for (const timeoutMs of [0, -5, NaN, Infinity, 0.5, 2_147_483_648]) {
       expect(() => new HTTPFacilitatorClient({ timeoutMs })).toThrow(RangeError);
     }
+  });
+
+  it("accepts the maximum timer-safe timeoutMs", () => {
+    expect(new HTTPFacilitatorClient({ timeoutMs: 2_147_483_647 }).timeoutMs).toBe(2_147_483_647);
   });
 
   it("passes an AbortSignal to fetch on verify, settle, and getSupported", async () => {
@@ -497,6 +503,33 @@ describe("request timeout", () => {
     expect(error).toBeInstanceOf(FacilitatorTimeoutError);
     expect(error.operation).toBe("supported");
     expect(error.message).toContain("supported request timed out");
+  });
+
+  it("throws FacilitatorTimeoutError when a 429 error body stalls, without retrying", async () => {
+    const fetchMock = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal!;
+      return Promise.resolve({
+        ok: false,
+        status: 429,
+        headers: new Headers(),
+        text: () =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason));
+          }),
+      } as unknown as Response);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new HTTPFacilitatorClient({
+      url: "https://facilitator.test",
+      timeoutMs: 25,
+    });
+    const error = await client.getSupported().catch(caught => caught as FacilitatorTimeoutError);
+
+    expect(error).toBeInstanceOf(FacilitatorTimeoutError);
+    expect(error.operation).toBe("supported");
+    // The deadline abort must not be masked as a retryable HTTP error.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not convert non-timeout failures into FacilitatorTimeoutError", async () => {
