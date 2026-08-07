@@ -44,7 +44,10 @@ evm = [
 ]
 svm = [
     "solders>=0.27.0",
-    "solana>=0.36.0",
+    # solana 0.40 removed the sync client (solana.rpc.api) and TxOpts, both of
+    # which mechanisms/svm imports at module scope. Lift the cap once those
+    # imports move to the async client.
+    "solana>=0.36.0,<0.40",
 ]
 tvm = [
     "httpx>=0.28.1",
@@ -92,7 +95,7 @@ dev = [
     "web3>=7.0.0",
     # SVM dependencies
     "solders>=0.27.0",
-    "solana>=0.36.0",
+    "solana>=0.36.0,<0.40",
     # TVM dependencies
     "pytoniq>=0.1.39",
     "pytoniq-core>=0.1.36",
