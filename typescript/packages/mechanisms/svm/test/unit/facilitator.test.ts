@@ -358,10 +358,11 @@ describe("ExactSvmScheme", () => {
       ["maxComputeUnits", NaN],
       ["maxComputeUnits", Infinity],
       ["maxComputeUnits", -1],
+      ["maxComputeUnits", 0],
       ["maxRequiredSignatures", NaN],
       ["maxRequiredSignatures", Infinity],
       ["maxRequiredSignatures", 0],
-    ])("should reject %s = %p at construction", (option, value) => {
+    ])("should reject %s = %s at construction", (option, value) => {
       expect(
         () => new ExactSvmScheme(mockSigner, undefined, { [option]: value as number }),
       ).toThrow(option);
@@ -372,7 +373,7 @@ describe("ExactSvmScheme", () => {
         () =>
           new ExactSvmScheme(mockSigner, undefined, {
             maxPriorityFeeMicroLamports: 0,
-            maxComputeUnits: 0,
+            maxComputeUnits: 1,
             maxRequiredSignatures: 1,
           }),
       ).not.toThrow();

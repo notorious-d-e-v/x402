@@ -220,7 +220,7 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     // A limit that cannot be compared against is worse than no limit, so reject
     // it here rather than at verify time.
     assertLimit("maxPriorityFeeMicroLamports", this.options?.maxPriorityFeeMicroLamports, 0);
-    assertLimit("maxComputeUnits", this.options?.maxComputeUnits, 0);
+    assertLimit("maxComputeUnits", this.options?.maxComputeUnits, 1);
     // A ceiling below 1 would reject every transaction: the fee payer alone
     // always requires one signature.
     assertLimit("maxRequiredSignatures", this.options?.maxRequiredSignatures, 1);
