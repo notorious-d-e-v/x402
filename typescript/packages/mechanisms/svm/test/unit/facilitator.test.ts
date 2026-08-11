@@ -345,6 +345,38 @@ describe("ExactSvmScheme", () => {
       const facilitator = new ExactSvmScheme(mockSigner);
       expect(() => callLimit(facilitator, limitInstruction(1_400_000))).not.toThrow();
     });
+
+    // NaN/Infinity reach these options easily via parseInt on an unset env var,
+    // and each degrades differently: a NaN compute-unit or signature ceiling
+    // makes every comparison false (no limit), while a NaN priority fee makes
+    // BigInt() throw and rejects every payment under a misleading reason code.
+    it.each([
+      ["maxPriorityFeeMicroLamports", NaN],
+      ["maxPriorityFeeMicroLamports", Infinity],
+      ["maxPriorityFeeMicroLamports", 1.5],
+      ["maxPriorityFeeMicroLamports", -1],
+      ["maxComputeUnits", NaN],
+      ["maxComputeUnits", Infinity],
+      ["maxComputeUnits", -1],
+      ["maxRequiredSignatures", NaN],
+      ["maxRequiredSignatures", Infinity],
+      ["maxRequiredSignatures", 0],
+    ])("should reject %s = %p at construction", (option, value) => {
+      expect(
+        () => new ExactSvmScheme(mockSigner, undefined, { [option]: value as number }),
+      ).toThrow(option);
+    });
+
+    it("should accept the boundary values of each limit", () => {
+      expect(
+        () =>
+          new ExactSvmScheme(mockSigner, undefined, {
+            maxPriorityFeeMicroLamports: 0,
+            maxComputeUnits: 0,
+            maxRequiredSignatures: 1,
+          }),
+      ).not.toThrow();
+    });
   });
 
   describe("settle", () => {

@@ -165,6 +165,26 @@ export type ExactSvmSchemeOptions = {
 };
 
 /**
+ * Rejects a limit that cannot function as a limit. `NaN` and `Infinity` are the
+ * dangerous cases: they arrive easily from `parseInt(process.env.X)` on an unset
+ * variable, and each option degrades differently and silently — a `NaN` compute
+ * unit or signature ceiling makes every comparison false (no limit at all),
+ * while a `NaN` priority fee makes `BigInt()` throw and rejects every payment
+ * under a misleading reason code. Failing at construction turns all of those
+ * into one loud error.
+ *
+ * @param name - Option name, used in the error message
+ * @param value - Configured value, or undefined when the option is unset
+ * @param min - Smallest meaningful value for this option
+ */
+function assertLimit(name: string, value: number | undefined, min: number): void {
+  if (value === undefined) return;
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new Error(`${name} must be a safe integer >= ${min}, received ${value}`);
+  }
+}
+
+/**
  * SVM facilitator implementation for the Exact payment scheme.
  *
  * Dual-path verification:
@@ -196,6 +216,14 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     private readonly options?: ExactSvmSchemeOptions,
   ) {
     this.settlementCache = settlementCache ?? new SettlementCache();
+
+    // A limit that cannot be compared against is worse than no limit, so reject
+    // it here rather than at verify time.
+    assertLimit("maxPriorityFeeMicroLamports", this.options?.maxPriorityFeeMicroLamports, 0);
+    assertLimit("maxComputeUnits", this.options?.maxComputeUnits, 0);
+    // A ceiling below 1 would reject every transaction: the fee payer alone
+    // always requires one signature.
+    assertLimit("maxRequiredSignatures", this.options?.maxRequiredSignatures, 1);
 
     if (this.options?.enableSmartWalletVerification) {
       // fetchAddressLookupTables is required too: assertFeePayerIsolated can't
