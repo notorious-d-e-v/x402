@@ -134,6 +134,34 @@ export type ExactSvmSchemeOptions = {
    * Default: Squads Multisig v4, Squads Smart Account, Swig, SPL Governance, Metaplex Core
    */
   smartWalletAllowedPrograms?: string[];
+
+  /**
+   * Maximum compute unit price in microlamports accepted on the static path.
+   * The facilitator is the fee payer, so the payer chooses a priority fee the
+   * facilitator pays. Operators serving low-value payments will want this far
+   * below the default.
+   *
+   * Default: MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS (5,000,000)
+   */
+  maxPriorityFeeMicroLamports?: number;
+
+  /**
+   * Maximum compute unit limit accepted on the static path. An SPL transfer
+   * with a memo uses ~20k CU, so a low ceiling still leaves ample headroom for
+   * wallet-injected instructions.
+   *
+   * Default: unset (no limit, preserving existing behavior)
+   */
+  maxComputeUnits?: number;
+
+  /**
+   * Maximum number of required signatures. Every signature adds 5,000 lamports
+   * of base fee, paid by the facilitator. A typical x402 payment needs two
+   * (payer + fee payer).
+   *
+   * Default: unset (no limit, preserving existing behavior)
+   */
+  maxRequiredSignatures?: number;
 };
 
 /**
@@ -447,6 +475,28 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
         },
         verificationPath: null,
       };
+    }
+
+    // Signature count is a transaction-level property, so it is checked before
+    // path dispatch: it bounds the base fee the facilitator pays regardless of
+    // which verification strategy accepts the transaction, and it must not be
+    // recoverable via the Path 2 fallthrough.
+    const maxRequiredSignatures = this.options?.maxRequiredSignatures;
+    if (maxRequiredSignatures !== undefined) {
+      const compiledForSignerCheck = getCompiledTransactionMessageDecoder().decode(
+        transaction.messageBytes,
+      );
+      const numRequiredSignatures = compiledForSignerCheck.header.numSignerAccounts;
+      if (numRequiredSignatures > maxRequiredSignatures) {
+        return {
+          response: {
+            isValid: false,
+            invalidReason: "invalid_exact_svm_payload_excessive_signers",
+            payer: "",
+          },
+          verificationPath: null,
+        };
+      }
     }
 
     // ─── Path 1: Static validation (standard wallets) ───────────────────
@@ -785,8 +835,18 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     }
 
     try {
-      parseSetComputeUnitLimitInstruction(instruction as never);
-    } catch {
+      const parsedInstruction = parseSetComputeUnitLimitInstruction(instruction as never);
+
+      const maxComputeUnits = this.options?.maxComputeUnits;
+      if (maxComputeUnits !== undefined && parsedInstruction.data.units > maxComputeUnits) {
+        throw new Error(
+          "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction_too_high",
+        );
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("too_high")) {
+        throw error;
+      }
       throw new Error(
         "invalid_exact_svm_payload_transaction_instructions_compute_limit_instruction",
       );
@@ -819,8 +879,10 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     try {
       const parsedInstruction = parseSetComputeUnitPriceInstruction(instruction as never);
 
-      // Check if price exceeds maximum (5 lamports per compute unit)
-      if (parsedInstruction.data.microLamports > BigInt(MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS)) {
+      // Check if price exceeds the operator-configured maximum (default 5 lamports per compute unit)
+      const maxPriorityFee =
+        this.options?.maxPriorityFeeMicroLamports ?? MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS;
+      if (parsedInstruction.data.microLamports > BigInt(maxPriorityFee)) {
         throw new Error(
           "invalid_exact_svm_payload_transaction_instructions_compute_price_instruction_too_high",
         );
