@@ -11,12 +11,14 @@ export type { ExactSvmSchemeOptions } from "./exact/facilitator/scheme";
 // Export smart wallet verification helpers
 export {
   assertFeePayerIsolated,
+  assertSmartWalletLimits,
   validateComputeBudgetLimits,
   extractTransfersFromInnerInstructions,
   verifySmartWalletTransaction,
   verifyPostSettlement,
 } from "./exact/facilitator/smartWalletVerification";
 export type {
+  SmartWalletLimits,
   SmartWalletOptions,
   TransferCheckedInfo,
 } from "./exact/facilitator/smartWalletVerification";

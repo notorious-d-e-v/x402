@@ -37,7 +37,11 @@ import {
   getTokenPayerFromTransaction,
   transactionMessageHash,
 } from "../../utils";
-import { verifySmartWalletTransaction, verifyPostSettlement } from "./smartWalletVerification";
+import {
+  assertSmartWalletLimits,
+  verifySmartWalletTransaction,
+  verifyPostSettlement,
+} from "./smartWalletVerification";
 
 /**
  * Default allowed smart wallet program addresses.
@@ -112,6 +116,7 @@ export type ExactSvmSchemeOptions = {
    * Maximum compute units allowed for smart wallet transactions.
    * Smart wallet programs need more CU for CPI overhead.
    * Only applies when enableSmartWalletVerification is true.
+   * Invalid configured values throw when smart wallet verification is enabled.
    *
    * Default: 400,000
    */
@@ -120,6 +125,7 @@ export type ExactSvmSchemeOptions = {
   /**
    * Maximum priority fee in microlamports for smart wallet transactions.
    * Only applies when enableSmartWalletVerification is true.
+   * Invalid configured values throw when smart wallet verification is enabled.
    *
    * Default: 50,000
    */
@@ -170,6 +176,11 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     this.settlementCache = settlementCache ?? new SettlementCache();
 
     if (this.options?.enableSmartWalletVerification) {
+      assertSmartWalletLimits({
+        maxComputeUnits: this.options.smartWalletMaxComputeUnits,
+        maxPriorityFeeMicroLamports: this.options.smartWalletMaxPriorityFeeMicroLamports,
+      });
+
       // fetchAddressLookupTables is required too: assertFeePayerIsolated can't
       // inspect ALT-resolved accounts without it, so an ALT-using wallet would
       // otherwise fail at verify time rather than at construction.

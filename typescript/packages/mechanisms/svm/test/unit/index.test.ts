@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ExactSvmScheme,
+  assertSmartWalletLimits,
   validateSvmAddress,
   normalizeNetwork,
   getUsdcAddress,
@@ -18,6 +19,7 @@ describe("@x402/svm", () => {
     expect(ExactSvmScheme).toBeDefined();
     expect(ExactSvmScheme).toBeDefined();
     expect(ExactSvmScheme).toBeDefined();
+    expect(assertSmartWalletLimits).toBeDefined();
   });
 
   describe("validateSvmAddress", () => {
