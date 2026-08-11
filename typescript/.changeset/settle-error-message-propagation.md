@@ -3,6 +3,7 @@
 "@x402/concordium": patch
 "@x402/evm": patch
 "@x402/keeta": patch
+"@x402/near": patch
 "@x402/stellar": patch
 "@x402/svm": patch
 ---
