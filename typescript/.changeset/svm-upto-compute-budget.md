@@ -1,0 +1,5 @@
+---
+"@x402/svm": minor
+---
+
+Add ComputeBudget instructions to SVM `upto` payment-channel transactions. The client open builder now prefixes `SetComputeUnitLimit` (default 90,000 CU, spec ceiling 400,000) and `SetComputeUnitPrice` (default 1 microlamport/CU), overridable or removable via `computeUnitLimit` / `computeUnitPriceMicroLamports` on `BuildOpenArgs` and the new `UptoClientSvmConfig`. Facilitator-submitted settlement transactions (claim, zero-charge cancel, rent-cleanup close/distribute/reclaim) derive their compute-unit limit from a pre-broadcast simulation (2x `unitsConsumed` + 25k headroom, falling back to 400,000 when simulation is unavailable) and attach a configurable `SetComputeUnitPrice` (`computeUnitPriceMicroLamports` on `UptoSvmFacilitatorConfig` / `UptoSvmRentCleanupManagerConfig`, default 1). Previously these transactions carried no ComputeBudget instructions, so the runtime reserved 400,000-403,000 CU per transaction (SIMD-0170 defaults) while consuming ~2-50k, inflating block/account cost accounting and making priority fees ~10x more expensive per unit of actual priority.

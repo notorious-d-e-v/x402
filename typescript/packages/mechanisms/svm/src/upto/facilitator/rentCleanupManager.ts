@@ -89,6 +89,12 @@ export interface UptoSvmRentCleanupManagerConfig {
   storage: UptoChannelStorage;
   network: Network;
   rpcUrl?: string;
+  /**
+   * `SetComputeUnitPrice` (microlamports per compute unit) attached to cleanup
+   * transactions; `0` omits the instruction. Defaults to
+   * `DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS` (1).
+   */
+  computeUnitPriceMicroLamports?: number;
 }
 
 /**
@@ -103,6 +109,7 @@ export class UptoSvmRentCleanupManager {
   private readonly storage: UptoChannelStorage;
   private readonly network: Network;
   private readonly rpcUrl: string | undefined;
+  private readonly computeUnitPriceMicroLamports: number | undefined;
 
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
@@ -126,6 +133,7 @@ export class UptoSvmRentCleanupManager {
     this.storage = config.storage;
     this.network = config.network;
     this.rpcUrl = config.rpcUrl;
+    this.computeUnitPriceMicroLamports = config.computeUnitPriceMicroLamports;
   }
 
   /**
@@ -318,7 +326,9 @@ export class UptoSvmRentCleanupManager {
           ]
         : [distribute];
 
-    return submitSettle(feePayerSigner, rpc, instructions);
+    return submitSettle(feePayerSigner, rpc, instructions, {
+      computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+    });
   }
 
   /**
@@ -406,7 +416,9 @@ export class UptoSvmRentCleanupManager {
               rentPayer: candidate.rentPayer,
             }),
           );
-          const signature = await submitSettle(feePayerSigner, rpc, instructions);
+          const signature = await submitSettle(feePayerSigner, rpc, instructions, {
+            computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+          });
           txsUsed += 1;
           opts.onReclaim?.({
             channelIds: liveBatch.map(c => c.channelId),

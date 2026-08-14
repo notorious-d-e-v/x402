@@ -120,6 +120,17 @@ export interface UptoSvmFacilitatorConfig {
    * Default: unset (no additional ceiling beyond the exact signer-set rule)
    */
   maxRequiredSignatures?: number;
+  /**
+   * `SetComputeUnitPrice` (microlamports per compute unit) attached to
+   * facilitator-submitted settlement transactions (claim, zero-charge cancel,
+   * and rent cleanup via {@link UptoSvmScheme.createRentCleanupManager}).
+   * `0` omits the instruction. The compute-unit limit on those transactions is
+   * sized from a pre-broadcast simulation, so the resulting priority fee
+   * tracks actual consumption.
+   *
+   * Default: `DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS` (1)
+   */
+  computeUnitPriceMicroLamports?: number;
 }
 
 type OpenAuthFailure = {
@@ -190,6 +201,7 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
     assertLimit("maxPriorityFeeMicroLamports", config.maxPriorityFeeMicroLamports, 0);
     assertLimit("maxComputeUnits", config.maxComputeUnits, 1);
     assertLimit("maxRequiredSignatures", config.maxRequiredSignatures, 1);
+    assertLimit("computeUnitPriceMicroLamports", config.computeUnitPriceMicroLamports, 0);
     this.config = config;
     this.channelStorage = config.channelStorage ?? new InMemoryUptoChannelStorage();
   }
@@ -213,6 +225,7 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
    */
   createRentCleanupManager(network: Network): UptoSvmRentCleanupManager {
     return new UptoSvmRentCleanupManager({
+      computeUnitPriceMicroLamports: this.config.computeUnitPriceMicroLamports,
       network,
       rpcUrl: this.config.rpcUrl,
       signer: this.signer,
@@ -596,7 +609,9 @@ export class UptoSvmScheme implements SchemeNetworkFacilitator {
       });
 
       const instructions: ServerInstruction[] = [...settle, distribute];
-      const signature = await submitSettle(feePayerSigner, rpc, instructions);
+      const signature = await submitSettle(feePayerSigner, rpc, instructions, {
+        computeUnitPriceMicroLamports: this.config.computeUnitPriceMicroLamports,
+      });
 
       // Settlement is confirmed onchain past this point; storage is cleanup
       // bookkeeping and must never turn a charged payment into a failure.
