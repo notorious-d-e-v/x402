@@ -38,8 +38,9 @@ import { encodeVoucherMessageBytes, VOUCHER_MAGIC } from "../../src/payment-chan
 import { UptoSvmScheme as UptoClientScheme } from "../../src/upto/client/scheme";
 import { UptoSvmScheme as UptoServerScheme } from "../../src/upto/server/scheme";
 import {
+  DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT,
   getChannelDistributionHash,
-  SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT,
+  reclaimComputeUnitLimit,
   simulateOpenSettleDistribute,
   submitSettle,
   verifyOpenChannelAccount,
@@ -1196,10 +1197,24 @@ describe("upto SVM scheme", () => {
       expect(
         () =>
           new UptoFacilitatorScheme(mockSigner as never, {
+            settleComputeUnitLimit: 0,
+          }),
+      ).toThrow(/settleComputeUnitLimit/);
+      expect(
+        () =>
+          new UptoFacilitatorScheme(mockSigner as never, {
+            computeUnitPriceMicroLamports: -1,
+          }),
+      ).toThrow(/computeUnitPriceMicroLamports/);
+      expect(
+        () =>
+          new UptoFacilitatorScheme(mockSigner as never, {
             maxPriorityFeeMicroLamports: 0,
             maxComputeUnits: 1,
             maxRequiredSignatures: 1,
             maxChannelLifetimeSecs: 1,
+            computeUnitPriceMicroLamports: 0,
+            settleComputeUnitLimit: 1,
           }),
       ).not.toThrow();
     });
@@ -1672,17 +1687,12 @@ describe("upto SVM scheme", () => {
     };
 
     /**
-     * RPC mock capturing simulate/send wire transactions.
+     * RPC mock capturing sent wire transactions.
      *
-     * @param simValue - Value resolved by simulateTransaction
-     * @param simReject - Reject the simulateTransaction send when true
      * @returns Mock rpc plus the simulate/send spies
      */
-    function makeSettleRpc(simValue: unknown, simReject = false) {
-      const simulateSend = simReject
-        ? vi.fn().mockRejectedValue(new Error("simulation transport down"))
-        : vi.fn().mockResolvedValue({ value: simValue });
-      const simulateTransaction = vi.fn().mockReturnValue({ send: simulateSend });
+    function makeSettleRpc() {
+      const simulateTransaction = vi.fn();
       const sendSend = vi.fn().mockResolvedValue(SIG);
       const sendTransaction = vi.fn().mockReturnValue({ send: sendSend });
       const rpc = {
@@ -1700,27 +1710,19 @@ describe("upto SVM scheme", () => {
       return { rpc, sendTransaction, simulateTransaction };
     }
 
-    it("derives the compute-unit limit from simulated consumption", async () => {
+    it("applies the static default limit and price without simulating", async () => {
       const feePayer = await generateKeyPairSigner();
-      const { rpc, sendTransaction, simulateTransaction } = makeSettleRpc({
-        err: null,
-        unitsConsumed: 20_000n,
-      });
+      const { rpc, sendTransaction, simulateTransaction } = makeSettleRpc();
 
       const signature = await submitSettle(feePayer, rpc as never, [memoIx]);
       expect(signature).toBe(SIG);
+      expect(simulateTransaction).not.toHaveBeenCalled();
 
-      // The sim itself runs under the per-transaction max, sigVerify off.
-      const [simWire, simConfig] = simulateTransaction.mock.calls[0]!;
-      expect(simConfig).toMatchObject({ replaceRecentBlockhash: true, sigVerify: false });
-      const simIxs = decodeTopLevelInstructions(simWire as string);
-      expect(readComputeLimitData(simIxs[0]!.data)).toBe(1_400_000);
-
-      // Broadcast: margin-sized limit + default price, then the payload ix.
+      // Broadcast: static limit + default price, then the payload ix.
       const wire = sendTransaction.mock.calls[0]![0] as string;
       const instructions = decodeTopLevelInstructions(wire);
       expect(instructions[0]!.program).toBe(COMPUTE_BUDGET_PROGRAM_ADDRESS);
-      expect(readComputeLimitData(instructions[0]!.data)).toBe(20_000 * 2 + 25_000);
+      expect(readComputeLimitData(instructions[0]!.data)).toBe(DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT);
       expect(instructions[1]!.program).toBe(COMPUTE_BUDGET_PROGRAM_ADDRESS);
       expect(readComputePriceData(instructions[1]!.data)).toBe(
         BigInt(DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS),
@@ -1728,55 +1730,26 @@ describe("upto SVM scheme", () => {
       expect(instructions[2]!.program).toBe(MEMO_PROGRAM_ADDRESS);
     });
 
-    it("clamps the derived limit to the per-transaction maximum", async () => {
+    it("honors the compute-unit limit override", async () => {
       const feePayer = await generateKeyPairSigner();
-      const { rpc, sendTransaction } = makeSettleRpc({ err: null, unitsConsumed: 1_000_000n });
+      const { rpc, sendTransaction } = makeSettleRpc();
 
-      await submitSettle(feePayer, rpc as never, [memoIx]);
+      await submitSettle(feePayer, rpc as never, [memoIx], { computeUnitLimit: 222_222 });
 
       const wire = sendTransaction.mock.calls[0]![0] as string;
-      expect(readComputeLimitData(decodeTopLevelInstructions(wire)[0]!.data)).toBe(1_400_000);
-    });
-
-    it("falls back to the conservative limit when simulation fails", async () => {
-      const feePayer = await generateKeyPairSigner();
-      const { rpc, sendTransaction } = makeSettleRpc(undefined, true);
-
-      const signature = await submitSettle(feePayer, rpc as never, [memoIx]);
-      expect(signature).toBe(SIG);
-
-      const wire = sendTransaction.mock.calls[0]![0] as string;
-      expect(readComputeLimitData(decodeTopLevelInstructions(wire)[0]!.data)).toBe(
-        SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT,
-      );
-    });
-
-    it("falls back and still broadcasts when the simulation reports an execution error", async () => {
-      const feePayer = await generateKeyPairSigner();
-      const { rpc, sendTransaction } = makeSettleRpc({
-        err: { InstructionError: [0, "Custom"] },
-        unitsConsumed: 5_000n,
-      });
-
-      const signature = await submitSettle(feePayer, rpc as never, [memoIx]);
-      expect(signature).toBe(SIG);
-
-      const wire = sendTransaction.mock.calls[0]![0] as string;
-      expect(readComputeLimitData(decodeTopLevelInstructions(wire)[0]!.data)).toBe(
-        SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT,
-      );
+      expect(readComputeLimitData(decodeTopLevelInstructions(wire)[0]!.data)).toBe(222_222);
     });
 
     it("honors the compute-unit price option, omitting the instruction at 0", async () => {
       const feePayer = await generateKeyPairSigner();
-      const priced = makeSettleRpc({ err: null, unitsConsumed: 10_000n });
+      const priced = makeSettleRpc();
       await submitSettle(feePayer, priced.rpc as never, [memoIx], {
         computeUnitPriceMicroLamports: 250,
       });
       const pricedIxs = decodeTopLevelInstructions(priced.sendTransaction.mock.calls[0]![0]);
       expect(readComputePriceData(pricedIxs[1]!.data)).toBe(250n);
 
-      const unpriced = makeSettleRpc({ err: null, unitsConsumed: 10_000n });
+      const unpriced = makeSettleRpc();
       await submitSettle(feePayer, unpriced.rpc as never, [memoIx], {
         computeUnitPriceMicroLamports: 0,
       });
@@ -1784,7 +1757,14 @@ describe("upto SVM scheme", () => {
       expect(unpricedIxs.filter(ix => ix.program === COMPUTE_BUDGET_PROGRAM_ADDRESS)).toHaveLength(
         1,
       );
-      expect(readComputeLimitData(unpricedIxs[0]!.data)).toBe(10_000 * 2 + 25_000);
+      expect(readComputeLimitData(unpricedIxs[0]!.data)).toBe(DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT);
+    });
+
+    it("reclaimComputeUnitLimit scales with batch size and clamps to the tx max", () => {
+      expect(reclaimComputeUnitLimit(1)).toBe(30_000);
+      expect(reclaimComputeUnitLimit(2)).toBe(35_000);
+      expect(reclaimComputeUnitLimit(8)).toBe(65_000);
+      expect(reclaimComputeUnitLimit(1_000_000)).toBe(1_400_000);
     });
   });
 

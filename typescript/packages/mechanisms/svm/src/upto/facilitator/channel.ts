@@ -55,25 +55,49 @@ import { createRpcClient } from "../../utils";
 /** Payment-channels `AccountDiscriminator::Channel` (byte 0 is reserved for uninitialized accounts). */
 const CHANNEL_ACCOUNT_DISCRIMINATOR = 1;
 const CHANNEL_STATUS_OPEN = 0;
-/** Solana per-transaction compute-unit max; used only for facilitator-built sims. */
-const SIM_COMPUTE_UNIT_LIMIT = 1_400_000;
+/** Solana per-transaction compute-unit maximum. */
+const MAX_TRANSACTION_COMPUTE_UNITS = 1_400_000;
+/** Compute-unit limit for facilitator-built sims; sims raise the limit to the
+ *  per-transaction max because the composite (open + settle + distribute) can
+ *  exceed the client open's 400k ceiling. */
+const SIM_COMPUTE_UNIT_LIMIT = MAX_TRANSACTION_COMPUTE_UNITS;
 
 /**
- * `SetComputeUnitLimit` used when the pre-broadcast simulation cannot supply
- * `unitsConsumed`. Matches the ~400,000 CU the runtime would derive for these
- * transactions absent any limit (SIMD-0170: 200,000 CU per non-builtin
- * instruction), so a simulation outage never makes settlement riskier than the
- * pre-right-sizing behavior — only as over-reserved.
+ * Default `SetComputeUnitLimit` for facilitator-submitted settlement
+ * transactions: claim (`settle_and_seal` + optional Ed25519 precompile +
+ * `distribute`), the zero-charge cancel, and rent-cleanup close/distribute.
+ * A measured claim with a warm recipient ATA consumes ~21.6k CU; a distribute
+ * that must recreate a closed recipient ATA adds ~25k. 100k keeps >2x
+ * headroom over that worst case. Assumes standard SPL Token (or Token-2022
+ * without execution extensions) behavior — mints with transfer hooks or other
+ * compute-heavy extensions need an explicit
+ * {@link SubmitSettleOptions.computeUnitLimit} override.
  */
-export const SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT = 400_000;
-/** Margin multiplier applied to simulated `unitsConsumed` when sizing the limit. */
-const SETTLE_COMPUTE_UNIT_MARGIN = 2;
+export const DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT = 100_000;
+
+/** Base `SetComputeUnitLimit` for a reclaim batch transaction. */
+export const RECLAIM_COMPUTE_UNIT_BASE = 25_000;
 /**
- * Fixed pad on top of the margin. Covers state drift between simulation and
- * execution — chiefly a recipient ATA closed in between, which `distribute`
- * then recreates (~25k CU) — plus the ComputeBudget instructions' own cost.
+ * Additional compute units budgeted per `reclaim` instruction in a batch. A
+ * measured reclaim consumes ~320 CU per channel and is mint-independent (the
+ * escrow ATA is already closed by that point — `reclaim` only closes the
+ * channel PDA and returns lamports), so 5k per channel is >15x margin.
  */
-const SETTLE_COMPUTE_UNIT_HEADROOM = 25_000;
+export const RECLAIM_COMPUTE_UNIT_PER_CHANNEL = 5_000;
+
+/**
+ * `SetComputeUnitLimit` for a reclaim batch of `channelCount` channels,
+ * clamped to the per-transaction maximum.
+ *
+ * @param channelCount - Number of `reclaim` instructions in the batch
+ * @returns The compute-unit limit for the batch transaction
+ */
+export function reclaimComputeUnitLimit(channelCount: number): number {
+  return Math.min(
+    RECLAIM_COMPUTE_UNIT_BASE + RECLAIM_COMPUTE_UNIT_PER_CHANNEL * channelCount,
+    MAX_TRANSACTION_COMPUTE_UNITS,
+  );
+}
 
 /** Signer capable of signing Solana transactions and raw Ed25519 messages. */
 export type UptoSvmSigner = TransactionSigner & MessagePartialSigner;
@@ -344,6 +368,13 @@ export async function simulateZeroChargeSettle(
 /** Options for {@link submitSettle}. */
 export interface SubmitSettleOptions {
   /**
+   * `SetComputeUnitLimit` for the settlement transaction. Defaults to
+   * {@link DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT} (100k), sized for standard SPL
+   * Token settlement; raise it for compute-heavy Token-2022 extension mints
+   * or unusually large distributions.
+   */
+  computeUnitLimit?: number | undefined;
+  /**
    * `SetComputeUnitPrice` in microlamports per compute unit attached to the
    * settlement transaction; `0` omits the instruction. Defaults to
    * `DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS` (1).
@@ -356,13 +387,10 @@ export interface SubmitSettleOptions {
  * fee payer, broadcast it, and confirm. Other signers, such as the channel
  * payee on `settle_and_seal`, are carried by the instruction list.
  *
- * The transaction is prefixed with a `SetComputeUnitLimit` sized from a
- * pre-broadcast simulation (margin + fixed headroom over `unitsConsumed`) and
- * an optional `SetComputeUnitPrice`. When simulation cannot supply a
- * consumption figure, {@link SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT} is used and
- * the transaction is still broadcast — simulation failures never fail the
- * settlement here; genuine execution failures surface at broadcast/confirm
- * exactly as before.
+ * The transaction is prefixed with a statically sized `SetComputeUnitLimit`
+ * and an optional `SetComputeUnitPrice`. Static sizing keeps the time-critical
+ * claim free of extra RPC round-trips and failure modes; the limit is
+ * operator-overridable for deployments outside the documented assumptions.
  *
  * @param feePayer - The fee-payer signer
  * @param rpc - The RPC client
@@ -376,31 +404,7 @@ export async function submitSettle(
   instructions: readonly ServerInstruction[],
   options: SubmitSettleOptions = {},
 ): Promise<Signature> {
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-  const lifetime = {
-    blockhash: latestBlockhash.blockhash as Blockhash,
-    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-  };
-
-  let computeUnitLimit = SETTLE_FALLBACK_COMPUTE_UNIT_LIMIT;
-  try {
-    const sim = await simulateInstructionsRaw(
-      feePayer,
-      rpc,
-      [getSetComputeUnitLimitInstruction({ units: SIM_COMPUTE_UNIT_LIMIT }), ...instructions],
-      lifetime,
-    );
-    if (sim.err == null && sim.unitsConsumed != null) {
-      computeUnitLimit = Math.min(
-        Number(sim.unitsConsumed) * SETTLE_COMPUTE_UNIT_MARGIN + SETTLE_COMPUTE_UNIT_HEADROOM,
-        SIM_COMPUTE_UNIT_LIMIT,
-      );
-    }
-  } catch {
-    // Simulation unavailable: keep the fallback limit and let the broadcast
-    // path report any real failure.
-  }
-
+  const computeUnitLimit = options.computeUnitLimit ?? DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT;
   const computeUnitPrice =
     options.computeUnitPriceMicroLamports ?? DEFAULT_COMPUTE_UNIT_PRICE_MICROLAMPORTS;
   const computeBudgetIxs: Instruction[] = [
@@ -410,10 +414,18 @@ export async function submitSettle(
       : []),
   ];
 
+  const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
   const message = pipe(
     createTransactionMessage({ version: 0 }),
     m => setTransactionMessageFeePayerSigner(feePayer, m),
-    m => setTransactionMessageLifetimeUsingBlockhash(lifetime, m),
+    m =>
+      setTransactionMessageLifetimeUsingBlockhash(
+        {
+          blockhash: latestBlockhash.blockhash as Blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        },
+        m,
+      ),
     m => appendTransactionMessageInstructions([...computeBudgetIxs, ...instructions], m),
   );
   const signed = await signTransactionMessageWithSigners(message);
@@ -494,42 +506,32 @@ export function getChannelDistributionHash(splits: readonly ChannelSplit[]): Uin
   return hasher.digest();
 }
 
-/** Blockhash lifetime accepted by {@link simulateInstructionsRaw}. */
-type BlockhashLifetime = {
-  blockhash: Blockhash;
-  lastValidBlockHeight: bigint;
-};
-
 /**
  * Partially sign and simulate a facilitator-built instruction list without
- * broadcasting, returning the raw simulation value (`err`, `unitsConsumed`,
- * ...). Always uses `sigVerify: false` (sims are never landed; the open
- * composite may carry a noop payer) and `replaceRecentBlockhash: true`.
+ * broadcasting. Always uses `sigVerify: false` (sims are never landed; the
+ * open composite may carry a noop payer) and `replaceRecentBlockhash: true`.
  *
  * @param feePayer - The fee-payer signer
  * @param rpc - The RPC client
  * @param instructions - Instructions to simulate
- * @param lifetime - Optional pre-fetched blockhash lifetime (fetched when omitted)
- * @returns The simulation result value
  */
-async function simulateInstructionsRaw(
+async function simulateInstructions(
   feePayer: UptoSvmSigner,
   rpc: ChannelRpc,
   instructions: readonly Instruction[],
-  lifetime?: BlockhashLifetime,
-) {
-  let resolvedLifetime = lifetime;
-  if (!resolvedLifetime) {
-    const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-    resolvedLifetime = {
-      blockhash: latestBlockhash.blockhash as Blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    };
-  }
+): Promise<void> {
+  const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
   const message = pipe(
     createTransactionMessage({ version: 0 }),
     m => setTransactionMessageFeePayerSigner(feePayer, m),
-    m => setTransactionMessageLifetimeUsingBlockhash(resolvedLifetime, m),
+    m =>
+      setTransactionMessageLifetimeUsingBlockhash(
+        {
+          blockhash: latestBlockhash.blockhash as Blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        },
+        m,
+      ),
     m => appendTransactionMessageInstructions(instructions, m),
   );
   const signed = await partiallySignTransactionMessageWithSigners(message);
@@ -542,25 +544,8 @@ async function simulateInstructionsRaw(
       sigVerify: false,
     })
     .send();
-  return result.value;
-}
-
-/**
- * Simulate a facilitator-built instruction list and throw when execution would
- * fail. Used by the readiness sims that gate settlement.
- *
- * @param feePayer - The fee-payer signer
- * @param rpc - The RPC client
- * @param instructions - Instructions to simulate
- */
-async function simulateInstructions(
-  feePayer: UptoSvmSigner,
-  rpc: ChannelRpc,
-  instructions: readonly Instruction[],
-): Promise<void> {
-  const value = await simulateInstructionsRaw(feePayer, rpc, instructions);
-  if (value.err) {
-    const errorStr = JSON.stringify(value.err, (_, v) =>
+  if (result.value.err) {
+    const errorStr = JSON.stringify(result.value.err, (_, v) =>
       typeof v === "bigint" ? v.toString() : v,
     );
     throw new Error(`zero-charge settlement simulation failed: ${errorStr}`);

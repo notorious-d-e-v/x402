@@ -60,11 +60,14 @@ export const OPEN_MAX_COMPUTE_UNIT_LIMIT = 400_000;
 /**
  * Default `SetComputeUnitLimit` for a built open transaction. Without one the
  * runtime reserves 200,000 CU per instruction (SIMD-0170) — 400,000 for the
- * open + memo pair — while an observed open consumes ~46,000 CU. The default
- * keeps ~2x headroom over that (Token-2022 escrow ATAs with extensions cost
- * more than the measured Token USDC open) and any `SetComputeUnitPrice`
- * priority fee is charged on the requested limit, so right-sizing buys the
- * same scheduling priority at a fraction of the fee.
+ * open + memo pair — while an observed open consumes ~51,000 CU. The default
+ * keeps ~1.8x headroom over that, and any `SetComputeUnitPrice` priority fee
+ * is charged on the requested limit, so right-sizing buys the same scheduling
+ * priority at a fraction of the fee. Assumes standard SPL Token (or
+ * Token-2022 without execution extensions) behavior — mints whose escrow
+ * transfer runs compute-heavy extensions (e.g. transfer hooks) need an
+ * explicit {@link BuildOpenArgs.computeUnitLimit} override, up to the spec
+ * ceiling {@link OPEN_MAX_COMPUTE_UNIT_LIMIT}.
  */
 export const OPEN_DEFAULT_COMPUTE_UNIT_LIMIT = 90_000;
 /** Spec ceiling for optional Phantom/Solflare Lighthouse assertions after `open`. */
