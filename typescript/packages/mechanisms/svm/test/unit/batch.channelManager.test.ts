@@ -124,6 +124,42 @@ describe("batch-settlement redemption worker", () => {
     );
   });
 
+  it("rejects a configured batch size above the protocol maximum", () => {
+    const store = new MemoryChannelStore();
+    const { settle } = recorder();
+    expect(
+      () =>
+        new BatchChannelManager({
+          maxChannelsPerBatch: 5,
+          requirements: requirements(),
+          settle,
+          store,
+        }),
+    ).toThrow(/1 through 4/);
+  });
+
+  it("lets only one worker instance own a redemption pass", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a"));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let calls = 0;
+    const settle = async (): Promise<SettleResponse> => {
+      calls += 1;
+      if (calls === 1) await gate;
+      return ok();
+    };
+    const first = new BatchChannelManager({ requirements: requirements(), settle, store });
+    const second = new BatchChannelManager({ requirements: requirements(), settle, store });
+    const firstPass = first.redeem();
+    await Promise.resolve();
+    expect(await second.redeem()).toEqual({ claimed: [], distributed: [] });
+    release();
+    expect((await firstPass).claimed).toEqual(["chan-a"]);
+  });
+
   it("leaves a failed batch for the next pass instead of recording it", async () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a"));

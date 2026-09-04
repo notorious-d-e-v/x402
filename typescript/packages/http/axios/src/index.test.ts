@@ -17,6 +17,7 @@ vi.mock("@x402/core/client", () => {
   MockX402HTTPClient.prototype.encodePaymentSignatureHeader = vi.fn();
   MockX402HTTPClient.prototype.handlePaymentRequired = vi.fn();
   MockX402HTTPClient.prototype.processPaymentResult = vi.fn();
+  MockX402HTTPClient.prototype.processPaymentError = vi.fn();
 
   const MockX402Client = vi.fn() as ReturnType<typeof vi.fn> & {
     fromConfig: ReturnType<typeof vi.fn>;
@@ -306,12 +307,17 @@ describe("wrapAxiosWithPayment()", () => {
   });
 
   it("should propagate retry errors", async () => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
     const retryError = new Error("Retry failed");
     (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockRejectedValue(retryError);
 
     const error = createAxiosError(402, createErrorConfig(), validPaymentRequired);
 
     await expect(interceptor(error)).rejects.toBe(retryError);
+    expect(MockX402HTTPClient.prototype.processPaymentError).toHaveBeenCalledWith(
+      validPaymentPayload,
+      retryError,
+    );
   });
 
   it("should set Access-Control-Expose-Headers on retry request", async () => {

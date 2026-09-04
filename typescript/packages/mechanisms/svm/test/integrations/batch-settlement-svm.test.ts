@@ -175,6 +175,7 @@ describe("batch-settlement SVM onchain", () => {
      * asked for — a fresh client has no local record and rediscovers.
      */
     function pipeline(store = new MemoryChannelStore(), coldClient = false) {
+      const rpc = createRpcClient(NETWORK, RPC_URL);
       const facilitator = new x402Facilitator().register(
         NETWORK,
         new BatchFacilitatorScheme(toFacilitatorSvmSigner(operator, { defaultRpcUrl: RPC_URL }), {
@@ -182,7 +183,21 @@ describe("batch-settlement SVM onchain", () => {
         }),
       );
       const server = new x402ResourceServer(new SvmFacilitatorClient(facilitator));
-      server.register(NETWORK, new BatchServerScheme({ store, withdrawDelay: WITHDRAW_DELAY }));
+      server.register(
+        NETWORK,
+        new BatchServerScheme({
+          readChannel: async ({ channelId }) => {
+            const [channel, mint] = await Promise.all([
+              fetchMaybeChannel(rpc, channelId as never),
+              rpc.getAccountInfo(USDC_DEVNET_ADDRESS as never, { encoding: "base64" }).send(),
+            ]);
+            if (!channel.exists || !mint.value) return undefined;
+            return { channel: channel.data, mintOwner: String(mint.value.owner) };
+          },
+          store,
+          withdrawDelay: WITHDRAW_DELAY,
+        }),
+      );
       const clientScheme = coldClient
         ? new BatchClientScheme(payer, { depositAmount: DEPOSIT, rpcUrl: RPC_URL })
         : lifecycleClient;
@@ -339,9 +354,9 @@ describe("batch-settlement SVM onchain", () => {
       },
     );
 
-    it("rebuilds a lost server record from chain", { timeout: 120_000 }, async () => {
-      // The operator lost its store. The channel is open and funded onchain,
-      // and the client is still holding a usable voucher base.
+    it("fails closed after server-store loss", { timeout: 120_000 }, async () => {
+      // The chain cannot reconstruct the accepted voucher or application
+      // response, so an empty replacement store must never resume serving.
       const emptyStore = new MemoryChannelStore();
       const { client, server } = pipeline(emptyStore, true);
       await server.initialize();
@@ -350,17 +365,9 @@ describe("batch-settlement SVM onchain", () => {
       const matched = server.findMatchingRequirements(accepts(), payload);
 
       const verified = await server.verifyPayment(payload, matched!);
-      const rebuilt = await emptyStore.get(channelId);
-      expect(rebuilt, "the record was rebuilt from confirmed onchain state").toBeDefined();
-      expect(rebuilt?.deposit).toBe(BigInt(DEPOSIT));
-      // Both sides rebuild from the same onchain watermark — the server from
-      // the facilitator's snapshot, the client from its own scan — so they
-      // agree on the base and the request is simply served. Before this, the
-      // server refused every voucher on a funded, open channel.
-      expect(rebuilt?.chargedCumulativeAmount).toBe(rebuilt?.settled);
-      expect(verified.isValid, JSON.stringify(verified)).toBe(true);
-      const settled = await server.settlePayment(payload, matched!);
-      expect(settled.success, JSON.stringify(settled)).toBe(true);
+      expect(await emptyStore.get(channelId)).toBeUndefined();
+      expect(verified.isValid).toBe(false);
+      expect(verified.invalidReason).toBe("invalid_batch_settlement_svm_channel_state");
     });
 
     it("redeems through the channel manager", { timeout: 180_000 }, async () => {

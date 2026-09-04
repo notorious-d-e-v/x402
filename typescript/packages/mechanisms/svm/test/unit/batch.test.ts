@@ -38,8 +38,10 @@ import {
 } from "../../src/payment-channels/close";
 import { SEAL_DISCRIMINATOR } from "../../src/payment-channels/generated/instructions/seal";
 import { SETTLE_DISCRIMINATOR } from "../../src/payment-channels/generated/instructions/settle";
+import { ChannelStatus } from "../../src/payment-channels/generated/types/channelStatus";
 import { buildSealInstruction, buildSettleInstructions } from "../../src/payment-channels/onchain";
 import { verifyOpenTransaction } from "../../src/payment-channels/open";
+import { getChannelDistributionHash } from "../../src/payment-channels/facilitator";
 import {
   encodeVoucherMessageBytes,
   verifyVoucherSignature,
@@ -121,6 +123,70 @@ async function signedVoucher(maxClaimableAmount: bigint, expiresAt = 0): Promise
 
 describe("batch-settlement SVM", () => {
   describe("resource server", () => {
+    it("fails closed when the durable server record is missing", async () => {
+      const server = new BatchServerScheme({ store: new MemoryChannelStore() });
+      const voucher = await signedVoucher(1_000n);
+      const result = await server.schemeHooks.onBeforeVerify!({
+        declaredExtensions: {},
+        paymentPayload: {
+          accepted: requirements(),
+          payload: { channelConfig, type: "voucher", voucher },
+          x402Version: 2,
+        },
+        requirements: requirements(),
+      });
+      expect(result).toMatchObject({ abort: true, reason: BatchError.CHANNEL_STATE });
+    });
+
+    it("verifies ordinary vouchers locally from a fresh confirmed snapshot", async () => {
+      const store = new MemoryChannelStore();
+      await store.put(serverState({ onchainSnapshotAt: 0 }));
+      let reads = 0;
+      const server = new BatchServerScheme({
+        readChannel: async () => {
+          reads += 1;
+          return {
+            mintOwner: TOKEN_PROGRAM_ADDRESS,
+            observedAt: Date.now(),
+            channel: {
+              authorizedSigner: payer.address,
+              bump: 1,
+              closureStartedAt: 0n,
+              deposit: 10_000n,
+              discriminator: 1,
+              distributionHash: [
+                ...getChannelDistributionHash([{ bps: 10_000, recipient: RECEIVER }]),
+              ],
+              gracePeriod: WITHDRAW_DELAY,
+              mint: MINT,
+              openSlot: OPEN_SLOT,
+              payee: feePayer.address,
+              payer: payer.address,
+              payerWithdrawnAt: 0n,
+              rentPayer: feePayer.address,
+              salt: BigInt(channelConfig.salt),
+              settlement: { payoutWatermark: 0n, settled: 0n },
+              status: ChannelStatus.Open,
+              version: 1,
+            },
+          };
+        },
+        store,
+      });
+      const voucher = await signedVoucher(1_000n);
+      const result = await server.schemeHooks.onBeforeVerify!({
+        declaredExtensions: {},
+        paymentPayload: {
+          accepted: requirements(),
+          payload: { channelConfig, type: "voucher", voucher },
+          x402Version: 2,
+        },
+        requirements: requirements(),
+      });
+      expect(reads).toBe(1);
+      expect(result).toMatchObject({ skip: true, result: { isValid: true } });
+    });
+
     it("parses stablecoin prices", async () => {
       const server = new BatchServerScheme();
       expect(await server.parsePrice("$0.001", SOLANA_MAINNET_CAIP2)).toMatchObject({
@@ -315,7 +381,7 @@ describe("batch-settlement SVM", () => {
 
     it("rebuilds an unknown channel from the verified onchain snapshot", async () => {
       const store = new MemoryChannelStore();
-      const server = new BatchServerScheme({ store });
+      const server = new BatchServerScheme({ recoverUnknownChannels: true, store });
       // The client believes it was charged 4000; the chain has settled 2000,
       // which is all this server can rebuild from.
       const voucher = await signedVoucher(5_000n);
@@ -369,7 +435,7 @@ describe("batch-settlement SVM", () => {
 
     it("serves the first voucher a rebuilt record expects", async () => {
       const store = new MemoryChannelStore();
-      const server = new BatchServerScheme({ store });
+      const server = new BatchServerScheme({ recoverUnknownChannels: true, store });
       const voucher = await signedVoucher(3_000n);
       const context = {
         declaredExtensions: {},
@@ -407,7 +473,7 @@ describe("batch-settlement SVM", () => {
 
     it("refuses to rebuild a record for a channel that is closing", async () => {
       const store = new MemoryChannelStore();
-      const server = new BatchServerScheme({ store });
+      const server = new BatchServerScheme({ recoverUnknownChannels: true, store });
       const voucher = await signedVoucher(3_000n);
       const context = {
         declaredExtensions: {},
@@ -645,6 +711,25 @@ describe("batch-settlement SVM", () => {
   });
 
   describe("client construction", () => {
+    it("serializes concurrent payload allocation per channel", async () => {
+      const client = new BatchClientScheme(payer);
+      const internal = client as unknown as {
+        acquireChannel(key: string): Promise<void>;
+        releaseChannel(key: string): void;
+      };
+      await internal.acquireChannel("channel");
+      let secondEntered = false;
+      const second = internal.acquireChannel("channel").then(() => {
+        secondEntered = true;
+      });
+      await Promise.resolve();
+      expect(secondEntered).toBe(false);
+      internal.releaseChannel("channel");
+      await second;
+      expect(secondEntered).toBe(true);
+      internal.releaseChannel("channel");
+    });
+
     it("signs the canonical 50-byte voucher message", async () => {
       const voucher = await signedVoucher(5_000n);
       expect(voucher.maxClaimableAmount).toBe("5000");
@@ -716,6 +801,30 @@ describe("batch-settlement SVM", () => {
         x402Version: 2,
       };
     }
+
+    it("preserves the exact pending payload after a lost HTTP response", async () => {
+      const voucher = await signedVoucher(1_000n);
+      const payment = voucherPayment(voucher);
+      const { client, key, storage } = await pendingClient({
+        amount: "1000",
+        cumulative: "1000",
+        deposit: "10000",
+        payment,
+      });
+      const internal = client as unknown as {
+        acquireChannel(channelKey: string): Promise<void>;
+        releaseChannel(channelKey: string): void;
+      };
+      await internal.acquireChannel(key);
+      await client.schemeHooks.onPaymentResponse!({
+        error: new Error("connection reset after request write"),
+        paymentPayload: { accepted: requirements(), ...payment },
+        requirements: requirements(),
+      });
+      expect(await storage.get(key)).toMatchObject({ pending: { payment } });
+      await internal.acquireChannel(key);
+      internal.releaseChannel(key);
+    });
 
     it("adopts a corrective cumulative base against its own signature", async () => {
       const stale = await signedVoucher(1_000n);
@@ -889,26 +998,43 @@ describe("batch-settlement SVM", () => {
         return { result, stored: await storage.get(key) };
       };
 
-      // A charge above the advertised price is refused outright.
-      await expect(
-        respond({
-          chargedAmount: "1001",
-          channelState: { balance: "10000", chargedCumulativeAmount: "1000" },
-          commitmentId: `${channelId}:1000`,
-        }),
-      ).rejects.toThrow(/charged more than the advertised price/);
-
-      // A cumulative the client cannot derive leaves local state alone rather
-      // than adopting the server's accounting.
-      expect(
-        (
-          await respond({
-            chargedAmount: "1000",
-            channelState: { balance: "10000", chargedCumulativeAmount: "9999" },
+      // The wire contract is fixed-price: both over- and under-charging fail.
+      for (const chargedAmount of ["999", "1001"]) {
+        await expect(
+          respond({
+            chargedAmount,
+            channelState: { balance: "10000", chargedCumulativeAmount: "1000" },
             commitmentId: `${channelId}:1000`,
-          })
-        ).stored,
-      ).toBeUndefined();
+          }),
+        ).rejects.toThrow(/did not equal the advertised price/);
+      }
+
+      // A cumulative the client cannot derive keeps the exact signed payload
+      // pending. A retry can therefore ask the server for the cached response
+      // without authorizing a second resource request.
+      const inconsistent = await pendingClient({
+        amount: "1000",
+        cumulative: "1000",
+        deposit: "10000",
+        payment: deposit,
+      });
+      await expect(
+        inconsistent.client.schemeHooks.onPaymentResponse!({
+          paymentPayload: { accepted: requirements(), ...deposit },
+          requirements: requirements(),
+          settleResponse: {
+            extra: {
+              chargedAmount: "1000",
+              channelState: { balance: "10000", chargedCumulativeAmount: "9999" },
+              commitmentId: `${channelId}:1000`,
+            },
+            success: true,
+          },
+        } as Parameters<NonNullable<typeof inconsistent.client.schemeHooks.onPaymentResponse>>[0]),
+      ).rejects.toThrow(/state is inconsistent/);
+      expect(await inconsistent.storage.get(inconsistent.key)).toMatchObject({
+        pending: { payment: deposit },
+      });
 
       // The escrow is the deposit this client signed, not the balance the
       // server reports — here inflated tenfold.

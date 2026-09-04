@@ -138,4 +138,59 @@ describe("batch-settlement pending settlement", () => {
     // Confirmed, so it is cleaned up afterwards.
     expect(await store.get(KEY)).toBeUndefined();
   });
+
+  it("reconciles a deposit signature before interpreting current channel state", async () => {
+    const store = new InMemoryPendingSettlementStore();
+    const transaction = "payer-signed-open";
+    const key = `batch:deposit:${NETWORK}:${transaction}`;
+    await store.set(key, "landed-open-signature");
+    let confirmed = false;
+    const base = toFacilitatorSvmSigner(await generateKeyPairSigner(), {
+      defaultRpcUrl: "http://127.0.0.1:9",
+    });
+    const scheme = new BatchFacilitatorScheme(
+      {
+        ...base,
+        confirmTransaction: async () => {
+          confirmed = true;
+        },
+      },
+      { pendingSettlementStore: store },
+    ) as unknown as Record<string, unknown>;
+    let validationSawConfirmed = false;
+    scheme.validateDeposit = async () => {
+      validationSawConfirmed = confirmed;
+      return {
+        channelId: "channel",
+        deposit: 10n,
+        expectedDeposit: 10n,
+        isTopUp: false,
+        payload: {},
+        terms: {},
+      };
+    };
+    scheme.fetchChannel = async () => ({
+      deposit: 10n,
+      payer,
+      settlement: { settled: 1n },
+    });
+    scheme.assertDepositChannel = () => undefined;
+    const payload = {
+      channelConfig: { payer },
+      deposit: { amount: "10", transaction },
+      type: "deposit",
+      voucher: { maxClaimableAmount: "1" },
+    };
+    const requirements = { amount: "1", network: NETWORK };
+    const response = await (
+      scheme.settleDeposit as (
+        payment: unknown,
+        deposit: unknown,
+        requirement: unknown,
+      ) => Promise<{ success: boolean; transaction: string }>
+    )({ accepted: requirements }, payload, requirements);
+
+    expect(validationSawConfirmed).toBe(true);
+    expect(response).toMatchObject({ success: true, transaction: "landed-open-signature" });
+  });
 });

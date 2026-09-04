@@ -10,6 +10,7 @@ vi.mock("@x402/core/client", () => {
   MockX402HTTPClient.prototype.encodePaymentSignatureHeader = vi.fn();
   MockX402HTTPClient.prototype.handlePaymentRequired = vi.fn();
   MockX402HTTPClient.prototype.processPaymentResult = vi.fn();
+  MockX402HTTPClient.prototype.processPaymentError = vi.fn();
 
   const MockX402Client = vi.fn() as ReturnType<typeof vi.fn> & {
     fromConfig: ReturnType<typeof vi.fn>;
@@ -98,6 +99,9 @@ describe("wrapFetchWithPayment()", () => {
     (
       MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>
     ).mockResolvedValue({ recovered: false });
+    (
+      MockX402HTTPClient.prototype.processPaymentError as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(undefined);
 
     wrappedFetch = wrapFetchWithPayment(mockFetch, mockClient);
   });
@@ -273,12 +277,17 @@ describe("wrapFetchWithPayment()", () => {
   });
 
   it("should propagate retry errors", async () => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
     const retryError = new Error("Network error on retry");
 
     mockFetch.mockResolvedValueOnce(createResponse(402, validPaymentRequired));
     mockFetch.mockRejectedValueOnce(retryError);
 
     await expect(wrappedFetch("https://api.example.com", { method: "GET" })).rejects.toBe(
+      retryError,
+    );
+    expect(MockX402HTTPClient.prototype.processPaymentError).toHaveBeenCalledWith(
+      validPaymentPayload,
       retryError,
     );
   });
