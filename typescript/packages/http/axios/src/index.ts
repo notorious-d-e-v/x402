@@ -1,6 +1,11 @@
 import { x402Client, x402ClientConfig, x402HTTPClient } from "@x402/core/client";
 import { type PaymentRequired } from "@x402/core/types";
-import { type AxiosInstance, type AxiosError, type InternalAxiosRequestConfig } from "axios";
+import {
+  type AxiosInstance,
+  type AxiosError,
+  type AxiosResponse,
+  type InternalAxiosRequestConfig,
+} from "axios";
 
 type X402RetryConfig = InternalAxiosRequestConfig & { __is402Retry?: boolean };
 type AxiosHeaderRecord = Record<string, string>;
@@ -223,7 +228,13 @@ export function wrapAxiosWithPayment(
         );
 
         // Retry the request with payment
-        const secondResponse = await axiosInstance.request(paidConfig);
+        let secondResponse: AxiosResponse;
+        try {
+          secondResponse = await axiosInstance.request(paidConfig);
+        } catch (paymentError) {
+          await httpClient.processPaymentError(paymentPayload, paymentError);
+          throw paymentError;
+        }
 
         // Fire payment response hooks and handle recovery
         const getResponseHeader = (name: string) => {
@@ -249,7 +260,13 @@ export function wrapAxiosWithPayment(
             "Access-Control-Expose-Headers",
             "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE",
           );
-          const retryResponse = await axiosInstance.request(retryConfig);
+          let retryResponse: AxiosResponse;
+          try {
+            retryResponse = await axiosInstance.request(retryConfig);
+          } catch (paymentError) {
+            await httpClient.processPaymentError(freshPayload, paymentError);
+            throw paymentError;
+          }
           // Process the final retry result without another recovery attempt.
           const getRetryHeader = (name: string) => {
             const value = retryResponse.headers[name] ?? retryResponse.headers[name.toLowerCase()];

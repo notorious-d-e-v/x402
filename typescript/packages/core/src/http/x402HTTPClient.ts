@@ -223,6 +223,22 @@ export class x402HTTPClient {
   }
 
   /**
+   * Notify scheme hooks when the paid HTTP attempt ended without a response.
+   * Stateful schemes use this to preserve ambiguous signed payloads for an
+   * exact retry while releasing any in-process serialization lease.
+   */
+  async processPaymentError(paymentPayload: PaymentPayload, error: unknown): Promise<void> {
+    if (paymentPayload.x402Version === 1) return;
+    const requirements = paymentPayload.accepted;
+    if (!requirements) return;
+    await this.client.handlePaymentResponse({
+      error: error instanceof Error ? error : new Error(String(error)),
+      paymentPayload,
+      requirements,
+    });
+  }
+
+  /**
    * Parses HTTP status, headers, and body into an `HTTPResourceResponse`.
    *
    * Decodes the x402 payment header into `header`: the `PAYMENT-RESPONSE`
