@@ -283,6 +283,16 @@ export type FacilitatorSvmSigner = {
   ): Promise<FacilitatorAccountInfo | null>;
 
   /**
+   * Fetch several accounts in one confirmed RPC request. Optional; batch
+   * settlement falls back to parallel `getAccountInfo` calls when absent.
+   */
+  getMultipleAccounts?(
+    accountAddresses: readonly string[],
+    network: string,
+    options?: { commitment?: string; encoding?: string },
+  ): Promise<readonly (FacilitatorAccountInfo | null)[]>;
+
+  /**
    * Fetch a recent blockhash. Optional — required by the `upto` scheme;
    * {@link toFacilitatorSvmSigner} provides an implementation.
    */
@@ -738,6 +748,20 @@ export function toFacilitatorSvmSigner(
         .send();
       const value = result.value as FacilitatorAccountInfo | null;
       return value;
+    },
+
+    getMultipleAccounts: async (accountAddresses, network, options) => {
+      const rpc = getRpcForNetwork(network);
+      const result = await rpc
+        .getMultipleAccounts(
+          accountAddresses.map(value => value as Address),
+          {
+            commitment: (options?.commitment ?? "confirmed") as never,
+            encoding: (options?.encoding ?? "base64") as never,
+          },
+        )
+        .send();
+      return result.value as readonly (FacilitatorAccountInfo | null)[];
     },
 
     getLatestBlockhash: async (network: string) => {

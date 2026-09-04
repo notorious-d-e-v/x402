@@ -30,7 +30,11 @@ import {
 } from "../../payment-channels/open";
 import { encodeVoucherMessageBytes, verifyVoucherSignature } from "../../payment-channels/voucher";
 import { SettlementCache } from "../../settlement-cache";
-import type { FacilitatorSigningCapabilities, FacilitatorSvmSigner } from "../../signer";
+import type {
+  FacilitatorRpcClient,
+  FacilitatorSigningCapabilities,
+  FacilitatorSvmSigner,
+} from "../../signer";
 import {
   broadcastOpen,
   getChannelDistributionHash,
@@ -78,6 +82,12 @@ export const MAX_CHANNELS_PER_SETTLE_TX = 4;
 export interface BatchSvmFacilitatorConfig {
   rpcUrl?: string | undefined;
   /**
+   * Shared RPC used by composite setup simulation. Production facilitators
+   * should inject the same paced/failover-aware client used by the signer so
+   * reads, simulation and broadcast cannot silently use different providers.
+   */
+  rpcClient?: FacilitatorRpcClient | undefined;
+  /**
    * Durable record of transactions this facilitator broadcast but could not
    * confirm, so a retry — or a restart — reconciles against the signature
    * instead of broadcasting the same escrow or redemption again. Defaults to
@@ -122,6 +132,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
   private readonly channelStorage: PaymentChannelStorage;
   private readonly settlementCache = new SettlementCache();
   private readonly pendingStore: PendingSettlementStore;
+  private readonly mintOwnerCache = new Map<string, Promise<string>>();
 
   constructor(
     private readonly signer: FacilitatorSvmSigner,
@@ -270,7 +281,24 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
     void payment;
-    const prepared: {
+    const prepared = await Promise.all(
+      payload.claims.map(async claim => {
+        const terms = await this.resolveTerms(claim.voucher.channelConfig, requirements);
+        const channelId = await this.deriveChannelId(claim.voucher.channelConfig, terms.feePayer);
+        if (channelId !== claim.voucher.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
+        return {
+          claim,
+          channelId,
+          cumulative: parseU64(claim.voucher.maxClaimableAmount, "maxClaimableAmount"),
+          terms,
+        };
+      }),
+    );
+    const channels = await this.readChannels(
+      requirements.network,
+      prepared.map(item => item.channelId),
+    );
+    const validated: {
       channel: Channel;
       channelId: string;
       feePayer: string;
@@ -280,13 +308,11 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       payTo: string;
       tokenProgram: string;
     }[] = [];
-    for (const claim of payload.claims) {
-      const terms = await this.resolveTerms(claim.voucher.channelConfig, requirements);
-      const channelId = await this.deriveChannelId(claim.voucher.channelConfig, terms.feePayer);
-      if (channelId !== claim.voucher.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
-      const cumulative = parseU64(claim.voucher.maxClaimableAmount, "maxClaimableAmount");
+    for (let index = 0; index < prepared.length; index += 1) {
+      const { claim, channelId, cumulative, terms } = prepared[index]!;
       this.assertExpiry(claim.voucher.expiresAt);
-      const channel = await this.fetchChannel(requirements.network, channelId);
+      const channel = channels[index];
+      if (!channel) throw new Error(`${BatchError.CHANNEL_STATE}: channel not found`);
       this.assertClaimChannel(channel, claim.voucher.channelConfig, terms, requirements, [
         ChannelStatus.Open,
       ]);
@@ -309,7 +335,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         signerBase58: voucher.authorizedSigner,
       });
       if (!valid) throw new Error(BatchError.VOUCHER_SIGNATURE);
-      prepared.push({
+      validated.push({
         channel,
         channelId,
         cumulative,
@@ -320,12 +346,12 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         tokenProgram: terms.tokenProgram,
       });
     }
-    const feePayer = prepared[0]?.feePayer;
-    if (!feePayer || prepared.some(item => item.feePayer !== feePayer)) {
+    const feePayer = validated[0]?.feePayer;
+    if (!feePayer || validated.some(item => item.feePayer !== feePayer)) {
       throw new Error(BatchError.FEE_PAYER_MISMATCH);
     }
     await Promise.all(
-      prepared.map(item =>
+      validated.map(item =>
         this.trackChannel({
           channelId: item.channelId,
           expiresAt: item.expiresAt,
@@ -337,22 +363,28 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     );
     // Keyed by exactly what this batch advances, so a retry of the same claim
     // reconciles while a different one proceeds.
-    const claimKey = `batch:claim:${requirements.network}:${prepared
+    const claimKey = `batch:claim:${requirements.network}:${validated
       .map(item => `${item.channelId}:${item.cumulative}`)
       .sort()
       .join(",")}`;
     const submitted = await this.submitRedemption(
       feePayer,
       requirements.network,
-      prepared.flatMap(item => item.instructions),
+      validated.flatMap(item => item.instructions),
       claimKey,
-      prepared[0]?.channel.payer ?? "",
+      validated[0]?.channel.payer ?? "",
     );
     if (!submitted.ok) return submitted.response;
     const signature = submitted.signature;
+    const confirmedChannels = await this.fetchChannels(
+      requirements.network,
+      validated.map(item => item.channelId),
+    );
     const accepts = [];
-    for (const item of prepared) {
-      const confirmed = await this.fetchChannel(requirements.network, item.channelId);
+    for (let index = 0; index < validated.length; index += 1) {
+      const item = validated[index]!;
+      const confirmed = confirmedChannels[index];
+      if (!confirmed) throw new Error(BatchError.CHANNEL_STATE);
       if (confirmed.settlement.settled !== item.cumulative) {
         throw new Error(BatchError.CHANNEL_STATE);
       }
@@ -377,6 +409,18 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (payload.channels.length > MAX_CHANNELS_PER_SETTLE_TX) {
       throw new Error(`${BatchError.PAYLOAD_TYPE}: too many channels`);
     }
+    const resolved = await Promise.all(
+      payload.channels.map(async entry => {
+        const terms = await this.resolveTerms(entry.channelConfig, requirements);
+        const channelId = await this.deriveChannelId(entry.channelConfig, terms.feePayer);
+        if (channelId !== entry.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
+        return { channelId, entry, terms };
+      }),
+    );
+    const channels = await this.readChannels(
+      requirements.network,
+      resolved.map(item => item.channelId),
+    );
     const prepared: {
       channelId: string;
       feePayer: string;
@@ -384,11 +428,10 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       payoutBefore: bigint;
       settled: bigint;
     }[] = [];
-    for (const entry of payload.channels) {
-      const terms = await this.resolveTerms(entry.channelConfig, requirements);
-      const channelId = await this.deriveChannelId(entry.channelConfig, terms.feePayer);
-      if (channelId !== entry.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
-      const channel = await this.fetchChannel(requirements.network, channelId);
+    for (let index = 0; index < resolved.length; index += 1) {
+      const { channelId, entry, terms } = resolved[index]!;
+      const channel = channels[index];
+      if (!channel) throw new Error(`${BatchError.CHANNEL_STATE}: channel not found`);
       this.assertClaimChannel(channel, entry.channelConfig, terms, requirements, [
         ChannelStatus.Open,
         ChannelStatus.Sealed,
@@ -419,8 +462,14 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     );
     if (!submitted.ok) return submitted.response;
     const signature = submitted.signature;
-    for (const item of prepared) {
-      const confirmed = await this.fetchChannel(requirements.network, item.channelId);
+    const confirmedChannels = await this.fetchChannels(
+      requirements.network,
+      prepared.map(item => item.channelId),
+    );
+    for (let index = 0; index < prepared.length; index += 1) {
+      const item = prepared[index]!;
+      const confirmed = confirmedChannels[index];
+      if (!confirmed) throw new Error(BatchError.CHANNEL_STATE);
       if (confirmed.settlement.payoutWatermark !== item.settled) {
         throw new Error(`${BatchError.CHANNEL_STATE}: distribution watermark did not advance`);
       }
@@ -444,6 +493,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
   private async validateDeposit(
     payload: BatchDepositPayload,
     requirements: PaymentRequirements,
+    alreadyLanded = false,
   ): Promise<ValidatedDeposit> {
     const terms = await this.resolveTerms(payload.channelConfig, requirements);
     const deposit = parseU64(payload.deposit.amount, "deposit.amount");
@@ -465,53 +515,63 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (!voucherValid) throw new Error(`${BatchError.VOUCHER_SIGNATURE}: invalid voucher`);
     this.assertExpiry(payload.voucher.expiresAt);
     const existing = await this.readChannel(requirements.network, channelId);
-    if (existing) {
-      this.assertClaimChannel(existing, payload.channelConfig, terms, requirements, [
-        ChannelStatus.Open,
-      ]);
-      const expectedDeposit = existing.deposit + deposit;
-      if (voucherAmount < charge || voucherAmount > expectedDeposit) {
-        throw new Error(
-          `${BatchError.CUMULATIVE_AMOUNT_MISMATCH}: voucher exceeds topped-up ceiling`,
-        );
-      }
-      await verifyTopUpTransaction(payload.deposit.transaction, {
-        amount: deposit,
-        channelId,
+
+    // Classify the signed transaction from its instructions, not from current
+    // chain state. A retry may observe an `open` that landed after the first
+    // confirmation wait timed out; treating that same wire payload as a
+    // `top_up` is both incorrect and unrecoverable.
+    let openError: unknown;
+    try {
+      const open = await verifyOpenTransaction(payload.deposit.transaction, {
+        authorizedSigner: payload.channelConfig.payerAuthorizer,
         feePayer: terms.feePayer,
         from: payload.channelConfig.payer,
+        maxCap: deposit,
         maxComputeUnits: this.config.maxComputeUnits,
         maxPriorityFeeMicroLamports: this.config.maxPriorityFeeMicroLamports,
+        maxRequiredSignatures: this.config.maxRequiredSignatures,
         memo: terms.memo,
         mint: requirements.asset,
+        openSlot: BigInt(payload.channelConfig.openSlot),
+        payee: terms.feePayer,
+        recentSlot: parseOptionalSlot(requirements.extra?.recentSlot),
+        recipients: [{ bps: 10_000, recipient: requirements.payTo }],
         tokenProgram: terms.tokenProgram,
+        withdrawDelay: terms.withdrawDelay,
       });
-      return { channelId, deposit, expectedDeposit, isTopUp: true, payload, terms };
+      if (open.channelId !== channelId) {
+        throw new Error(`${BatchError.CHANNEL_ID_MISMATCH}: setup transaction channel mismatch`);
+      }
+      if (voucherAmount !== charge || voucherAmount > deposit) {
+        throw new Error(`${BatchError.CUMULATIVE_AMOUNT_MISMATCH}: invalid first voucher amount`);
+      }
+      return { channelId, deposit, expectedDeposit: deposit, isTopUp: false, payload, terms };
+    } catch (error) {
+      openError = error;
     }
-    if (voucherAmount !== charge || voucherAmount > deposit) {
-      throw new Error(`${BatchError.CUMULATIVE_AMOUNT_MISMATCH}: invalid first voucher amount`);
+
+    if (!existing) throw openError;
+    this.assertClaimChannel(existing, payload.channelConfig, terms, requirements, [
+      ChannelStatus.Open,
+    ]);
+    const expectedDeposit = existing.deposit + (alreadyLanded ? 0n : deposit);
+    if (voucherAmount < charge || voucherAmount > expectedDeposit) {
+      throw new Error(
+        `${BatchError.CUMULATIVE_AMOUNT_MISMATCH}: voucher exceeds topped-up ceiling`,
+      );
     }
-    const open = await verifyOpenTransaction(payload.deposit.transaction, {
-      authorizedSigner: payload.channelConfig.payerAuthorizer,
+    await verifyTopUpTransaction(payload.deposit.transaction, {
+      amount: deposit,
+      channelId,
       feePayer: terms.feePayer,
       from: payload.channelConfig.payer,
-      maxCap: deposit,
       maxComputeUnits: this.config.maxComputeUnits,
       maxPriorityFeeMicroLamports: this.config.maxPriorityFeeMicroLamports,
-      maxRequiredSignatures: this.config.maxRequiredSignatures,
       memo: terms.memo,
       mint: requirements.asset,
-      openSlot: BigInt(payload.channelConfig.openSlot),
-      payee: terms.feePayer,
-      recentSlot: parseOptionalSlot(requirements.extra?.recentSlot),
-      recipients: [{ bps: 10_000, recipient: requirements.payTo }],
       tokenProgram: terms.tokenProgram,
-      withdrawDelay: terms.withdrawDelay,
     });
-    if (open.channelId !== channelId) {
-      throw new Error(`${BatchError.CHANNEL_ID_MISMATCH}: setup transaction channel mismatch`);
-    }
-    return { channelId, deposit, expectedDeposit: deposit, isTopUp: false, payload, terms };
+    return { channelId, deposit, expectedDeposit, isTopUp: true, payload, terms };
   }
 
   private async settleDeposit(
@@ -519,11 +579,33 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     payload: BatchDepositPayload,
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
-    const validated = await this.validateDeposit(payload, requirements);
-    const { channelId, terms } = validated;
     // A channel can be opened once and topped up many times. Deduplicate only
     // an identical signed setup transaction, never all deposits for a channel.
     const key = `batch:deposit:${requirements.network}:${payload.deposit.transaction}`;
+    const recorded = await this.pendingStore.get(key);
+    if (recorded) {
+      const reconciled = await this.reconcileBroadcast(
+        key,
+        recorded,
+        requirements.network,
+        payload.channelConfig.payer,
+      );
+      if (!reconciled.ok) return reconciled.response;
+      const validated = await this.validateDeposit(payload, requirements, true);
+      const channel = await this.fetchChannel(requirements.network, validated.channelId);
+      this.assertDepositChannel(channel, validated, requirements);
+      return depositResponse(
+        validated.channelId,
+        channel,
+        requirements.network,
+        reconciled.signature,
+        parseU64(requirements.amount, "amount"),
+        parseU64(payload.voucher.maxClaimableAmount, "maxClaimableAmount"),
+      );
+    }
+
+    const validated = await this.validateDeposit(payload, requirements);
+    const { channelId, terms } = validated;
     if ((await this.readChannel(requirements.network, channelId)) && !validated.isTopUp) {
       const existing = await this.fetchChannel(requirements.network, channelId);
       this.assertDepositChannel(existing, validated, requirements);
@@ -550,7 +632,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       // used by `upto` too.
       await simulateOpenSettleDistribute(
         terms.feePayerSigner,
-        createRpcClient(requirements.network, this.config.rpcUrl),
+        this.config.rpcClient ?? createRpcClient(requirements.network, this.config.rpcUrl),
         {
           channel: {
             channelId,
@@ -773,11 +855,8 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           "Use toFacilitatorSvmSigner() which provides all required methods.",
       );
     }
-    const mint = await this.signer.getAccountInfo(requirements.asset, requirements.network, {
-      commitment: "confirmed",
-      encoding: "base64",
-    });
-    if (!mint || mint.owner.toString() !== tokenProgram) {
+    const mintOwner = await this.getMintOwner(requirements.network, requirements.asset);
+    if (mintOwner !== tokenProgram) {
       throw new Error(BatchError.TOKEN_PROGRAM);
     }
     const memo = extra.memo;
@@ -1012,10 +1091,83 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     return getChannelDecoder().decode(Buffer.from(encoded, "base64"));
   }
 
+  /**
+   * Read several channel accounts through one RPC request when supported.
+   *
+   * @param network - CAIP-2 network to read from
+   * @param channelIds - Channel PDAs in response order
+   * @returns Decoded channels with undefined entries for absent accounts
+   */
+  private async readChannels(
+    network: string,
+    channelIds: readonly string[],
+  ): Promise<(Channel | undefined)[]> {
+    if (typeof this.signer.getMultipleAccounts !== "function") {
+      return Promise.all(channelIds.map(channelId => this.readChannel(network, channelId)));
+    }
+    const accounts = await this.signer.getMultipleAccounts(channelIds, network, {
+      commitment: "confirmed",
+      encoding: "base64",
+    });
+    if (accounts.length !== channelIds.length) {
+      throw new Error(`${BatchError.CHANNEL_STATE}: incomplete batched account response`);
+    }
+    return accounts.map(account => {
+      if (!account) return undefined;
+      const encoded = Array.isArray(account.data) ? account.data[0] : account.data;
+      return getChannelDecoder().decode(Buffer.from(encoded, "base64"));
+    });
+  }
+
+  /**
+   * Read and cache a mint's immutable owner program.
+   *
+   * @param network - CAIP-2 network to read from
+   * @param mintAddress - Mint account address
+   * @returns Owning token program address
+   */
+  private async getMintOwner(network: string, mintAddress: string): Promise<string> {
+    const key = `${network}:${mintAddress}`;
+    const cached = this.mintOwnerCache.get(key);
+    if (cached) return cached;
+    if (typeof this.signer.getAccountInfo !== "function") {
+      throw new Error(
+        "BatchSvmScheme requires getAccountInfo on the facilitator signer. " +
+          "Use toFacilitatorSvmSigner() which provides all required methods.",
+      );
+    }
+    const read = this.signer
+      .getAccountInfo(mintAddress, network, { commitment: "confirmed", encoding: "base64" })
+      .then(account => {
+        if (!account) throw new Error(BatchError.TOKEN_PROGRAM);
+        return account.owner.toString();
+      });
+    this.mintOwnerCache.set(key, read);
+    try {
+      return await read;
+    } catch (error) {
+      this.mintOwnerCache.delete(key);
+      throw error;
+    }
+  }
+
   private async fetchChannel(network: string, channelId: string): Promise<Channel> {
     for (let attempt = 0; attempt < CHANNEL_READ_ATTEMPTS; attempt += 1) {
       const channel = await this.readChannel(network, channelId);
       if (channel) return channel;
+      if (attempt + 1 < CHANNEL_READ_ATTEMPTS) {
+        await new Promise(resolve =>
+          setTimeout(resolve, CHANNEL_READ_INITIAL_BACKOFF_MS * 2 ** attempt),
+        );
+      }
+    }
+    throw new Error(`${BatchError.CHANNEL_STATE}: channel is not visible after confirmation`);
+  }
+
+  private async fetchChannels(network: string, channelIds: readonly string[]): Promise<Channel[]> {
+    for (let attempt = 0; attempt < CHANNEL_READ_ATTEMPTS; attempt += 1) {
+      const channels = await this.readChannels(network, channelIds);
+      if (channels.every((channel): channel is Channel => channel !== undefined)) return channels;
       if (attempt + 1 < CHANNEL_READ_ATTEMPTS) {
         await new Promise(resolve =>
           setTimeout(resolve, CHANNEL_READ_INITIAL_BACKOFF_MS * 2 ** attempt),
