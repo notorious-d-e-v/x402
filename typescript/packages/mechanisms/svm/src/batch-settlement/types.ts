@@ -174,6 +174,7 @@ export function isBatchFacilitatorPayload(value: unknown): value is BatchFacilit
     value.type === "settle" &&
     Array.isArray(value.channels) &&
     value.channels.length > 0 &&
+    value.channels.length <= 4 &&
     value.channels.every(
       item =>
         isRecord(item) &&

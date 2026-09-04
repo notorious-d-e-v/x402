@@ -43,6 +43,8 @@ export interface ChannelState {
   signedMaxClaimable: bigint;
   /** On-chain settled watermark (advanced by `settleBatch`). */
   settled: bigint;
+  /** Millisecond timestamp of the last confirmed onchain snapshot. */
+  onchainSnapshotAt?: number | undefined;
   /** Cumulative distributed on-chain (base units). */
   payoutWatermark: bigint;
   /** Channel lifecycle status. */
@@ -74,6 +76,12 @@ export interface ChannelState {
  * concurrent voucher acceptance for the same channel is serialized.
  */
 export interface ChannelStore {
+  /**
+   * True only when records and leases survive process loss and are shared by
+   * every server/worker instance using this store.
+   */
+  readonly durable?: boolean;
+
   /**
    * Fetch a channel's state.
    *
@@ -111,12 +119,22 @@ export interface ChannelStore {
     channelId: string,
     updater: (current: ChannelState | undefined) => ChannelState | Promise<ChannelState>,
   ): Promise<ChannelState>;
+
+  /**
+   * Try to acquire a cross-process worker lease. Durable production stores
+   * should implement this with an atomic compare-and-set (for example Redis
+   * `SET NX PX` or a database advisory lock) and return a fencing-safe release
+   * function. Request serving does not require it; redemption workers do.
+   */
+  acquireLease?(key: string, ttlMs: number): Promise<(() => Promise<void>) | undefined>;
 }
 
 /** In-memory {@link ChannelStore} with per-channel serialization. */
 export class MemoryChannelStore implements ChannelStore {
+  readonly durable = false;
   private readonly channels = new Map<string, ChannelState>();
   private readonly locks = new Map<string, Promise<unknown>>();
+  private readonly leases = new Map<string, symbol>();
 
   /** @inheritdoc */
   /**
@@ -162,5 +180,15 @@ export class MemoryChannelStore implements ChannelStore {
       ),
     );
     return run;
+  }
+
+  /** @inheritdoc */
+  async acquireLease(key: string): Promise<(() => Promise<void>) | undefined> {
+    if (this.leases.has(key)) return undefined;
+    const token = Symbol(key);
+    this.leases.set(key, token);
+    return async () => {
+      if (this.leases.get(key) === token) this.leases.delete(key);
+    };
   }
 }

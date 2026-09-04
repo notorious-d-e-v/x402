@@ -37,6 +37,8 @@ export interface BatchChannelManagerConfig {
   requirements: PaymentRequirements;
   /** Channels per claim transaction. Defaults to the spec's four. */
   maxChannelsPerBatch?: number | undefined;
+  /** Cross-process lease duration for one redemption pass. Defaults to 5 minutes. */
+  leaseTtlMs?: number | undefined;
   /** Reports a pass that failed, so an operator can see it. */
   onError?: ((error: unknown) => void) | undefined;
 }
@@ -66,7 +68,17 @@ export class BatchChannelManager {
    *
    * @param config - Store, settler and the terms to redeem against
    */
-  constructor(private readonly config: BatchChannelManagerConfig) {}
+  constructor(private readonly config: BatchChannelManagerConfig) {
+    const size = config.maxChannelsPerBatch ?? MAX_CHANNELS_PER_BATCH;
+    if (!Number.isInteger(size) || size < 1 || size > MAX_CHANNELS_PER_BATCH) {
+      throw new Error(
+        `maxChannelsPerBatch must be an integer from 1 through ${MAX_CHANNELS_PER_BATCH}`,
+      );
+    }
+    if (typeof config.store.acquireLease !== "function") {
+      throw new Error("BatchChannelManager requires a cross-process-capable worker lease");
+    }
+  }
 
   /**
    * Run one redemption pass: claim what has vouchers, pay out what settles.
@@ -121,13 +133,29 @@ export class BatchChannelManager {
     if (typeof this.config.store.list !== "function") {
       throw new Error("BatchChannelManager requires a channel store that can list its channels");
     }
-    const list = this.config.store.list.bind(this.config.store);
-    const claimed = await this.claim(await list());
-    // Re-read before paying out: a claim in this same pass just advanced the
-    // watermarks that decide what there is to distribute, so the snapshot the
-    // pass opened with is already stale.
-    const distributed = await this.distribute(await list());
-    return { claimed, distributed };
+    const leaseKey = [
+      "batch-redemption",
+      this.config.requirements.network,
+      this.config.requirements.asset,
+      this.config.requirements.payTo,
+      this.config.requirements.extra?.feePayer ?? "",
+    ].join(":");
+    const release = await this.config.store.acquireLease!(
+      leaseKey,
+      this.config.leaseTtlMs ?? 5 * 60 * 1_000,
+    );
+    if (!release) return { claimed: [], distributed: [] };
+    try {
+      const list = this.config.store.list.bind(this.config.store);
+      const claimed = await this.claim(await list());
+      // Re-read before paying out: a claim in this same pass just advanced the
+      // watermarks that decide what there is to distribute, so the snapshot the
+      // pass opened with is already stale.
+      const distributed = await this.distribute(await list());
+      return { claimed, distributed };
+    } finally {
+      await release();
+    }
   }
 
   /**
@@ -252,7 +280,7 @@ export class BatchChannelManager {
    * @returns Channels to pack into one redemption transaction
    */
   private batchSize(): number {
-    return Math.max(1, this.config.maxChannelsPerBatch ?? MAX_CHANNELS_PER_BATCH);
+    return this.config.maxChannelsPerBatch ?? MAX_CHANNELS_PER_BATCH;
   }
 }
 
