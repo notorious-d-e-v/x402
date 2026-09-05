@@ -177,6 +177,17 @@ describe.each([false, true])("deposit settlement path (topup=%s)", topup => {
       expect(f.sign).not.toHaveBeenCalled();
     });
   }
+  it("reverifies an already confirmed open without simulating escrow creation again", async () => {
+    const f = await fixture(true);
+    f.payment.payload = structuredClone(built.payload);
+    f.simulation.mockImplementation(() => ({
+      send: async () => ({ value: { err: "already open", accounts: [] } }),
+    }));
+    expect((await f.scheme.verify(f.payment, f.requirements)).isValid).toBe(true);
+    expect(f.simulation).not.toHaveBeenCalled();
+    expect(f.sign).not.toHaveBeenCalled();
+  });
+
   it("accepts usable accounts and simulates the exact client-signed bytes", async () => {
     const f = await fixture(topup);
     expect(await f.scheme.verify(f.payment, f.requirements)).toEqual(

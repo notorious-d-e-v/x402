@@ -244,7 +244,15 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       switch (payload.type) {
         case "deposit": {
           const validated = await this.validateDeposit(payload, requirements);
-          await this.preflightDeposit(validated, requirements);
+          const existing = validated.isTopUp
+            ? undefined
+            : await this.readChannel(requirements.network, validated.channelId);
+          if (existing) {
+            // An identical, fully bound open is recovery, not new escrow.
+            this.assertDepositChannel(existing, validated, requirements);
+          } else {
+            await this.preflightDeposit(validated, requirements);
+          }
           return {
             isValid: true,
             payer: payload.channelConfig.payer,
@@ -462,6 +470,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     payload: BatchSettlePayload,
     requirements: PaymentRequirements,
     lease?: { assertHeld(): Promise<void> },
+    recoveredSignature = "",
   ): Promise<SettleResponse> {
     void payment;
     const prepared = await this.prepareDistributions(payload, requirements);
@@ -479,7 +488,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     const legacy = await this.pendingStore.get(legacyKey);
     const pendingKey = legacy ? legacyKey : distributeKey;
     const recorded = legacy ?? (await this.pendingStore.get(pendingKey));
-    let signature = "";
+    let signature = recoveredSignature;
     if (recorded) {
       const reconciled = await this.reconcileBroadcast(
         pendingKey,
@@ -492,7 +501,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         throw new Error(`${BatchError.CHANNEL_STATE}: pending record could not be cleared`);
       // The old send may have landed before a newer claim. Re-read the actual
       // remaining delta rather than treating its signature as the new payout.
-      return this.distributeOwned(payment, payload, requirements, lease);
+      return this.distributeOwned(payment, payload, requirements, lease, reconciled.signature);
     }
     if (prepared.some(item => item.payoutBefore < item.settled)) {
       await lease?.assertHeld();

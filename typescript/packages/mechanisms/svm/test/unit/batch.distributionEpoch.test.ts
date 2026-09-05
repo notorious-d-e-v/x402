@@ -193,6 +193,20 @@ describe("confirmed distribution epochs", () => {
       expect(f.balance.escrow + f.balance.receiver).toBe(f.channel.deposit);
     }
   });
+  it("preserves the reconciled signature on an already landed payout", async () => {
+    const f = await ledger();
+    await f.claim(f.restart(), 1000n);
+    f.setTimeout(true);
+    const pending = await f.restart().settle(f.distribution, f.requirements);
+    f.setTimeout(false);
+    expect(await f.restart().settle(f.distribution, f.requirements)).toMatchObject({
+      success: true,
+      transaction: pending.transaction,
+    });
+    expect(f.send).toHaveBeenCalledTimes(2);
+    expect(f.balance.receiver).toBe(1000n);
+  });
+
   it.each([false, true])(
     "recovers confirmation timeout (landed=%s) after restart",
     async landed => {
