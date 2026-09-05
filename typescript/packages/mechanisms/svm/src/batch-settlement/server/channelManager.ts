@@ -247,10 +247,26 @@ export class BatchChannelManager {
         );
         continue;
       }
+      const payouts = response.extra?.payouts;
+      if (
+        response.network !== this.config.requirements.network ||
+        !Array.isArray(payouts) ||
+        payouts.length !== batch.length ||
+        batch.some(channel => {
+          const matches = payouts.filter(item => item?.channelId === channel.channelId);
+          return matches.length !== 1 || matches[0]?.payoutWatermark !== channel.settled.toString();
+        })
+      ) {
+        this.config.onError?.(
+          new Error(`${BATCH_SETTLEMENT_SCHEME} distribute missing confirmed payout watermark`),
+        );
+        continue;
+      }
       for (const channel of batch) {
         await this.record(channel.channelId, state => ({
           ...state,
-          payoutWatermark: channel.settled,
+          payoutWatermark:
+            state.payoutWatermark > channel.settled ? state.payoutWatermark : channel.settled,
         }));
         distributed.push(channel.channelId);
       }

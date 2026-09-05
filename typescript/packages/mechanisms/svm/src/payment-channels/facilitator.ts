@@ -420,6 +420,8 @@ export async function simulateZeroChargeSettle(
 
 /** Options for {@link submitSettle}. */
 export interface SubmitSettleOptions {
+  /** Recheck cross-process ownership immediately before sending. */
+  beforeBroadcast?: (() => Promise<void>) | undefined;
   /**
    * `SetComputeUnitLimit` for the settlement transaction. Defaults to
    * {@link DEFAULT_SETTLE_COMPUTE_UNIT_LIMIT} (100k), sized for standard SPL
@@ -542,6 +544,7 @@ export async function submitChannelTransactionWithSigner(
   } catch (error) {
     throw new ChannelSimulationError(error);
   }
+  await options.beforeBroadcast?.();
   const signature = (await signer.sendTransaction(wire, network)) as Signature;
   await options.onBroadcast?.(signature);
   try {

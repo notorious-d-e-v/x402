@@ -20,6 +20,7 @@ import {
   buildDistributeInstruction,
   buildSettleInstructions,
   ChannelStatus,
+  PAYMENT_CHANNELS_PROGRAM_ID,
   type ServerInstruction,
 } from "../../payment-channels/onchain";
 import {
@@ -80,6 +81,19 @@ const CHANNEL_READ_INITIAL_BACKOFF_MS = 200;
 export const MAX_CHANNELS_PER_SETTLE_TX = 4;
 
 export interface BatchSvmFacilitatorConfig {
+  /** Shared per-channel ownership across API/worker instances and claim epochs. */
+  acquireDistributionLease?:
+    | ((
+        network: string,
+        channels: readonly string[],
+      ) => Promise<
+        | {
+            assertHeld(): Promise<void>;
+            release(): Promise<void>;
+          }
+        | undefined
+      >)
+    | undefined;
   rpcUrl?: string | undefined;
   /**
    * Shared RPC used by composite setup simulation. Production facilitators
@@ -192,6 +206,29 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
   ): Promise<VerifyResponse> {
     const payload = payment.payload;
+    if (isBatchFacilitatorPayload(payload) && payload.type === "settle") {
+      try {
+        if (
+          payment.accepted.network !== requirements.network ||
+          payment.accepted.scheme !== BATCH_SETTLEMENT_SCHEME ||
+          requirements.scheme !== BATCH_SETTLEMENT_SCHEME
+        )
+          throw new Error(BatchError.PAYLOAD_TYPE);
+        const prepared = await this.prepareDistributions(payload, requirements);
+        return {
+          isValid: true,
+          payer: "",
+          extra: {
+            distributionEpoch: prepared.map(item => ({
+              channelId: item.channelId,
+              settled: item.settled.toString(),
+            })),
+          },
+        };
+      } catch (error) {
+        return this.verifyFailure(BatchError.CHANNEL_STATE, "", String(error));
+      }
+    }
     if (!isBatchPayload(payload)) return this.verifyFailure(BatchError.PAYLOAD_TYPE, "");
     if (
       payment.accepted.scheme !== BATCH_SETTLEMENT_SCHEME ||
@@ -405,8 +442,113 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     payload: BatchSettlePayload,
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
+    const lease = await this.config.acquireDistributionLease?.(
+      requirements.network,
+      payload.channels.map(c => c.channelId),
+    );
+    if (this.config.acquireDistributionLease && !lease) {
+      return this.settleFailure(payment, ErrSettlementPending, "");
+    }
+    try {
+      return await this.distributeOwned(payment, payload, requirements, lease);
+    } finally {
+      await lease?.release();
+    }
+  }
+
+  private async distributeOwned(
+    payment: PaymentPayload,
+    payload: BatchSettlePayload,
+    requirements: PaymentRequirements,
+    lease?: { assertHeld(): Promise<void> },
+  ): Promise<SettleResponse> {
     void payment;
-    if (payload.channels.length > MAX_CHANNELS_PER_SETTLE_TX) {
+    const prepared = await this.prepareDistributions(payload, requirements);
+    const feePayer = prepared[0]!.feePayer;
+    // The durable broadcast identity spans claim epochs: finish an ambiguous
+    // older send before funding another distribution, even after restart.
+    const distributeKey = `batch:distribute:v2:${requirements.network}:${prepared
+      .map(item => item.channelId)
+      .sort()
+      .join(",")}`;
+    const legacyKey = `batch:distribute:${requirements.network}:${prepared
+      .map(item => `${item.channelId}:${item.settled}`)
+      .sort()
+      .join(",")}`;
+    const legacy = await this.pendingStore.get(legacyKey);
+    const pendingKey = legacy ? legacyKey : distributeKey;
+    const recorded = legacy ?? (await this.pendingStore.get(pendingKey));
+    let signature = "";
+    if (recorded) {
+      const reconciled = await this.reconcileBroadcast(
+        pendingKey,
+        recorded,
+        requirements.network,
+        "",
+      );
+      if (!reconciled.ok) return reconciled.response;
+      if (await this.pendingStore.get(pendingKey))
+        throw new Error(`${BatchError.CHANNEL_STATE}: pending record could not be cleared`);
+      // The old send may have landed before a newer claim. Re-read the actual
+      // remaining delta rather than treating its signature as the new payout.
+      return this.distributeOwned(payment, payload, requirements, lease);
+    }
+    if (prepared.some(item => item.payoutBefore < item.settled)) {
+      await lease?.assertHeld();
+      const submitted = await this.submitRedemption(
+        feePayer,
+        requirements.network,
+        prepared.filter(item => item.payoutBefore < item.settled).map(item => item.instruction),
+        distributeKey,
+        "",
+        lease ? () => lease.assertHeld() : undefined,
+      );
+      if (!submitted.ok) return submitted.response;
+      signature = submitted.signature;
+    }
+    const confirmedChannels = await this.fetchChannels(
+      requirements.network,
+      prepared.map(item => item.channelId),
+    );
+    for (let index = 0; index < prepared.length; index += 1) {
+      const item = prepared[index]!;
+      const confirmed = confirmedChannels[index];
+      if (!confirmed) throw new Error(BatchError.CHANNEL_STATE);
+      if (confirmed.settlement.payoutWatermark !== item.settled) {
+        throw new Error(`${BatchError.CHANNEL_STATE}: distribution watermark did not advance`);
+      }
+    }
+    const amount = calculateDistributionAmount(
+      prepared.map(item => ({
+        payoutWatermark: item.payoutBefore,
+        settled: item.settled,
+      })),
+    );
+    return {
+      amount: amount.toString(),
+      extra: {
+        channels: prepared.map(item => item.channelId),
+        payouts: prepared.map(item => ({
+          channelId: item.channelId,
+          payoutWatermark: item.settled.toString(),
+        })),
+      },
+      network: requirements.network,
+      payer: "",
+      success: true,
+      transaction: signature,
+    };
+  }
+
+  private async prepareDistributions(
+    payload: BatchSettlePayload,
+    requirements: PaymentRequirements,
+  ) {
+    if (
+      payload.channels.length === 0 ||
+      payload.channels.length > MAX_CHANNELS_PER_SETTLE_TX ||
+      new Set(payload.channels.map(item => item.channelId)).size !== payload.channels.length
+    ) {
       throw new Error(`${BatchError.PAYLOAD_TYPE}: too many channels`);
     }
     const resolved = await Promise.all(
@@ -448,46 +590,10 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (!feePayer || prepared.some(item => item.feePayer !== feePayer)) {
       throw new Error(BatchError.FEE_PAYER_MISMATCH);
     }
-    const distributeKey = `batch:distribute:${requirements.network}:${prepared
-      .map(item => `${item.channelId}:${item.settled}`)
-      .sort()
-      .join(",")}`;
-    const submitted = await this.submitRedemption(
-      feePayer,
-      requirements.network,
-      prepared.map(item => item.instruction),
-      distributeKey,
-      // A distribution names no payer: it pays the receiver from settled funds.
-      "",
-    );
-    if (!submitted.ok) return submitted.response;
-    const signature = submitted.signature;
-    const confirmedChannels = await this.fetchChannels(
-      requirements.network,
-      prepared.map(item => item.channelId),
-    );
-    for (let index = 0; index < prepared.length; index += 1) {
-      const item = prepared[index]!;
-      const confirmed = confirmedChannels[index];
-      if (!confirmed) throw new Error(BatchError.CHANNEL_STATE);
-      if (confirmed.settlement.payoutWatermark !== item.settled) {
-        throw new Error(`${BatchError.CHANNEL_STATE}: distribution watermark did not advance`);
-      }
+    for (const item of prepared) {
+      if (item.payoutBefore > item.settled) throw new Error(BatchError.CHANNEL_STATE);
     }
-    const amount = calculateDistributionAmount(
-      prepared.map(item => ({
-        payoutWatermark: item.payoutBefore,
-        settled: item.settled,
-      })),
-    );
-    return {
-      amount: amount.toString(),
-      extra: { channels: prepared.map(item => item.channelId) },
-      network: requirements.network,
-      payer: "",
-      success: true,
-      transaction: signature,
-    };
+    return prepared;
   }
 
   private async validateDeposit(
@@ -1027,6 +1133,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
    * @param instructions - The batch's channel instructions
    * @param key - Deterministic key for this exact batch
    * @param payer - Payer reported on a pending or failed response
+   * @param beforeBroadcast - Recheck ownership after simulation
    * @returns The confirmed signature, or the response to answer with
    */
   private async submitRedemption(
@@ -1035,6 +1142,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     instructions: readonly ServerInstruction[],
     key: string,
     payer: string,
+    beforeBroadcast?: () => Promise<void>,
   ): Promise<{ ok: true; signature: Signature } | { ok: false; response: SettleResponse }> {
     const broadcast = await this.broadcastDurably(key, network, payer, async onBroadcast => {
       try {
@@ -1043,7 +1151,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           this.signer,
           network,
           instructions,
-          { onBroadcast },
+          { onBroadcast, beforeBroadcast },
         );
       } catch (error) {
         if (error instanceof ChannelSimulationError) {
@@ -1087,6 +1195,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       encoding: "base64",
     });
     if (!account) return undefined;
+    if (account.owner !== PAYMENT_CHANNELS_PROGRAM_ID) throw new Error(BatchError.CHANNEL_STATE);
     const encoded = Array.isArray(account.data) ? account.data[0] : account.data;
     return getChannelDecoder().decode(Buffer.from(encoded, "base64"));
   }
@@ -1114,6 +1223,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     }
     return accounts.map(account => {
       if (!account) return undefined;
+      if (account.owner !== PAYMENT_CHANNELS_PROGRAM_ID) throw new Error(BatchError.CHANNEL_STATE);
       const encoded = Array.isArray(account.data) ? account.data[0] : account.data;
       return getChannelDecoder().decode(Buffer.from(encoded, "base64"));
     });

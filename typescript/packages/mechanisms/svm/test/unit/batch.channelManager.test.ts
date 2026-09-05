@@ -1,5 +1,5 @@
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { BatchChannelManager } from "../../src/batch-settlement/server/channelManager";
 import { MemoryChannelStore, type ChannelState } from "../../src/batch-settlement/server/storage";
@@ -72,7 +72,17 @@ function recorder(answer: (type: string) => SettleResponse = () => ok()) {
         .concat((raw.channels ?? []).map(c => c.channelId)),
       type: raw.type,
     });
-    return answer(raw.type);
+    const response = answer(raw.type);
+    return {
+      ...response,
+      extra: {
+        payouts: (raw.channels ?? []).map(c => ({
+          channelId: c.channelId,
+          payoutWatermark: "3000",
+        })),
+        ...response.extra,
+      },
+    };
   };
   return { settle, submitted };
 }
@@ -82,6 +92,26 @@ function ok(): SettleResponse {
 }
 
 describe("batch-settlement redemption worker", () => {
+  it("does not mark a new payout complete from stale or unproven success", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a", { settled: 3000n }));
+    const onError = vi.fn();
+    for (const extra of [
+      undefined,
+      { payouts: [{ channelId: "chan-a", payoutWatermark: "1000" }] },
+    ]) {
+      const manager = new BatchChannelManager({
+        store,
+        requirements: requirements(),
+        onError,
+        settle: async () => ({ ...ok(), extra }),
+      });
+      expect((await manager.redeem()).distributed).toEqual([]);
+      expect((await store.get("chan-a"))?.payoutWatermark).toBe(0n);
+    }
+    expect(onError).toHaveBeenCalledTimes(2);
+  });
+
   it("claims unclaimed vouchers, then distributes what they settled", async () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a"));
