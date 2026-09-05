@@ -1,3 +1,4 @@
+import { settlementPath, verifySettlementPath } from "./settlementPath";
 /* eslint-disable jsdoc/require-jsdoc */
 import { address, type Signature } from "@solana/kit";
 import type {
@@ -39,7 +40,6 @@ import type {
 import {
   broadcastOpen,
   getChannelDistributionHash,
-  simulateOpenSettleDistribute,
   submitChannelTransactionWithSigner,
   ChannelSimulationError,
   ChannelBroadcastConfirmationError,
@@ -244,6 +244,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       switch (payload.type) {
         case "deposit": {
           const validated = await this.validateDeposit(payload, requirements);
+          await this.preflightDeposit(validated, requirements);
           return {
             isValid: true,
             payer: payload.channelConfig.payer,
@@ -621,6 +622,13 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (!voucherValid) throw new Error(`${BatchError.VOUCHER_SIGNATURE}: invalid voucher`);
     this.assertExpiry(payload.voucher.expiresAt);
     const existing = await this.readChannel(requirements.network, channelId);
+    const { setupAccounts } = await settlementPath(
+      requirements.asset,
+      terms.tokenProgram,
+      payload.channelConfig.payer,
+      requirements.payTo,
+      requirements.network,
+    );
 
     // Classify the signed transaction from its instructions, not from current
     // chain state. A retry may observe an `open` that landed after the first
@@ -629,6 +637,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     let openError: unknown;
     try {
       const open = await verifyOpenTransaction(payload.deposit.transaction, {
+        setupAccounts,
         authorizedSigner: payload.channelConfig.payerAuthorizer,
         feePayer: terms.feePayer,
         from: payload.channelConfig.payer,
@@ -667,6 +676,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       );
     }
     await verifyTopUpTransaction(payload.deposit.transaction, {
+      setupAccounts,
       amount: deposit,
       channelId,
       feePayer: terms.feePayer,
@@ -678,6 +688,19 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       tokenProgram: terms.tokenProgram,
     });
     return { channelId, deposit, expectedDeposit, isTopUp: true, payload, terms };
+  }
+
+  private async preflightDeposit(validated: ValidatedDeposit, requirements: PaymentRequirements) {
+    await verifySettlementPath({
+      mint: requirements.asset,
+      tokenProgram: validated.terms.tokenProgram,
+      payer: validated.payload.channelConfig.payer,
+      recipient: requirements.payTo,
+      network: requirements.network,
+      transaction: validated.payload.deposit.transaction,
+      signer: this.signer,
+      rpc: this.config.rpcClient ?? createRpcClient(requirements.network, this.config.rpcUrl),
+    });
   }
 
   private async settleDeposit(
@@ -727,33 +750,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (this.settlementCache.isDuplicate(key)) {
       return this.settleFailure(payment, "duplicate_settlement", payload.channelConfig.payer);
     }
-    if (validated.isTopUp) {
-      // Simulated unsigned: `sigVerify` is off, so the fee payer's signature
-      // adds nothing here, and not asking for it keeps simulation portable
-      // across signer backends that will not sign the same bytes twice.
-      await this.signer.simulateTransaction(payload.deposit.transaction, requirements.network);
-    } else {
-      // The only read still on its own client: this shared helper simulates
-      // the open/settle/distribute chain through an rpc of its own, and is
-      // used by `upto` too.
-      await simulateOpenSettleDistribute(
-        terms.feePayerSigner,
-        this.config.rpcClient ?? createRpcClient(requirements.network, this.config.rpcUrl),
-        {
-          channel: {
-            channelId,
-            mint: requirements.asset,
-            network: requirements.network,
-            payee: terms.feePayer,
-            payer: payload.channelConfig.payer,
-            rentPayer: terms.feePayer,
-            splits: [{ bps: 10_000, recipient: requirements.payTo }],
-            tokenProgram: terms.tokenProgram,
-          },
-          openTransactionBase64: payload.deposit.transaction,
-        },
-      );
-    }
+    await this.preflightDeposit(validated, requirements);
     await this.trackChannel({
       channelId,
       expiresAt: payload.voucher.expiresAt,

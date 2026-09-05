@@ -487,6 +487,8 @@ export async function buildOpenPaymentChannelTransaction(args: BuildOpenArgs): P
 
 /** Expected values the server validates a client-submitted open transaction against. */
 export interface VerifyOpenExpected {
+  /** Optional exact, client-funded ATA setup prefix (batch settlement only). */
+  setupAccounts?: readonly (readonly string[])[] | undefined;
   /** Receiver authorizer key set as the channel authorized signer (base58). */
   authorizedSigner: string;
   /** Fee payer expected in the transaction fee-payer and rentPayer slots. */
@@ -540,6 +542,8 @@ export interface VerifyOpenExpected {
 
 /** Expected bindings for a canonical six-account `top_up` transaction. */
 export interface VerifyTopUpExpected {
+  /** Optional exact, client-funded ATA setup prefix (batch settlement only). */
+  setupAccounts?: readonly (readonly string[])[] | undefined;
   feePayer: string;
   from: string;
   channelId: string;
@@ -578,6 +582,7 @@ export async function verifyTopUpTransaction(
         MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS,
       ),
       expectedMemo: expected.memo,
+      setupAccounts: expected.setupAccounts,
     },
     TOP_UP_DISCRIMINATOR,
     "top_up",
@@ -735,6 +740,7 @@ export async function verifyOpenTransaction(
     maxComputeUnits,
     maxPriorityFeeMicroLamports,
     expectedMemo: expected.memo,
+    setupAccounts: expected.setupAccounts,
   });
 
   // Required-signer set must equal the distinct addresses in
@@ -844,6 +850,7 @@ export async function verifyOpenTransaction(
     channelAddr,
     payerTokenAccountAddr,
     channelTokenAccountAddr,
+    ...(expected.setupAccounts ?? []).map(accounts => accounts[1]!),
   ]);
   for (let i = 0; i < message.staticAccounts.length; i += 1) {
     const addr = message.staticAccounts[i];
@@ -1001,6 +1008,7 @@ export async function verifyOpenTransaction(
 }
 
 type OpenLayoutLimits = {
+  setupAccounts?: readonly (readonly string[])[] | undefined;
   maxComputeUnits: number;
   maxPriorityFeeMicroLamports: number;
   expectedMemo?: string | undefined;
@@ -1088,6 +1096,45 @@ function findCanonicalOpenInstruction(
       );
     }
     i += 1;
+  }
+
+  const created = new Set<string>();
+  while (
+    instructions[i] &&
+    staticAccounts[instructions[i]!.programAddressIndex] === ASSOCIATED_TOKEN_PROGRAM_ID
+  ) {
+    const setup = instructions[i]!;
+    if (!setup.accountIndices) throw new Error("verifyOpenTransaction: missing ATA accounts");
+    const keys = setup.accountIndices.map(index => staticAccounts[index]);
+    if (
+      keys.length !== 6 ||
+      keys.includes(feePayer) ||
+      created.has(keys[1]!) ||
+      !(
+        setup.data?.length === 0 ||
+        (setup.data?.length === 1 && (setup.data[0] === 0 || setup.data[0] === 1))
+      ) ||
+      !limits.setupAccounts?.some(expected => expected.every((key, slot) => key === keys[slot]))
+    ) {
+      throw new Error("verifyOpenTransaction: invalid client-funded ATA setup");
+    }
+    for (let slot = 0; slot < keys.length; slot++) {
+      const role = staticAccountRole(
+        message.header,
+        staticAccounts.length,
+        setup.accountIndices[slot]!,
+      );
+      if (
+        (slot <= 1 && !isWritableRole(role)) ||
+        (slot === 0 && !isSignerRole(role)) ||
+        (slot !== 0 && keys[slot] !== keys[0] && isSignerRole(role)) ||
+        (slot >= 3 && isWritableRole(role))
+      ) {
+        throw new Error("verifyOpenTransaction: invalid ATA setup privileges");
+      }
+    }
+    created.add(keys[1]!);
+    i++;
   }
 
   const openInstruction = instructions[i];
