@@ -245,14 +245,26 @@ async function scenario(options: {
     const body = payload.payload as {
       type: "claim" | "settle";
       claims?: unknown[];
-      channels?: unknown[];
+      channels?: { channelId: string }[];
     };
     facilitatorCalls[body.type] += 1;
     (body.type === "claim" ? claimBatchSizes : settleBatchSizes).push(
       (body.claims ?? body.channels ?? []).length,
     );
     await new Promise(resolve => setTimeout(resolve, 8));
-    return { network: NETWORK, success: true, transaction: `${body.type}-${Date.now()}` };
+    return {
+      network: NETWORK,
+      success: true,
+      transaction: `${body.type}-${Date.now()}`,
+      extra: {
+        payouts: await Promise.all(
+          (body.channels ?? []).map(async entry => ({
+            channelId: entry.channelId,
+            payoutWatermark: (await store.get(entry.channelId))!.settled.toString(),
+          })),
+        ),
+      },
+    };
   };
   const manager = new BatchChannelManager({
     maxChannelsPerBatch: 4,
