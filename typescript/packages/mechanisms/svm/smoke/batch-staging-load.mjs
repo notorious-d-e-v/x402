@@ -528,6 +528,10 @@ async function parent() {
     api = generateKeyPairSync("ed25519"),
     payers = [Keypair.generate(), Keypair.generate()],
     receiver = Keypair.generate();
+  // Keep recovery signers reachable even after an assertion unwinds the
+  // driver's async frame. Never export this process-memory-only object.
+  const recoveryKey = Symbol.for("payai.batch-load.recovery-wallets");
+  globalThis[recoveryKey] = { payers, receiver };
   config = {
     prefix: `batch-load:${userId}`,
     apiId,
@@ -606,10 +610,27 @@ async function parent() {
         spl.createTransferCheckedInstruction(source, mint, ata, fee.publicKey, 200000n, 6),
       );
     }
+    // An unusable recipient ATA redirects its share to the program treasury.
+    // Provision and validate the synthetic merchant before any channel opens.
+    const receiverAta = await spl.getAssociatedTokenAddress(mint, receiver.publicKey);
+    tx.add(
+      spl.createAssociatedTokenAccountIdempotentInstruction(
+        fee.publicKey,
+        receiverAta,
+        receiver.publicKey,
+        mint,
+      ),
+    );
     report.fundingSignature = await sendAndConfirmTransaction(conn, tx, [fee], {
       commitment: "confirmed",
       maxRetries: 0,
     });
+    const recipientAccount = await conn.getAccountInfo(receiverAta, "confirmed");
+    assert(recipientAccount?.owner.equals(tokenProgram));
+    assert(recipientAccount.data.subarray(0, 32).equals(mint.toBuffer()));
+    assert(recipientAccount.data.subarray(32, 64).equals(receiver.publicKey.toBuffer()));
+    assert.equal(recipientAccount.data[108], 1, "receiver ATA must be initialized and unfrozen");
+    report.receiverAtaValidated = true;
     report.fundedAtomic = "400000";
     report.receiver = config.receiver;
     servers = [await spawn("server", { port: 3100 }), await spawn("server", { port: 3101 })];
@@ -658,16 +679,12 @@ async function parent() {
     }, 10000);
     monitorTimer = setInterval(
       () =>
-        void store
-          .list()
-          .then(rows =>
-            metric("exposure", {
-              unclaimed: String(
-                rows.reduce((n, s) => n + s.chargedCumulativeAmount - s.settled, 0n),
-              ),
-              undistributed: String(rows.reduce((n, s) => n + s.settled - s.payoutWatermark, 0n)),
-            }),
-          ),
+        void store.list().then(rows =>
+          metric("exposure", {
+            unclaimed: String(rows.reduce((n, s) => n + s.chargedCumulativeAmount - s.settled, 0n)),
+            undistributed: String(rows.reduce((n, s) => n + s.settled - s.payoutWatermark, 0n)),
+          }),
+        ),
       1000,
     );
     for (const s of [
@@ -767,6 +784,7 @@ async function parent() {
     report.feeAfter = await conn.getBalance(fee.publicKey);
     assert.equal(await tokenBalance(FEE), 5000000n);
     report.success = true;
+    delete globalThis[recoveryKey];
     advance("complete");
   } catch (e) {
     report.success = false;
