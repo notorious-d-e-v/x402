@@ -1,6 +1,6 @@
 import { generateKeyPairSigner, getTransactionDecoder, getBase64Codec } from "@solana/kit";
 import type { PaymentRequirements } from "@x402/core/types";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { BatchError } from "../../src/batch-settlement/errors";
 import {
@@ -122,7 +122,80 @@ async function signedVoucher(maxClaimableAmount: bigint, expiresAt = 0): Promise
 }
 
 describe("batch-settlement SVM", () => {
+  afterEach(() => vi.restoreAllMocks());
   describe("resource server", () => {
+    it("refreshes during continuous vouchers and rejects an onchain close", async () => {
+      let now = 1_000_000;
+      let closing = false;
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const store = new MemoryChannelStore();
+      await store.put(serverState({ onchainSnapshotAt: 0 }));
+      const readChannel = vi.fn(async () => ({
+        mintOwner: TOKEN_PROGRAM_ADDRESS,
+        observedAt: now,
+        channel: {
+          authorizedSigner: payer.address,
+          bump: 1,
+          closureStartedAt: closing ? 1n : 0n,
+          deposit: 10_000n,
+          discriminator: 1,
+          distributionHash: [...getChannelDistributionHash([{ bps: 10_000, recipient: RECEIVER }])],
+          gracePeriod: WITHDRAW_DELAY,
+          mint: MINT,
+          openSlot: OPEN_SLOT,
+          payee: feePayer.address,
+          payer: payer.address,
+          payerWithdrawnAt: 0n,
+          rentPayer: feePayer.address,
+          salt: BigInt(channelConfig.salt),
+          settlement: { payoutWatermark: 0n, settled: 0n },
+          status: closing ? ChannelStatus.Closing : ChannelStatus.Open,
+          version: 1,
+        },
+      }));
+      const server = new BatchServerScheme({ store, readChannel, channelSnapshotMaxAgeMs: 1000 });
+      for (let i = 1; i <= 5; i++) {
+        const context = {
+          paymentPayload: {
+            accepted: requirements(),
+            x402Version: 2,
+            payload: {
+              channelConfig,
+              type: "voucher" as const,
+              voucher: await signedVoucher(BigInt(i) * 1000n),
+            },
+          },
+          requirements: requirements(),
+          declaredExtensions: {},
+        };
+        const before = await server.schemeHooks.onBeforeVerify!(context);
+        expect(before).toMatchObject({ skip: true, result: { isValid: true } });
+        if (!before || !("skip" in before)) throw new Error("expected local verification");
+        await server.schemeHooks.onAfterVerify!({ ...context, result: before.result });
+        expect(await server.schemeHooks.onBeforeSettle!(context)).toMatchObject({
+          skip: true,
+          result: { success: true },
+        });
+        expect((await store.get(channelId))?.onchainSnapshotAt).toBe(
+          1_000_000 + Math.floor((i - 1) / 2) * 1800,
+        );
+        now += 900;
+      }
+      expect(readChannel).toHaveBeenCalledTimes(3);
+      closing = true;
+      now += 1000;
+      expect(
+        await server.schemeHooks.onBeforeVerify!({
+          declaredExtensions: {},
+          requirements: requirements(),
+          paymentPayload: {
+            accepted: requirements(),
+            x402Version: 2,
+            payload: { channelConfig, type: "voucher", voucher: await signedVoucher(6000n) },
+          },
+        }),
+      ).toMatchObject({ abort: true, reason: BatchError.CHANNEL_STATE });
+    });
     it("fails closed when the durable server record is missing", async () => {
       const server = new BatchServerScheme({ store: new MemoryChannelStore() });
       const voucher = await signedVoucher(1_000n);
@@ -711,6 +784,43 @@ describe("batch-settlement SVM", () => {
   });
 
   describe("client construction", () => {
+    it("persists the same pending top-up on retry after storage writes fail", async () => {
+      let saved: Awaited<ReturnType<BatchClientChannelStorage["get"]>> = {
+        channelConfig,
+        channelId,
+        chargedCumulativeAmount: "1000",
+        deposit: "1000",
+      };
+      const set = vi
+        .fn<BatchClientChannelStorage["set"]>()
+        .mockRejectedValueOnce(new Error("storage unavailable"))
+        .mockRejectedValueOnce(new Error("storage still unavailable"))
+        .mockImplementation(async (_key, value) => {
+          saved = value;
+        });
+      const client = new BatchClientScheme(payer, {
+        channelStorage: { get: async () => saved, set, delete: async () => undefined },
+      });
+      (client as unknown as { resolveMintProgram(): Promise<string> }).resolveMintProgram =
+        async () => TOKEN_PROGRAM_ADDRESS;
+      const req = {
+        ...requirements(),
+        extra: {
+          ...requirements().extra,
+          recentBlockhash: DUMMY_BLOCKHASH,
+          lastValidBlockHeight: "1",
+        },
+      };
+      await expect(client.createPaymentPayload(2, req)).rejects.toThrow("storage unavailable");
+      await expect(client.createPaymentPayload(2, req)).rejects.toThrow(
+        "storage still unavailable",
+      );
+      const payment = await client.createPaymentPayload(2, req);
+      expect(saved?.pending?.payment).toEqual(payment);
+      expect(set).toHaveBeenCalledTimes(3);
+      expect(set.mock.calls[0][1].pending?.payment).toEqual(payment);
+      expect(set.mock.calls[1][1].pending?.payment).toEqual(payment);
+    });
     it("serializes concurrent payload allocation per channel", async () => {
       const client = new BatchClientScheme(payer);
       const internal = client as unknown as {

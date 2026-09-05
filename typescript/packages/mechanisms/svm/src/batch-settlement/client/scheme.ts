@@ -205,6 +205,9 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       if (pending.amount !== requirements.amount) {
         throw new Error("batch-settlement channel has a pending allocation for a different amount");
       }
+      // A prior storage write may have failed after allocating in memory.
+      // Keep the exact authorization, but never expose it until storage works.
+      await this.persistPending(pending);
       return pending.payment;
     }
     if (existing) {

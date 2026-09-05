@@ -47,6 +47,8 @@ type RequestContext = {
   channelId: string;
   pendingId?: string;
   replay?: boolean;
+  /** Local verification already persisted any genuine confirmed read. */
+  locallyVerified?: boolean;
   /**
    * Set when this server held no record for the channel, so the cumulative
    * rule could not be applied before the facilitator confirmed onchain state.
@@ -283,7 +285,14 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         this.requestContexts.set(ctx.paymentPayload, { channelId, replay });
         if (raw.type === "voucher" && state) {
           const local = await this.verifyVoucherLocally(state, raw, ctx.requirements);
-          if (local) return { skip: true, result: local };
+          if (local) {
+            this.requestContexts.set(ctx.paymentPayload, {
+              channelId,
+              replay,
+              locallyVerified: true,
+            });
+            return { skip: true, result: local };
+          }
         }
       } else {
         if (!state) throw new Error(BatchError.CHANNEL_STATE);
@@ -343,7 +352,10 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (snapshot && !this.applySnapshot(request.channelId, snapshot)) {
       return this.abort(BatchError.CHANNEL_STATE, "verified channel snapshot is unusable");
     }
-    if (snapshot) {
+    // Core invokes afterVerify for skipped verification too. The local result
+    // echoes a cached snapshot; persisting it here would renew its freshness
+    // forever under continuous traffic, without another confirmed chain read.
+    if (snapshot && !request.locallyVerified) {
       await this.persistSnapshot(request.channelId, raw, ctx.requirements, snapshot);
     }
 
@@ -607,13 +619,18 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       stored.onchainSnapshotAt === undefined ? Infinity : Date.now() - stored.onchainSnapshotAt;
     let state = stored;
 
-    if (age > maxAge) {
+    if (age < 0 || age >= maxAge) {
       if (!this.config.readChannel) return undefined;
       const observed = await this.config.readChannel({
         channelId: stored.channelId,
         network: requirements.network as Network,
       });
       if (!observed) throw new Error(BatchError.CHANNEL_STATE);
+      const observedAt = observed.observedAt ?? Date.now();
+      const observedAge = Date.now() - observedAt;
+      if (!Number.isFinite(observedAt) || observedAge < 0 || observedAge > maxAge) {
+        throw new Error(BatchError.CHANNEL_STATE);
+      }
       this.assertConfirmedChannel(observed.channel, observed.mintOwner, stored, requirements);
       state = await this.store.update(stored.channelId, current => {
         if (!current) throw new Error(BatchError.CHANNEL_STATE);
@@ -621,7 +638,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         return {
           ...current,
           deposit: observed.channel.deposit,
-          onchainSnapshotAt: observed.observedAt ?? Date.now(),
+          onchainSnapshotAt: observedAt,
           payoutWatermark: observed.channel.settlement.payoutWatermark,
           settled: observed.channel.settlement.settled,
         };
