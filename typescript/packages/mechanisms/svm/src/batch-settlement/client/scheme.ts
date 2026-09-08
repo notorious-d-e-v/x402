@@ -14,7 +14,6 @@ import { buildTopUpPaymentChannelTransaction, parseU64 } from "../../payment-cha
 import { encodeVoucherMessageBytes, verifyVoucherSignature } from "../../payment-channels/voucher";
 import { discoverChannelsByPayer, type ProgramAccountScan } from "../../payment-channels/discovery";
 import { ChannelStatus } from "../../payment-channels/generated/types/channelStatus";
-import { getChannelDistributionHash } from "../../payment-channels/facilitator";
 import type { ClientSvmConfig } from "../../signer";
 import { createRpcClient, resolveBlockhash, resolveOpenSlot } from "../../utils";
 import { BatchError } from "../errors";
@@ -39,7 +38,7 @@ interface OpenChannel {
 }
 
 type PendingPayment = {
-  payload: Extract<BatchPayload, { type: "deposit" | "voucher" }>;
+  payload: Extract<BatchPayload, { type: "authorization" | "deposit" | "voucher" }>;
   x402Version: number;
 };
 type PendingChannel = OpenChannel & {
@@ -107,9 +106,6 @@ export class BatchSvmScheme implements SchemeNetworkClient {
   };
   private readonly channels = new Map<string, OpenChannel>();
   private readonly pending = new Map<string, PendingChannel>();
-  private readonly channelQueueTails = new Map<string, Promise<void>>();
-  private readonly activeChannelReleases = new Map<string, () => void>();
-  private readonly mintProgramCache = new Map<string, Promise<string>>();
 
   constructor(
     private readonly signer: BatchClientSigner,
@@ -124,19 +120,144 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     const charge = parseU64(requirements.amount, "amount");
     if (charge === 0n) throw new Error("batch-settlement amount must be positive");
     const key = this.channelKey(requirements, terms.feePayer, terms.withdrawDelay);
-    await this.acquireChannel(key);
-    try {
-      return await this.createPaymentPayloadForChannel(
-        x402Version,
-        requirements,
-        terms,
-        charge,
-        key,
-      );
-    } catch (error) {
-      this.releaseChannel(key);
-      throw error;
+    const existing = await this.loadChannel(key);
+    const pending = this.pending.get(key);
+    if (pending) {
+      if (pending.amount !== requirements.amount) {
+        throw new Error("batch-settlement channel has a pending allocation for a different amount");
+      }
+      return pending.payment;
     }
+    if (existing) {
+      const cumulative = existing.tracker.cumulative + charge;
+      if (cumulative <= existing.deposit) {
+        const payload: Extract<BatchPayload, { type: "authorization" | "voucher" }> =
+          terms.voucherSigner === "server"
+            ? {
+                authorization: await existing.tracker.authorization(),
+                channelConfig: existing.tracker.channelConfig,
+                idempotencyKey: crypto.randomUUID(),
+                maxClaimableAmount: cumulative.toString(),
+                type: "authorization",
+              }
+            : {
+                channelConfig: existing.tracker.channelConfig,
+                type: "voucher",
+                voucher: await existing.tracker.previewVoucher(charge),
+              };
+        const payment: PendingPayment = {
+          x402Version,
+          payload,
+        };
+        const next = {
+          ...existing,
+          amount: requirements.amount,
+          confirmed: existing,
+          cumulative,
+          key,
+          payment,
+        };
+        this.pending.set(key, next);
+        await this.persistPending(next);
+        return payment;
+      }
+      const configured = this.config.depositAmount
+        ? parseU64(this.config.depositAmount, "depositAmount")
+        : charge;
+      const topUpAmount =
+        configured >= cumulative - existing.deposit ? configured : cumulative - existing.deposit;
+      const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
+      const blockhash = await resolveBlockhash(rpc, requirements);
+      const topUp = await buildTopUpPaymentChannelTransaction({
+        amount: topUpAmount,
+        blockhash,
+        channelId: existing.tracker.channelId,
+        feePayer: terms.feePayer,
+        memo: terms.memo,
+        mint: requirements.asset,
+        payer: this.signer,
+        tokenProgram: terms.tokenProgram,
+      });
+      const payment: PendingPayment = {
+        x402Version,
+        payload: {
+          channelConfig: existing.tracker.channelConfig,
+          deposit: { amount: topUpAmount.toString(), transaction: topUp.transaction },
+          type: "deposit",
+          ...(terms.voucherSigner === "server"
+            ? {
+                authorization: await existing.tracker.authorization(),
+                idempotencyKey: crypto.randomUUID(),
+                maxClaimableAmount: cumulative.toString(),
+              }
+            : { voucher: await existing.tracker.previewVoucher(charge) }),
+        },
+      };
+      const next = {
+        ...existing,
+        amount: requirements.amount,
+        confirmed: existing,
+        cumulative,
+        deposit: existing.deposit + topUpAmount,
+        key,
+        payment,
+      };
+      this.pending.set(key, next);
+      await this.persistPending(next);
+      return payment;
+    }
+
+    // Before funding a second channel, look for one this wallet already opened.
+    const discovered = await this.discoverChannel(requirements, terms);
+    if (discovered) {
+      this.channels.set(key, discovered);
+      await this.config.channelStorage?.set(key, {
+        channelConfig: discovered.tracker.channelConfig,
+        channelId: discovered.tracker.channelId,
+        chargedCumulativeAmount: discovered.tracker.cumulative.toString(),
+        deposit: discovered.deposit.toString(),
+      });
+      return this.createPaymentPayload(x402Version, requirements);
+    }
+
+    const deposit = this.config.depositAmount
+      ? parseU64(this.config.depositAmount, "depositAmount")
+      : charge;
+    if (deposit < charge) throw new Error("depositAmount must cover the current request");
+    const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
+    const [blockhash, openSlot] = await Promise.all([
+      resolveBlockhash(rpc, requirements),
+      resolveOpenSlot(rpc, requirements),
+    ]);
+    const built = await buildDepositPayload({
+      blockhash,
+      depositAmount: deposit,
+      feePayer: terms.feePayer,
+      firstCharge: charge,
+      memo: terms.memo,
+      mint: requirements.asset,
+      openSlot,
+      payer: this.signer,
+      receiver: requirements.payTo,
+      receiverAuthorizer: terms.receiverAuthorizer,
+      salt: this.salt(),
+      tokenProgram: terms.tokenProgram,
+      withdrawDelay: terms.withdrawDelay,
+      voucherSigner: terms.voucherSigner,
+      ...(terms.operator ? { operator: terms.operator } : {}),
+    });
+    const payment: PendingPayment = { payload: built.payload, x402Version };
+    const next = {
+      amount: requirements.amount,
+      cumulative: charge,
+      deposit,
+      key,
+      payment,
+      tracker: built.tracker,
+    };
+    this.pending.set(key, next);
+    await this.persistPending(next);
+    return payment;
   }
 
   /**
@@ -192,164 +313,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     };
   }
 
-  private async createPaymentPayloadForChannel(
-    x402Version: number,
-    requirements: PaymentRequirements,
-    terms: Awaited<ReturnType<BatchSvmScheme["resolveTerms"]>>,
-    charge: bigint,
-    key: string,
-  ): Promise<Pick<PaymentPayload, "x402Version" | "payload">> {
-    const existing = await this.loadChannel(key);
-    const pending = this.pending.get(key);
-    if (pending) {
-      if (pending.amount !== requirements.amount) {
-        throw new Error("batch-settlement channel has a pending allocation for a different amount");
-      }
-      // A prior storage write may have failed after allocating in memory.
-      // Keep the exact authorization, but never expose it until storage works.
-      await this.persistPending(pending);
-      return pending.payment;
-    }
-    if (existing) {
-      const cumulative = existing.tracker.cumulative + charge;
-      const voucher = await existing.tracker.previewVoucher(charge);
-      if (cumulative <= existing.deposit) {
-        const payment: PendingPayment = {
-          x402Version,
-          payload: { channelConfig: existing.tracker.channelConfig, type: "voucher", voucher },
-        };
-        const next = {
-          ...existing,
-          amount: requirements.amount,
-          confirmed: existing,
-          cumulative,
-          key,
-          payment,
-        };
-        this.pending.set(key, next);
-        await this.persistPending(next);
-        return payment;
-      }
-      const configured = this.config.depositAmount
-        ? parseU64(this.config.depositAmount, "depositAmount")
-        : charge;
-      const topUpAmount =
-        configured >= cumulative - existing.deposit ? configured : cumulative - existing.deposit;
-      const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
-      const blockhash = await resolveBlockhash(rpc, requirements);
-      const topUp = await buildTopUpPaymentChannelTransaction({
-        amount: topUpAmount,
-        blockhash,
-        channelId: existing.tracker.channelId,
-        feePayer: terms.feePayer,
-        memo: terms.memo,
-        mint: requirements.asset,
-        payer: this.signer,
-        tokenProgram: terms.tokenProgram,
-      });
-      const payment: PendingPayment = {
-        x402Version,
-        payload: {
-          channelConfig: existing.tracker.channelConfig,
-          deposit: { amount: topUpAmount.toString(), transaction: topUp.transaction },
-          type: "deposit",
-          voucher,
-        },
-      };
-      const next = {
-        ...existing,
-        amount: requirements.amount,
-        confirmed: existing,
-        cumulative,
-        deposit: existing.deposit + topUpAmount,
-        key,
-        payment,
-      };
-      this.pending.set(key, next);
-      await this.persistPending(next);
-      return payment;
-    }
-
-    // Before funding a second channel, look for one this wallet already opened.
-    const discovered = await this.discoverChannel(requirements, terms);
-    if (discovered) {
-      this.channels.set(key, discovered);
-      await this.config.channelStorage?.set(key, {
-        channelConfig: discovered.tracker.channelConfig,
-        channelId: discovered.tracker.channelId,
-        chargedCumulativeAmount: discovered.tracker.cumulative.toString(),
-        deposit: discovered.deposit.toString(),
-      });
-      return this.createPaymentPayloadForChannel(x402Version, requirements, terms, charge, key);
-    }
-
-    const deposit = this.config.depositAmount
-      ? parseU64(this.config.depositAmount, "depositAmount")
-      : charge;
-    if (deposit < charge) throw new Error("depositAmount must cover the current request");
-    const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
-    const [blockhash, openSlot] = await Promise.all([
-      resolveBlockhash(rpc, requirements),
-      resolveOpenSlot(rpc, requirements),
-    ]);
-    const built = await buildDepositPayload({
-      blockhash,
-      depositAmount: deposit,
-      feePayer: terms.feePayer,
-      firstCharge: charge,
-      memo: terms.memo,
-      mint: requirements.asset,
-      openSlot,
-      payer: this.signer,
-      receiver: requirements.payTo,
-      receiverAuthorizer: terms.receiverAuthorizer,
-      salt: this.salt(),
-      tokenProgram: terms.tokenProgram,
-      withdrawDelay: terms.withdrawDelay,
-    });
-    const payment: PendingPayment = { payload: built.payload, x402Version };
-    const next = {
-      amount: requirements.amount,
-      cumulative: charge,
-      deposit,
-      key,
-      payment,
-      tracker: built.tracker,
-    };
-    this.pending.set(key, next);
-    await this.persistPending(next);
-    return payment;
-  }
-
   private salt(): bigint {
     return this.config.salt === undefined ? 0n : parseU64(this.config.salt, "salt");
-  }
-
-  /**
-   * Hold one channel from payload creation until its HTTP outcome is known.
-   *
-   * @param key - Deterministic channel configuration key
-   */
-  private async acquireChannel(key: string): Promise<void> {
-    const prior = this.channelQueueTails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const active = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    const tail = prior.then(() => active);
-    this.channelQueueTails.set(key, tail);
-    await prior;
-    this.activeChannelReleases.set(key, release);
-    void tail.finally(() => {
-      if (this.channelQueueTails.get(key) === tail) this.channelQueueTails.delete(key);
-    });
-  }
-
-  private releaseChannel(key: string): void {
-    const release = this.activeChannelReleases.get(key);
-    if (!release) return;
-    this.activeChannelReleases.delete(key);
-    release();
   }
 
   /**
@@ -370,6 +335,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
    * @param terms.withdrawDelay
    * @param terms.tokenProgram
    * @param terms.receiverAuthorizer
+   * @param terms.voucherSigner
+   * @param terms.operator
    */
   private async discoverChannel(
     requirements: PaymentRequirements,
@@ -378,6 +345,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       withdrawDelay: number;
       tokenProgram: string;
       receiverAuthorizer?: string | undefined;
+      voucherSigner: "client" | "server";
+      operator?: string | undefined;
     },
   ): Promise<OpenChannel | undefined> {
     if (this.config.discoverChannels === false) return undefined;
@@ -399,32 +368,19 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       return undefined;
     }
     const salt = this.salt();
-    const expectedDistributionHash = getChannelDistributionHash([
-      { bps: 10_000, recipient: requirements.payTo },
-    ]);
     const usable = found.filter(
       candidate =>
         candidate.channel.status === ChannelStatus.Open &&
         candidate.channel.closureStartedAt === 0n &&
         candidate.channel.payee === terms.feePayer &&
         candidate.channel.mint === requirements.asset &&
-        candidate.channel.authorizedSigner === this.signer.address &&
+        candidate.channel.authorizedSigner === (terms.operator ?? this.signer.address) &&
         candidate.channel.gracePeriod === terms.withdrawDelay &&
-        candidate.channel.salt === salt &&
-        candidate.channel.distributionHash.length === expectedDistributionHash.length &&
-        candidate.channel.distributionHash.every(
-          (value, index) => value === expectedDistributionHash[index],
-        ),
+        candidate.channel.salt === salt,
     );
     // Prefer the newest, so a channel opened after an earlier one was drained
-    // wins. Break impossible-but-hostile equal-slot ties by PDA so every
-    // process makes the same choice.
-    usable.sort((left, right) => {
-      if (left.channel.openSlot !== right.channel.openSlot) {
-        return left.channel.openSlot < right.channel.openSlot ? 1 : -1;
-      }
-      return left.channelId.localeCompare(right.channelId);
-    });
+    // wins.
+    usable.sort((left, right) => (left.channel.openSlot < right.channel.openSlot ? 1 : -1));
     const channel = usable[0];
     if (!channel) return undefined;
     return {
@@ -440,6 +396,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
           salt: channel.channel.salt.toString(),
           token: channel.channel.mint,
           withdrawDelay: channel.channel.gracePeriod,
+          ...(terms.voucherSigner === "server" ? { voucherSigner: "server" as const } : {}),
         },
         this.signer,
         channel.channel.settlement.settled,
@@ -500,81 +457,78 @@ export class BatchSvmScheme implements SchemeNetworkClient {
    */
   private async handlePaymentResponse(ctx: PaymentResponseContext): Promise<boolean> {
     const payload = ctx.paymentPayload.payload;
-    if (!isBatchPayload(payload) || (payload.type !== "voucher" && payload.type !== "deposit")) {
+    if (
+      !isBatchPayload(payload) ||
+      (payload.type !== "authorization" && payload.type !== "voucher" && payload.type !== "deposit")
+    ) {
       return false;
     }
     const pending = [...this.pending.values()].find(
-      candidate => candidate.tracker.channelId === payload.voucher.channelId,
+      candidate =>
+        candidate.tracker.channelId ===
+        (payload.type === "voucher"
+          ? payload.voucher.channelId
+          : payload.type === "authorization"
+            ? payload.authorization.channelId
+            : (payload.voucher?.channelId ?? payload.authorization?.channelId)),
     );
     if (!pending) return false;
-    if (ctx.error) {
-      // The request may have reached the server. Preserve the exact signed
-      // payload for the next retry, but release the per-channel queue so that
-      // retry can acquire ownership instead of sharing this authorization.
-      this.releaseChannel(pending.key);
-      return false;
-    }
-    try {
-      if (!ctx.settleResponse?.success) {
-        this.pending.delete(pending.key);
-        await this.restoreConfirmedChannel(pending);
-        // A corrective 402 carries the base the server is actually charging
-        // from. Adopting it — against this client's own signature — turns a
-        // dead channel back into a usable one.
-        return ctx.paymentRequired
-          ? this.adoptCorrectiveState(pending, ctx.paymentRequired)
-          : false;
-      }
+    this.pending.delete(pending.key);
 
-      // The response is the server's report, not this client's accounting. The
-      // charge is capped at the price this request advertised, the cumulative is
-      // computed locally and only cross-checked against the server's, and the
-      // escrow comes from the deposit this client itself signed.
-      const extra = ctx.settleResponse.extra as
-        | {
-            commitmentId?: unknown;
-            chargedAmount?: unknown;
-            channelState?: { balance?: unknown; chargedCumulativeAmount?: unknown };
-          }
-        | undefined;
-      const requestAmount = parseU64(ctx.requirements.amount, "requirements.amount");
-      const charged =
-        typeof extra?.chargedAmount === "string" && /^\d+$/.test(extra.chargedAmount)
-          ? BigInt(extra.chargedAmount)
-          : undefined;
-      if (charged === undefined || charged !== requestAmount) {
-        throw new Error(
-          "batch-settlement PAYMENT-RESPONSE charge did not equal the advertised price",
-        );
-      }
-      const confirmedCumulative = (pending.confirmed?.tracker.cumulative ?? 0n) + charged;
-      const reported = extra?.channelState?.chargedCumulativeAmount;
-      if (
-        extra?.commitmentId !== `${payload.voucher.channelId}:${pending.cumulative}` ||
-        confirmedCumulative !== pending.cumulative ||
-        (typeof reported === "string" && reported !== confirmedCumulative.toString())
-      ) {
-        throw new Error("batch-settlement PAYMENT-RESPONSE state is inconsistent");
-      }
-      // A deposit's escrow is what this client signed for, not what the server
-      // reports holding.
-      const deposited =
-        payload.type === "deposit" ? parseU64(payload.deposit.amount, "deposit.amount") : 0n;
-      const confirmedDeposit = (pending.confirmed?.deposit ?? 0n) + deposited;
-      await this.config.channelStorage?.set(pending.key, {
-        channelConfig: pending.tracker.channelConfig,
-        channelId: pending.tracker.channelId,
-        chargedCumulativeAmount: pending.cumulative.toString(),
-        deposit: confirmedDeposit.toString(),
-      });
-      pending.tracker.commit(pending.cumulative);
-      pending.deposit = confirmedDeposit;
-      this.channels.set(pending.key, pending);
-      this.pending.delete(pending.key);
-      return false;
-    } finally {
-      this.releaseChannel(pending.key);
+    if (!ctx.settleResponse?.success) {
+      await this.restoreConfirmedChannel(pending);
+      // A corrective 402 carries the base the server is actually charging
+      // from. Adopting it — against this client's own signature — turns a
+      // dead channel back into a usable one.
+      return ctx.paymentRequired ? this.adoptCorrectiveState(pending, ctx.paymentRequired) : false;
     }
+
+    // The response is the server's report, not this client's accounting. The
+    // charge is capped at the price this request advertised, the cumulative is
+    // computed locally and only cross-checked against the server's, and the
+    // escrow comes from the deposit this client itself signed.
+    const extra = ctx.settleResponse.extra as
+      | {
+          commitmentId?: unknown;
+          chargedAmount?: unknown;
+          channelState?: { balance?: unknown; chargedCumulativeAmount?: unknown };
+        }
+      | undefined;
+    const requestAmount = parseU64(ctx.requirements.amount, "requirements.amount");
+    const charged =
+      typeof extra?.chargedAmount === "string" && /^\d+$/.test(extra.chargedAmount)
+        ? BigInt(extra.chargedAmount)
+        : undefined;
+    if (charged === undefined || charged > requestAmount) {
+      throw new Error("batch-settlement PAYMENT-RESPONSE charged more than the advertised price");
+    }
+    const confirmedCumulative = (pending.confirmed?.tracker.cumulative ?? 0n) + charged;
+    const reported = extra?.channelState?.chargedCumulativeAmount;
+    if (
+      extra?.commitmentId !== `${pending.tracker.channelId}:${pending.cumulative}` ||
+      confirmedCumulative !== pending.cumulative ||
+      (typeof reported === "string" && reported !== confirmedCumulative.toString())
+    ) {
+      // The server confirmed something this client did not submit. Leave local
+      // state untouched rather than adopt an accounting it cannot derive; the
+      // next request resynchronizes through a corrective 402.
+      await this.restoreConfirmedChannel(pending);
+      return false;
+    }
+    // A deposit's escrow is what this client signed for, not what the server
+    // reports holding.
+    const deposited =
+      payload.type === "deposit" ? parseU64(payload.deposit.amount, "deposit.amount") : 0n;
+    pending.tracker.commit(pending.cumulative);
+    pending.deposit = (pending.confirmed?.deposit ?? 0n) + deposited;
+    this.channels.set(pending.key, pending);
+    await this.config.channelStorage?.set(pending.key, {
+      channelConfig: pending.tracker.channelConfig,
+      channelId: pending.tracker.channelId,
+      chargedCumulativeAmount: pending.cumulative.toString(),
+      deposit: pending.deposit.toString(),
+    });
+    return false;
   }
 
   /**
@@ -597,7 +551,10 @@ export class BatchSvmScheme implements SchemeNetworkClient {
   ): Promise<boolean> {
     if (paymentRequired.error !== BatchError.CUMULATIVE_AMOUNT_MISMATCH) return false;
     const accept = paymentRequired.accepts.find(
-      candidate => candidate.scheme === BATCH_SETTLEMENT_SCHEME,
+      candidate =>
+        candidate.scheme === BATCH_SETTLEMENT_SCHEME &&
+        (candidate.extra?.channelState as BatchChannelState | undefined)?.channelId ===
+          pending.tracker.channelId,
     );
     const channelState = accept?.extra?.channelState as BatchChannelState | undefined;
     if (!channelState?.chargedCumulativeAmount) return false;
@@ -684,6 +641,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       feePayer,
       withdrawDelay,
       requirements.extra?.receiverAuthorizer ?? "",
+      requirements.extra?.voucherSigner ?? "client",
+      requirements.extra?.operator ?? "",
     ].join(":");
   }
 
@@ -693,6 +652,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     tokenProgram: string;
     withdrawDelay: number;
     memo?: string | undefined;
+    voucherSigner: "client" | "server";
+    operator?: string | undefined;
   }> {
     const extra = requirements.extra;
     if (!extra) throw new Error("requirements.extra is required");
@@ -717,7 +678,9 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     if (tokenProgram !== TOKEN_PROGRAM_ADDRESS && tokenProgram !== TOKEN_2022_PROGRAM_ADDRESS) {
       throw new Error("extra.tokenProgram is not a supported SPL token program");
     }
-    if ((await this.resolveMintProgram(requirements)) !== tokenProgram) {
+    const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
+    const mint = await fetchMint(rpc, requirements.asset as Address);
+    if (mint.programAddress.toString() !== tokenProgram) {
       throw new Error("extra.tokenProgram does not own requirements.asset");
     }
     const receiverAuthorizer = extra.receiverAuthorizer;
@@ -728,26 +691,25 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     if (memo !== undefined && typeof memo !== "string") {
       throw new Error("extra.memo must be a string when present");
     }
+    const voucherSigner = extra.voucherSigner ?? "client";
+    if (voucherSigner !== "client" && voucherSigner !== "server") {
+      throw new Error('extra.voucherSigner must be "client" or "server"');
+    }
+    const operator = extra.operator;
+    if (voucherSigner === "server" && (typeof operator !== "string" || operator.length === 0)) {
+      throw new Error("extra.operator is required for operator voucher signing");
+    }
+    if (voucherSigner === "client" && operator !== undefined) {
+      throw new Error("extra.operator is only valid for operator voucher signing");
+    }
     return {
       feePayer,
       ...(memo !== undefined ? { memo } : {}),
       ...(receiverAuthorizer !== undefined ? { receiverAuthorizer } : {}),
       tokenProgram,
       withdrawDelay,
+      voucherSigner,
+      ...(typeof operator === "string" ? { operator } : {}),
     };
-  }
-
-  private resolveMintProgram(requirements: PaymentRequirements): Promise<string> {
-    const key = `${requirements.network}:${requirements.asset}`;
-    let pending = this.mintProgramCache.get(key);
-    if (!pending) {
-      const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
-      pending = fetchMint(rpc, requirements.asset as Address).then(mint =>
-        mint.programAddress.toString(),
-      );
-      this.mintProgramCache.set(key, pending);
-      void pending.catch(() => this.mintProgramCache.delete(key));
-    }
-    return pending;
   }
 }

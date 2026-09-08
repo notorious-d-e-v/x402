@@ -23,13 +23,15 @@ import type {
   VerifyResponse,
 } from "@x402/core/types";
 import type { DeepReadonly } from "@x402/core/types";
+import type { MessagePartialSigner } from "@solana/kit";
 
 import { TOKEN_2022_PROGRAM_ADDRESS, TOKEN_PROGRAM_ADDRESS } from "../../constants";
-import { encodeVoucherMessageBytes, verifyVoucherSignature } from "../../payment-channels/voucher";
+import {
+  encodeVoucherMessageBytes,
+  signVoucher,
+  verifyVoucherSignature,
+} from "../../payment-channels/voucher";
 import { findPaymentChannelPda, parseU64 } from "../../payment-channels/open";
-import type { Channel } from "../../payment-channels/generated/accounts/channel";
-import { ChannelStatus } from "../../payment-channels/generated/types/channelStatus";
-import { getChannelDistributionHash } from "../../payment-channels/facilitator";
 import {
   convertToTokenAmount,
   getStablecoinAddress,
@@ -37,6 +39,7 @@ import {
   numberToDecimalString,
 } from "../../utils";
 import { BatchError } from "../errors";
+import { verifyBatchAuthorization } from "../authorization";
 import type { BatchChannelConfig, BatchPayload, BatchVoucher } from "../types";
 import { BATCH_SETTLEMENT_SCHEME, isBatchPayload } from "../types";
 import { type ChannelState, type ChannelStore, MemoryChannelStore } from "./storage";
@@ -45,10 +48,9 @@ type ParsedMoney = { amount: number; stablecoin?: SvmStablecoinSymbol };
 type SvmStablecoinSymbol = "USDC" | "USDT" | "USDG" | "PYUSD" | "CASH";
 type RequestContext = {
   channelId: string;
+  cumulative?: bigint;
+  idempotencyKey?: string;
   pendingId?: string;
-  replay?: boolean;
-  /** Local verification already persisted any genuine confirmed read. */
-  locallyVerified?: boolean;
   /**
    * Set when this server held no record for the channel, so the cumulative
    * rule could not be applied before the facilitator confirmed onchain state.
@@ -66,34 +68,8 @@ export interface BatchSvmServerConfig {
   withdrawDelay?: number | undefined;
   receiverAuthorizer?: string | undefined;
   store?: ChannelStore | undefined;
-  /**
-   * Read a confirmed channel snapshot for local voucher verification. When
-   * configured, ordinary vouchers bypass facilitator `/verify` after this
-   * fresh binding/deposit check; deposits and refunds never bypass it.
-   */
-  readChannel?:
-    | ((args: {
-        channelId: string;
-        network: Network;
-      }) => Promise<{ channel: Channel; mintOwner: string; observedAt?: number } | undefined>)
-    | undefined;
-  /** Maximum age of a confirmed snapshot used for local verification. */
-  channelSnapshotMaxAgeMs?: number | undefined;
-  /**
-   * Legacy recovery opt-in. The default fails closed when server state is
-   * absent because onchain state cannot reconstruct the accepted voucher or
-   * application-response cache.
-   */
-  recoverUnknownChannels?: boolean | undefined;
-  /** Refuse the in-memory default in a production integration. */
-  requireDurableStore?: boolean | undefined;
-  /** Resolve the application response cached under a replayed commitment. */
-  getReplayResponse?:
-    | ((commitment: {
-        channelId: string;
-        commitmentId: string;
-      }) => Promise<SkipHandlerDirective | undefined>)
-    | undefined;
+  /** Operator key used to sign cumulative vouchers after successful requests. */
+  operator?: MessagePartialSigner | undefined;
 }
 
 /**
@@ -118,9 +94,6 @@ export class BatchSvmScheme implements SchemeNetworkServer {
   private reservationSequence = 0;
 
   constructor(private readonly config: BatchSvmServerConfig = {}) {
-    if (config.requireDurableStore && config.store?.durable !== true) {
-      throw new Error("batch-settlement production mode requires a durable ChannelStore");
-    }
     this.store = config.store ?? new MemoryChannelStore();
     this.schemeHooks = {
       onBeforeVerify: ctx => this.beforeVerify(ctx),
@@ -245,6 +218,9 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         ...(this.config.receiverAuthorizer
           ? { receiverAuthorizer: this.config.receiverAuthorizer }
           : {}),
+        ...(this.config.operator
+          ? { operator: this.config.operator.address, voucherSigner: "server" }
+          : {}),
       },
     });
   }
@@ -261,49 +237,85 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     try {
       const channelId = await this.validatePayload(raw, ctx.requirements);
       const state = await this.store.get(channelId);
-      if (state) this.assertStoredConfig(state, raw.channelConfig);
+      if (state) {
+        this.assertStoredConfig(state, raw.channelConfig);
+        const authorization =
+          raw.type === "authorization"
+            ? raw.authorization
+            : raw.type === "deposit"
+              ? raw.authorization
+              : undefined;
+        if (
+          authorization &&
+          state.authorizationSignature !== undefined &&
+          state.authorizationSignature !== authorization.signature
+        ) {
+          throw new Error(BatchError.VOUCHER_SIGNATURE);
+        }
+      }
 
-      if (raw.type === "deposit" || raw.type === "voucher") {
-        if (!state && raw.type === "voucher") {
-          if (!this.config.recoverUnknownChannels) {
-            throw new Error(
-              `${BatchError.CHANNEL_STATE}: local channel state and replay cache are unavailable`,
-            );
-          }
-          this.requestContexts.set(ctx.paymentPayload, { channelId, unknownChannel: true });
+      if (raw.type === "deposit" || raw.type === "voucher" || raw.type === "authorization") {
+        // A channel this server holds no record for is not a dead end: the
+        // facilitator verifies the voucher against confirmed onchain state,
+        // and `afterVerify` rebuilds the record from the snapshot it returns.
+        // Refusing here instead would strand the payer's escrow behind a
+        // forced close every time this server lost its store.
+        if (!state && raw.type !== "deposit") {
+          this.requestContexts.set(ctx.paymentPayload, {
+            channelId,
+            unknownChannel: true,
+            ...(raw.type === "authorization"
+              ? {
+                  cumulative: BigInt(raw.maxClaimableAmount),
+                  idempotencyKey: raw.idempotencyKey,
+                }
+              : {}),
+          });
           return;
         }
         const expected = (state?.chargedCumulativeAmount ?? 0n) + BigInt(ctx.requirements.amount);
-        const submitted = BigInt(raw.voucher.maxClaimableAmount);
-        const replay =
-          state !== undefined &&
-          submitted === state.chargedCumulativeAmount &&
-          raw.voucher.signature === state.highestVoucherSignature;
-        if (!replay && submitted !== expected) {
-          throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
-        }
-        this.requestContexts.set(ctx.paymentPayload, { channelId, replay });
-        if (raw.type === "voucher" && state) {
-          const local = await this.verifyVoucherLocally(state, raw, ctx.requirements);
-          if (local) {
-            this.requestContexts.set(ctx.paymentPayload, {
-              channelId,
-              replay,
-              locallyVerified: true,
-            });
-            return { skip: true, result: local };
+        const voucher =
+          raw.type === "voucher" ? raw.voucher : raw.type === "deposit" ? raw.voucher : undefined;
+        if (voucher) {
+          const submitted = BigInt(voucher.maxClaimableAmount);
+          const replay =
+            state !== undefined &&
+            submitted === state.chargedCumulativeAmount &&
+            voucher.signature === state.highestVoucherSignature;
+          if (replay) throw new Error(CHANNEL_BUSY);
+          if (!replay && submitted !== expected) {
+            throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
           }
+          this.requestContexts.set(ctx.paymentPayload, {
+            channelId,
+            cumulative: submitted,
+          });
+        } else {
+          if (raw.type === "voucher") throw new Error(BatchError.PAYLOAD_TYPE);
+          const idempotencyKey = raw.idempotencyKey!;
+          const submitted = BigInt(raw.maxClaimableAmount!);
+          const recorded = state?.authorizationRecords?.[idempotencyKey];
+          if (recorded === undefined && submitted !== expected) {
+            throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+          }
+          if (recorded !== undefined && submitted !== BigInt(recorded)) {
+            throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+          }
+          if (recorded !== undefined) throw new Error(CHANNEL_BUSY);
+          this.requestContexts.set(ctx.paymentPayload, {
+            channelId,
+            cumulative: submitted,
+            idempotencyKey,
+          });
         }
       } else {
         if (!state) throw new Error(BatchError.CHANNEL_STATE);
         this.requestContexts.set(ctx.paymentPayload, { channelId });
       }
-      // Deposits and refunds must be verified by the facilitator: it statically
-      // validates the client-signed transaction before the resource executes.
-      // Voucher verification also binds the cumulative authorization to the
-      // confirmed channel deposit. Keep the request context for afterVerify,
-      // but do not bypass facilitator verification here.
-      return;
+      return {
+        skip: true,
+        result: { isValid: true, payer: raw.channelConfig.payer, extra: { channelId } },
+      };
     } catch (error) {
       return {
         abort: true,
@@ -324,26 +336,6 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (!ctx.result.isValid || !isBatchPayload(raw)) return;
     const request = this.requestContexts.get(ctx.paymentPayload);
     if (!request) return this.abort(BatchError.CHANNEL_STATE, "missing request state");
-    if (request.replay) {
-      const state = await this.store.get(request.channelId);
-      if (!state) return this.abort(BatchError.CHANNEL_STATE, "missing replay state");
-      const commitmentId = `${state.channelId}:${state.signedMaxClaimable}`;
-      const response = await this.config.getReplayResponse?.({
-        channelId: state.channelId,
-        commitmentId,
-      });
-      if (!response) {
-        return this.abort(
-          CHANNEL_BUSY,
-          `cached application response unavailable for ${commitmentId}`,
-        );
-      }
-      return {
-        skipHandler: true,
-        response,
-      };
-    }
-
     // The facilitator has now confirmed this payload against onchain state and
     // returned the channel snapshot. Persisting it is what lets a server with
     // no record of a live channel serve it, and what keeps `deposit`, `settled`
@@ -352,18 +344,18 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (snapshot && !this.applySnapshot(request.channelId, snapshot)) {
       return this.abort(BatchError.CHANNEL_STATE, "verified channel snapshot is unusable");
     }
-    // Core invokes afterVerify for skipped verification too. The local result
-    // echoes a cached snapshot; persisting it here would renew its freshness
-    // forever under continuous traffic, without another confirmed chain read.
-    if (snapshot && !request.locallyVerified) {
+    if (snapshot) {
       await this.persistSnapshot(request.channelId, raw, ctx.requirements, snapshot);
     }
 
     // The cumulative rule could not be applied before the record existed.
-    if (request.unknownChannel) {
+    if (request.unknownChannel && (raw.type === "voucher" || raw.type === "authorization")) {
       const state = await this.store.get(request.channelId);
       if (!state) return this.abort(BatchError.CHANNEL_STATE, "channel state unavailable");
-      const submitted = BigInt(raw.type === "refund" ? "0" : raw.voucher.maxClaimableAmount);
+      const submitted =
+        raw.type === "voucher"
+          ? BigInt(raw.voucher.maxClaimableAmount)
+          : BigInt(raw.maxClaimableAmount);
       const expected = state.chargedCumulativeAmount + BigInt(ctx.requirements.amount);
       if (submitted !== expected) {
         // The corrective 402 that follows carries this rebuilt snapshot and no
@@ -384,15 +376,20 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         }
         if (state.status !== "open") throw new Error(BatchError.CLOSE_STATE);
         this.assertStoredConfig(state, raw.channelConfig);
+        const maxClaimableAmount =
+          raw.type === "refund"
+            ? state.signedMaxClaimable
+            : (request.cumulative ??
+              state.chargedCumulativeAmount + BigInt(ctx.requirements.amount));
+        if (maxClaimableAmount > state.deposit) {
+          throw new Error(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT);
+        }
         return {
           ...state,
           pendingRequest: {
             expiresAt: Date.now() + Math.max(5_000, ctx.requirements.maxTimeoutSeconds * 1_000),
             id: pendingId,
-            maxClaimableAmount:
-              raw.type === "refund"
-                ? state.signedMaxClaimable
-                : BigInt(raw.voucher.maxClaimableAmount),
+            maxClaimableAmount,
           },
         };
       });
@@ -423,12 +420,6 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (!isBatchPayload(raw) || raw.type === "refund") return;
 
     const request = this.requestContexts.get(ctx.paymentPayload);
-    if (request?.replay) {
-      const state = await this.store.get(request.channelId);
-      this.requestContexts.delete(ctx.paymentPayload);
-      if (!state) return this.abort(BatchError.CHANNEL_STATE, "missing replay state");
-      return { skip: true, result: acceptedResponse(state, ctx.requirements) };
-    }
     if (!request?.pendingId) return this.abort(CHANNEL_BUSY, "missing reservation");
     const state = await this.store.get(request.channelId);
     if (!state || state.pendingRequest?.id !== request.pendingId) {
@@ -441,17 +432,32 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (raw.type === "deposit") return;
 
     try {
+      const voucher =
+        raw.type === "authorization"
+          ? await this.signOperatorVoucher(
+              request.channelId,
+              state.pendingRequest.maxClaimableAmount,
+            )
+          : raw.voucher;
       const committed = await this.store.update(request.channelId, current => {
         if (!current || current.pendingRequest?.id !== request.pendingId) {
           throw new Error(CHANNEL_BUSY);
         }
         return {
           ...current,
-          chargedCumulativeAmount: BigInt(raw.voucher.maxClaimableAmount),
-          highestVoucherExpiresAt: raw.voucher.expiresAt,
-          highestVoucherSignature: raw.voucher.signature,
+          chargedCumulativeAmount: BigInt(voucher.maxClaimableAmount),
+          highestVoucherExpiresAt: voucher.expiresAt,
+          highestVoucherSignature: voucher.signature,
           pendingRequest: undefined,
-          signedMaxClaimable: BigInt(raw.voucher.maxClaimableAmount),
+          signedMaxClaimable: BigInt(voucher.maxClaimableAmount),
+          ...(request.idempotencyKey
+            ? {
+                authorizationRecords: {
+                  ...current.authorizationRecords,
+                  [request.idempotencyKey]: voucher.maxClaimableAmount,
+                },
+              }
+            : {}),
         };
       });
       this.requestContexts.delete(ctx.paymentPayload);
@@ -471,6 +477,16 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (!request?.pendingId) return;
 
     if (raw.type === "deposit") {
+      const reserved = await this.store.get(request.channelId);
+      if (!reserved || reserved.pendingRequest?.id !== request.pendingId) {
+        throw new Error(CHANNEL_BUSY);
+      }
+      const voucher =
+        raw.voucher ??
+        (await this.signOperatorVoucher(
+          request.channelId,
+          reserved.pendingRequest.maxClaimableAmount,
+        ));
       await this.store.update(request.channelId, current => {
         if (!current || current.pendingRequest?.id !== request.pendingId) {
           throw new Error(CHANNEL_BUSY);
@@ -483,12 +499,19 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           deposit: confirmedDeposit(current.deposit, confirmed.balance),
           openSignature: ctx.result.transaction,
           settled: BigInt(confirmed.totalClaimed),
-          chargedCumulativeAmount: BigInt(raw.voucher.maxClaimableAmount),
-          highestVoucherExpiresAt: raw.voucher.expiresAt,
-          highestVoucherSignature: raw.voucher.signature,
-          onchainSnapshotAt: Date.now(),
-          signedMaxClaimable: BigInt(raw.voucher.maxClaimableAmount),
+          chargedCumulativeAmount: BigInt(voucher.maxClaimableAmount),
+          highestVoucherExpiresAt: voucher.expiresAt,
+          highestVoucherSignature: voucher.signature,
+          signedMaxClaimable: BigInt(voucher.maxClaimableAmount),
           pendingRequest: undefined,
+          ...(request.idempotencyKey
+            ? {
+                authorizationRecords: {
+                  ...current.authorizationRecords,
+                  [request.idempotencyKey]: voucher.maxClaimableAmount,
+                },
+              }
+            : {}),
         };
       });
       this.requestContexts.delete(ctx.paymentPayload);
@@ -541,6 +564,23 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       throw new Error(BatchError.PAYMENT_FLOW);
     }
     if (typeof extra.feePayer !== "string") throw new Error(BatchError.FEE_PAYER_MISMATCH);
+    const voucherSigner = extra.voucherSigner ?? "client";
+    if (voucherSigner !== "client" && voucherSigner !== "server") {
+      throw new Error(BatchError.CHANNEL_STATE);
+    }
+    if ((raw.channelConfig.voucherSigner ?? "client") !== voucherSigner) {
+      throw new Error(BatchError.CHANNEL_STATE);
+    }
+    const operator = extra.operator;
+    if (
+      (voucherSigner === "server" &&
+        (typeof operator !== "string" ||
+          raw.channelConfig.payerAuthorizer !== operator ||
+          this.config.operator?.address !== operator)) ||
+      (voucherSigner === "client" && operator !== undefined)
+    ) {
+      throw new Error(BatchError.CHANNEL_STATE);
+    }
     if (
       raw.channelConfig.payer === extra.feePayer ||
       raw.channelConfig.payerAuthorizer === extra.feePayer
@@ -578,123 +618,88 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       payer: raw.channelConfig.payer,
       salt: BigInt(raw.channelConfig.salt),
     });
-    if (raw.type === "deposit" || raw.type === "voucher") {
-      if (raw.voucher.channelId !== channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
-      this.assertExpiry(raw.voucher);
-      const valid = await verifyVoucherSignature({
-        message: encodeVoucherMessageBytes({
-          channelId,
-          cumulativeAmount: BigInt(raw.voucher.maxClaimableAmount),
-          expiresAt: BigInt(raw.voucher.expiresAt),
-        }),
-        signatureBase58: raw.voucher.signature,
-        signerBase58: raw.channelConfig.payerAuthorizer,
-      });
-      if (!valid) throw new Error(BatchError.VOUCHER_SIGNATURE);
-    }
+    await this.validateRequestProof(raw, channelId, voucherSigner);
     return channelId;
+  }
+
+  private async validateRequestProof(
+    raw: BatchPayload,
+    channelId: string,
+    voucherSigner: "client" | "server",
+  ): Promise<void> {
+    if (raw.type === "deposit" || raw.type === "voucher" || raw.type === "authorization") {
+      const voucher =
+        raw.type === "voucher" ? raw.voucher : raw.type === "deposit" ? raw.voucher : undefined;
+      const authorization =
+        raw.type === "authorization"
+          ? raw.authorization
+          : raw.type === "deposit"
+            ? raw.authorization
+            : undefined;
+      if (voucherSigner === "client" && !voucher) throw new Error(BatchError.VOUCHER_SIGNATURE);
+      if (voucherSigner === "server" && !authorization) {
+        throw new Error(BatchError.VOUCHER_SIGNATURE);
+      }
+      if (voucher) {
+        if (voucher.channelId !== channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
+        this.assertExpiry(voucher);
+        const valid = await verifyVoucherSignature({
+          message: encodeVoucherMessageBytes({
+            channelId,
+            cumulativeAmount: BigInt(voucher.maxClaimableAmount),
+            expiresAt: BigInt(voucher.expiresAt),
+          }),
+          signatureBase58: voucher.signature,
+          signerBase58: raw.channelConfig.payerAuthorizer,
+        });
+        if (!valid) throw new Error(BatchError.VOUCHER_SIGNATURE);
+      }
+      if (authorization) {
+        const idempotencyKey =
+          raw.type === "authorization"
+            ? raw.idempotencyKey
+            : raw.type === "deposit"
+              ? raw.idempotencyKey
+              : undefined;
+        const maxClaimableAmount =
+          raw.type === "authorization"
+            ? raw.maxClaimableAmount
+            : raw.type === "deposit"
+              ? raw.maxClaimableAmount
+              : undefined;
+        if (
+          authorization.channelId !== channelId ||
+          authorization.payer !== raw.channelConfig.payer ||
+          typeof idempotencyKey !== "string" ||
+          idempotencyKey.length === 0 ||
+          typeof maxClaimableAmount !== "string" ||
+          !(await verifyBatchAuthorization(authorization, raw.channelConfig.payerAuthorizer))
+        ) {
+          throw new Error(BatchError.VOUCHER_SIGNATURE);
+        }
+      }
+    }
   }
 
   private assertExpiry(voucher: BatchVoucher): void {
     if (voucher.expiresAt !== 0) throw new Error(BatchError.VOUCHER_EXPIRY);
   }
 
-  /**
-   * Verify an ordinary voucher from the server's durable state plus a fresh
-   * confirmed channel snapshot. Returning undefined deliberately falls back
-   * to facilitator `/verify`; deposits and refunds never enter this path.
-   *
-   * @param stored - Durable server state for the channel
-   * @param raw - Validated voucher payload
-   * @param requirements - Payment requirements for the resource request
-   * @returns A local verification result, or undefined when RPC is not configured
-   */
-  private async verifyVoucherLocally(
-    stored: ChannelState,
-    raw: Extract<BatchPayload, { type: "voucher" }>,
-    requirements: DeepReadonly<PaymentRequirements>,
-  ): Promise<VerifyResponse | undefined> {
-    const maxAge = this.config.channelSnapshotMaxAgeMs ?? 1_000;
-    const age =
-      stored.onchainSnapshotAt === undefined ? Infinity : Date.now() - stored.onchainSnapshotAt;
-    let state = stored;
-
-    if (age < 0 || age >= maxAge) {
-      if (!this.config.readChannel) return undefined;
-      const observed = await this.config.readChannel({
-        channelId: stored.channelId,
-        network: requirements.network as Network,
-      });
-      if (!observed) throw new Error(BatchError.CHANNEL_STATE);
-      const observedAt = observed.observedAt ?? Date.now();
-      const observedAge = Date.now() - observedAt;
-      if (!Number.isFinite(observedAt) || observedAge < 0 || observedAge > maxAge) {
-        throw new Error(BatchError.CHANNEL_STATE);
-      }
-      this.assertConfirmedChannel(observed.channel, observed.mintOwner, stored, requirements);
-      state = await this.store.update(stored.channelId, current => {
-        if (!current) throw new Error(BatchError.CHANNEL_STATE);
-        this.assertStoredConfig(current, raw.channelConfig);
-        return {
-          ...current,
-          deposit: observed.channel.deposit,
-          onchainSnapshotAt: observedAt,
-          payoutWatermark: observed.channel.settlement.payoutWatermark,
-          settled: observed.channel.settlement.settled,
-        };
-      });
-    }
-
-    const cumulative = parseU64(raw.voucher.maxClaimableAmount, "maxClaimableAmount");
-    if (
-      state.status !== "open" ||
-      state.payoutWatermark > state.settled ||
-      state.settled > state.deposit ||
-      state.chargedCumulativeAmount < state.settled ||
-      cumulative > state.deposit
-    ) {
-      throw new Error(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT);
-    }
+  private async signOperatorVoucher(
+    channelId: string,
+    cumulativeAmount: bigint,
+  ): Promise<BatchVoucher> {
+    if (!this.config.operator) throw new Error(BatchError.VOUCHER_SIGNATURE);
     return {
-      isValid: true,
-      payer: state.payer,
-      extra: { channelState: snapshot(state) },
+      channelId,
+      expiresAt: 0,
+      maxClaimableAmount: cumulativeAmount.toString(),
+      signature: await signVoucher(this.config.operator, {
+        channelId,
+        cumulativeAmount,
+        expiresAt: 0n,
+      }),
     };
-  }
-
-  /**
-   * Validate every immutable binding carried by a confirmed channel account.
-   *
-   * @param channel - Confirmed decoded payment-channel account
-   * @param mintOwner - Owner program for the configured mint
-   * @param stored - Durable server state the account must match
-   * @param requirements - Current resource payment requirements
-   */
-  private assertConfirmedChannel(
-    channel: Channel,
-    mintOwner: string,
-    stored: ChannelState,
-    requirements: DeepReadonly<PaymentRequirements>,
-  ): void {
-    const expectedDistributionHash = getChannelDistributionHash([
-      { bps: 10_000, recipient: requirements.payTo },
-    ]);
-    if (
-      channel.status !== ChannelStatus.Open ||
-      channel.payer !== stored.payer ||
-      channel.payee !== stored.feePayer ||
-      channel.rentPayer !== stored.feePayer ||
-      channel.authorizedSigner !== stored.payerAuthorizer ||
-      channel.mint !== stored.mint ||
-      mintOwner !== stored.tokenProgram ||
-      channel.gracePeriod !== stored.withdrawDelay ||
-      channel.salt !== stored.salt ||
-      channel.openSlot !== stored.openSlot ||
-      channel.distributionHash.length !== expectedDistributionHash.length ||
-      channel.distributionHash.some((value, index) => value !== expectedDistributionHash[index])
-    ) {
-      throw new Error(BatchError.CHANNEL_STATE);
-    }
   }
 
   /**
@@ -755,7 +760,6 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           snapshot.totalClaimed > base.signedMaxClaimable
             ? snapshot.totalClaimed
             : base.signedMaxClaimable,
-        onchainSnapshotAt: Date.now(),
         ...(snapshot.withdrawRequestedAt !== 0
           ? { closeRequestedAt: snapshot.withdrawRequestedAt, status: "closing" as const }
           : {}),
@@ -785,13 +789,15 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     const extra = requirements.extra!;
     return {
       channelConfig: raw.channelConfig,
+      ...(raw.type === "authorization" || (raw.type === "deposit" && raw.authorization)
+        ? { authorizationSignature: raw.authorization!.signature }
+        : {}),
       channelId,
       chargedCumulativeAmount: snapshot.totalClaimed,
       deposit: snapshot.balance ?? 0n,
       feePayer: String(extra.feePayer),
       mint: requirements.asset,
       openSlot: BigInt(raw.channelConfig.openSlot),
-      onchainSnapshotAt: Date.now(),
       payer: raw.channelConfig.payer,
       payerAuthorizer: raw.channelConfig.payerAuthorizer,
       payoutWatermark: 0n,
@@ -815,6 +821,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     const extra = requirements.extra!;
     return {
       channelConfig: raw.channelConfig,
+      ...(raw.authorization ? { authorizationSignature: raw.authorization.signature } : {}),
       channelId,
       chargedCumulativeAmount: 0n,
       deposit: parseU64(raw.deposit.amount, "deposit.amount"),
@@ -883,10 +890,7 @@ function acceptedResponse(state: ChannelState, requirements: PaymentRequirements
     amount: "",
     extra: {
       channelState: snapshot(state),
-      // The fixed per-request price, on a fresh acceptance and on a replay
-      // alike: a replay answers an authorization that was already charged this
-      // amount, so reporting zero would tell the client it paid nothing for a
-      // request it did pay for.
+      // The fixed per-request price charged by this acceptance.
       chargedAmount: requirements.amount,
       commitmentId: `${state.channelId}:${state.pendingRequest?.maxClaimableAmount ?? state.signedMaxClaimable}`,
     },
@@ -989,5 +993,6 @@ function confirmedDeposit(current: bigint, confirmed: string | undefined): bigin
 
 function classifyError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.includes(CHANNEL_BUSY)) return CHANNEL_BUSY;
   return Object.values(BatchError).find(value => message.includes(value)) ?? "transaction_failed";
 }

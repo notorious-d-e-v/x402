@@ -14,6 +14,17 @@ export type BatchExtra = {
   recentSlot?: number | undefined;
   channelState?: BatchChannelState | undefined;
   voucherState?: BatchVoucherState | undefined;
+  voucherSigner?: BatchVoucherSigner | undefined;
+  operator?: string | undefined;
+};
+
+export type BatchVoucherSigner = "client" | "server";
+
+export type BatchAuthorization = {
+  type: "proof";
+  channelId: string;
+  payer: string;
+  signature: string;
 };
 
 /**
@@ -42,6 +53,7 @@ export type BatchChannelConfig = {
   withdrawDelay: number;
   salt: string;
   openSlot: number;
+  voucherSigner?: BatchVoucherSigner | undefined;
 };
 
 export type BatchVoucher = {
@@ -59,7 +71,10 @@ export type CloseAuthorization = {
 export type BatchDepositPayload = {
   type: "deposit";
   channelConfig: BatchChannelConfig;
-  voucher: BatchVoucher;
+  voucher?: BatchVoucher | undefined;
+  authorization?: BatchAuthorization | undefined;
+  idempotencyKey?: string | undefined;
+  maxClaimableAmount?: string | undefined;
   deposit: {
     amount: string;
     transaction: string;
@@ -72,6 +87,14 @@ export type BatchVoucherPayload = {
   voucher: BatchVoucher;
 };
 
+export type BatchAuthorizationPayload = {
+  type: "authorization";
+  channelConfig: BatchChannelConfig;
+  authorization: BatchAuthorization;
+  idempotencyKey: string;
+  maxClaimableAmount: string;
+};
+
 export type BatchRefundPayload = {
   type: "refund";
   channelConfig: BatchChannelConfig;
@@ -80,7 +103,11 @@ export type BatchRefundPayload = {
   closeAuthorization?: CloseAuthorization | undefined;
 };
 
-export type BatchPayload = BatchDepositPayload | BatchVoucherPayload | BatchRefundPayload;
+export type BatchPayload =
+  | BatchDepositPayload
+  | BatchVoucherPayload
+  | BatchAuthorizationPayload
+  | BatchRefundPayload;
 
 export type BatchVoucherClaim = {
   voucher: {
@@ -132,7 +159,10 @@ export function isBatchChannelConfig(value: unknown): value is BatchChannelConfi
     typeof value.token === "string" &&
     typeof value.withdrawDelay === "number" &&
     typeof value.salt === "string" &&
-    typeof value.openSlot === "number"
+    typeof value.openSlot === "number" &&
+    (value.voucherSigner === undefined ||
+      value.voucherSigner === "client" ||
+      value.voucherSigner === "server")
   );
 }
 
@@ -140,14 +170,33 @@ export function isBatchPayload(value: unknown): value is BatchPayload {
   if (!isRecord(value) || !isBatchChannelConfig(value.channelConfig)) return false;
   switch (value.type) {
     case "deposit":
-      return (
-        isBatchVoucher(value.voucher) &&
-        isRecord(value.deposit) &&
-        typeof value.deposit.amount === "string" &&
-        typeof value.deposit.transaction === "string"
-      );
+      if (!isRecord(value.deposit)) return false;
+      if (
+        typeof value.deposit.amount !== "string" ||
+        typeof value.deposit.transaction !== "string"
+      ) {
+        return false;
+      }
+      return value.channelConfig.voucherSigner === "server"
+        ? value.voucher === undefined &&
+            isBatchAuthorization(value.authorization) &&
+            typeof value.idempotencyKey === "string" &&
+            value.idempotencyKey.length > 0 &&
+            typeof value.maxClaimableAmount === "string"
+        : isBatchVoucher(value.voucher) &&
+            value.authorization === undefined &&
+            value.idempotencyKey === undefined &&
+            value.maxClaimableAmount === undefined;
     case "voucher":
-      return isBatchVoucher(value.voucher);
+      return value.channelConfig.voucherSigner !== "server" && isBatchVoucher(value.voucher);
+    case "authorization":
+      return (
+        value.channelConfig.voucherSigner === "server" &&
+        isBatchAuthorization(value.authorization) &&
+        typeof value.idempotencyKey === "string" &&
+        value.idempotencyKey.length > 0 &&
+        typeof value.maxClaimableAmount === "string"
+      );
     case "refund":
       return (
         typeof value.transaction === "string" &&
@@ -157,6 +206,16 @@ export function isBatchPayload(value: unknown): value is BatchPayload {
     default:
       return false;
   }
+}
+
+function isBatchAuthorization(value: unknown): value is BatchAuthorization {
+  return (
+    isRecord(value) &&
+    value.type === "proof" &&
+    typeof value.channelId === "string" &&
+    typeof value.payer === "string" &&
+    typeof value.signature === "string"
+  );
 }
 
 export function isBatchFacilitatorPayload(value: unknown): value is BatchFacilitatorPayload {
