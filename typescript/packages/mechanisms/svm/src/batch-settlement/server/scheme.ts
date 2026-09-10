@@ -110,6 +110,8 @@ export interface BatchSvmServerConfig {
     | ((commitment: {
         channelId: string;
         commitmentId: string;
+        /** Stable request key; present for server-authorized operations. */
+        idempotencyKey?: string;
       }) => Promise<SkipHandlerDirective | undefined>)
     | undefined;
   /** Operator key used to sign cumulative vouchers after successful requests. */
@@ -475,6 +477,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
             const application = await this.config.getReplayResponse?.({
               channelId: request.channelId,
               commitmentId: `${request.channelId}:${reserved.operation.cumulative}`,
+              idempotencyKey: request.idempotencyKey,
             });
             return {
               skipHandler: true,

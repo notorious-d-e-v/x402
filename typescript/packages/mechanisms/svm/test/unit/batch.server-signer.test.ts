@@ -507,7 +507,16 @@ describe("batch server voucher signer boundaries", () => {
   it("reserves concurrent ceilings, completes out of order, and replays receipts", async () => {
     const store = new MemoryChannelStore();
     const operationStore = new MemoryBatchOperationStore();
-    const server = new BatchServerScheme({ operator, operationStore, store });
+    let replayKey: { channelId: string; commitmentId: string; idempotencyKey?: string } | undefined;
+    const server = new BatchServerScheme({
+      getReplayResponse: async key => {
+        replayKey = key;
+        return { body: { replayed: true } };
+      },
+      operator,
+      operationStore,
+      store,
+    });
     const openPayment: PaymentPayload = {
       accepted: requirements(),
       payload: serverDeposit,
@@ -644,6 +653,11 @@ describe("batch server voucher signer boundaries", () => {
     expect(replay.result).toMatchObject({
       skipHandler: true,
       response: { body: { replayed: true } },
+    });
+    expect(replayKey).toEqual({
+      channelId,
+      commitmentId: `${channelId}:1500`,
+      idempotencyKey: "concurrent-3",
     });
     await expect(
       server.schemeHooks.onBeforeSettle!({ ...replay.context, phase: "after-handler" }),
