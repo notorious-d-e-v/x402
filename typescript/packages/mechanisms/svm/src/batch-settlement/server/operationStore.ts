@@ -24,6 +24,8 @@ export type BatchOperation =
     };
 
 export interface BatchOperationStore {
+  /** True when records survive process loss and are shared by every server instance. */
+  readonly durable?: boolean;
   /** Fetch a reserved or completed request operation. */
   get(channelId: string, idempotencyKey: string): Promise<BatchOperation | undefined>;
   /** Atomically create a request reservation unless the operation already exists. */
@@ -41,6 +43,7 @@ export interface BatchOperationStore {
 
 /** In-memory operation store used by the reference implementation. */
 export class MemoryBatchOperationStore implements BatchOperationStore {
+  readonly durable = false;
   private readonly operations = new Map<string, BatchOperation>();
   private readonly locks = new Map<string, Promise<unknown>>();
 

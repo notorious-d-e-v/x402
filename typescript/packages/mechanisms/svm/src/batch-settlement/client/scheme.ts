@@ -121,6 +121,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
   };
   private readonly channels = new Map<string, OpenChannel>();
   private readonly pending = new Map<string, PendingChannel>();
+  private readonly mintProgramCache = new Map<string, Promise<string>>();
 
   constructor(
     private readonly signer: BatchClientSigner,
@@ -145,6 +146,9 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       if (blocking.amount !== requirements.amount) {
         throw new Error("batch-settlement channel has a pending allocation for a different amount");
       }
+      // A prior storage write may have failed after allocating in memory.
+      // Never expose the payment until the exact pending record is durable.
+      await this.persistPending(blocking);
       return blocking.payment;
     }
     if (existing) {
@@ -501,7 +505,6 @@ export class BatchSvmScheme implements SchemeNetworkClient {
    *
    * @param ctx
    */
-  // eslint-disable-next-line complexity
   private async handlePaymentResponse(ctx: PaymentResponseContext): Promise<boolean> {
     const payload = ctx.paymentPayload.payload;
     if (
@@ -529,6 +532,12 @@ export class BatchSvmScheme implements SchemeNetworkClient {
         : candidate.tracker.channelId === voucherChannelId,
     );
     if (!pending) return false;
+    if (ctx.error) {
+      // The request may have reached the server. Keep the exact authorization
+      // and idempotency key available for an application-level retry.
+      await this.persistPending(pending);
+      return false;
+    }
     this.pending.delete(pending.operationKey);
 
     if (!ctx.settleResponse?.success) {
@@ -557,8 +566,14 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       typeof extra?.chargedAmount === "string" && /^\d+$/.test(extra.chargedAmount)
         ? BigInt(extra.chargedAmount)
         : undefined;
-    if (charged === undefined || charged > requestAmount) {
-      throw new Error("batch-settlement PAYMENT-RESPONSE charged more than the advertised price");
+    if (
+      charged === undefined ||
+      charged > requestAmount ||
+      (pending.tracker.channelConfig.voucherSigner !== "server" && charged !== requestAmount)
+    ) {
+      throw new Error(
+        "batch-settlement PAYMENT-RESPONSE charge did not equal the advertised price or charged more than its ceiling",
+      );
     }
     let confirmedCumulative = (pending.confirmed?.tracker.cumulative ?? 0n) + charged;
     if (pending.tracker.channelConfig.voucherSigner === "server") {
@@ -617,11 +632,11 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       extra?.commitmentId !== `${pending.tracker.channelId}:${confirmedCumulative}` ||
       (typeof reported === "string" && reported !== confirmedCumulative.toString())
     ) {
-      // The server confirmed something this client did not submit. Leave local
-      // state untouched rather than adopt an accounting it cannot derive; the
-      // next request resynchronizes through a corrective 402.
-      await this.restoreConfirmedChannel(pending);
-      return false;
+      // Keep the exact request durable so a retry can recover the application
+      // response without authorizing another charge.
+      this.pending.set(pending.operationKey, pending);
+      await this.persistPending(pending);
+      throw new Error("batch-settlement PAYMENT-RESPONSE state is inconsistent");
     }
     // A deposit's escrow is what this client signed for, not what the server
     // reports holding.
@@ -797,9 +812,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     if (tokenProgram !== TOKEN_PROGRAM_ADDRESS && tokenProgram !== TOKEN_2022_PROGRAM_ADDRESS) {
       throw new Error("extra.tokenProgram is not a supported SPL token program");
     }
-    const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
-    const mint = await fetchMint(rpc, requirements.asset as Address);
-    if (mint.programAddress.toString() !== tokenProgram) {
+    if ((await this.resolveMintProgram(requirements)) !== tokenProgram) {
       throw new Error("extra.tokenProgram does not own requirements.asset");
     }
     const receiverAuthorizer = extra.receiverAuthorizer;
@@ -830,5 +843,19 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       voucherSigner,
       ...(typeof operator === "string" ? { operator } : {}),
     };
+  }
+
+  private resolveMintProgram(requirements: PaymentRequirements): Promise<string> {
+    const key = `${requirements.network}:${requirements.asset}`;
+    let pending = this.mintProgramCache.get(key);
+    if (!pending) {
+      const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
+      pending = fetchMint(rpc, requirements.asset as Address).then(mint =>
+        mint.programAddress.toString(),
+      );
+      this.mintProgramCache.set(key, pending);
+      void pending.catch(() => this.mintProgramCache.delete(key));
+    }
+    return pending;
   }
 }

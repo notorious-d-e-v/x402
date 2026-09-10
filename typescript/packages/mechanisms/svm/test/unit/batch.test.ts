@@ -693,44 +693,6 @@ describe("batch-settlement SVM", () => {
       expect(enriched?.[0]?.extra?.voucherState).toBeUndefined();
     });
 
-    it("reports the real charged amount when settling a replay", async () => {
-      const store = new MemoryChannelStore();
-      const voucher = await signedVoucher(1_000n);
-      await store.put(
-        serverState({
-          chargedCumulativeAmount: 1_000n,
-          highestVoucherExpiresAt: voucher.expiresAt,
-          highestVoucherSignature: voucher.signature,
-          signedMaxClaimable: 1_000n,
-        }),
-      );
-      const server = new BatchServerScheme({ store });
-      const context = {
-        declaredExtensions: {},
-        paymentPayload: {
-          accepted: requirements(),
-          payload: { channelConfig, type: "voucher" as const, voucher },
-          x402Version: 2,
-        },
-        requirements: requirements(),
-      };
-      await server.schemeHooks.onBeforeVerify!(context);
-
-      const settled = await server.schemeHooks.onBeforeSettle!({
-        ...context,
-        phase: "after-handler",
-      });
-      // The replayed authorization was charged the request price. Reporting
-      // zero would tell the client it paid nothing for a request it paid for.
-      expect(settled).toMatchObject({
-        result: {
-          extra: { chargedAmount: "1000", commitmentId: `${channelId}:1000` },
-          success: true,
-        },
-        skip: true,
-      });
-    });
-
     it("re-serves an exact replay only through the application response cache", async () => {
       const store = new MemoryChannelStore();
       const voucher = await signedVoucher(1_000n);
@@ -842,28 +804,13 @@ describe("batch-settlement SVM", () => {
         "storage still unavailable",
       );
       const payment = await client.createPaymentPayload(2, req);
-      expect(saved?.pending?.payment).toEqual(payment);
+      const persisted = Array.isArray(saved?.pending) ? saved.pending[0] : saved?.pending;
+      expect(persisted?.payment).toEqual(payment);
       expect(set).toHaveBeenCalledTimes(3);
-      expect(set.mock.calls[0][1].pending?.payment).toEqual(payment);
-      expect(set.mock.calls[1][1].pending?.payment).toEqual(payment);
-    });
-    it("serializes concurrent payload allocation per channel", async () => {
-      const client = new BatchClientScheme(payer);
-      const internal = client as unknown as {
-        acquireChannel(key: string): Promise<void>;
-        releaseChannel(key: string): void;
-      };
-      await internal.acquireChannel("channel");
-      let secondEntered = false;
-      const second = internal.acquireChannel("channel").then(() => {
-        secondEntered = true;
-      });
-      await Promise.resolve();
-      expect(secondEntered).toBe(false);
-      internal.releaseChannel("channel");
-      await second;
-      expect(secondEntered).toBe(true);
-      internal.releaseChannel("channel");
+      const first = set.mock.calls[0][1].pending;
+      const second = set.mock.calls[1][1].pending;
+      expect((Array.isArray(first) ? first[0] : first)?.payment).toEqual(payment);
+      expect((Array.isArray(second) ? second[0] : second)?.payment).toEqual(payment);
     });
 
     it("signs the canonical 50-byte voucher message", async () => {
@@ -947,19 +894,14 @@ describe("batch-settlement SVM", () => {
         deposit: "10000",
         payment,
       });
-      const internal = client as unknown as {
-        acquireChannel(channelKey: string): Promise<void>;
-        releaseChannel(channelKey: string): void;
-      };
-      await internal.acquireChannel(key);
       await client.schemeHooks.onPaymentResponse!({
         error: new Error("connection reset after request write"),
         paymentPayload: { accepted: requirements(), ...payment },
         requirements: requirements(),
       });
-      expect(await storage.get(key)).toMatchObject({ pending: { payment } });
-      await internal.acquireChannel(key);
-      internal.releaseChannel(key);
+      const saved = await storage.get(key);
+      const persisted = Array.isArray(saved?.pending) ? saved.pending[0] : saved?.pending;
+      expect(persisted?.payment).toEqual(payment);
     });
 
     it("adopts a corrective cumulative base against its own signature", async () => {
@@ -1168,9 +1110,9 @@ describe("batch-settlement SVM", () => {
           },
         } as Parameters<NonNullable<typeof inconsistent.client.schemeHooks.onPaymentResponse>>[0]),
       ).rejects.toThrow(/state is inconsistent/);
-      expect(await inconsistent.storage.get(inconsistent.key)).toMatchObject({
-        pending: { payment: deposit },
-      });
+      const saved = await inconsistent.storage.get(inconsistent.key);
+      const persisted = Array.isArray(saved?.pending) ? saved.pending[0] : saved?.pending;
+      expect(persisted?.payment).toEqual(deposit);
 
       // The escrow is the deposit this client signed, not the balance the
       // server reports — here inflated tenfold.

@@ -410,7 +410,7 @@ describe("batch server lifecycle boundaries", () => {
 
   it("handles unknown channels and rejects unusable facilitator snapshots", async () => {
     const store = new MemoryChannelStore();
-    const server = new BatchSvmScheme({ store });
+    const server = new BatchSvmScheme({ recoverUnknownChannels: true, store });
     const voucherPayload: BatchPayload = {
       channelConfig,
       type: "voucher",
@@ -445,7 +445,10 @@ describe("batch server lifecycle boundaries", () => {
       }),
     ).resolves.toMatchObject({ abort: true, reason: BatchError.CHANNEL_STATE });
 
-    const second = new BatchSvmScheme({ store: new MemoryChannelStore() });
+    const second = new BatchSvmScheme({
+      recoverUnknownChannels: true,
+      store: new MemoryChannelStore(),
+    });
     const payment2 = { ...payment, payload: { ...voucherPayload } } as PaymentPayload;
     const context2 = { ...verifyContext, paymentPayload: payment2 };
     await second.schemeHooks.onBeforeVerify!(context2);
@@ -468,7 +471,7 @@ describe("batch server lifecycle boundaries", () => {
     ).resolves.toMatchObject({ abort: true, reason: BatchError.CUMULATIVE_AMOUNT_MISMATCH });
   });
 
-  it("rejects an exact replay before the resource handler", async () => {
+  it("rejects an exact replay when no application response is cached", async () => {
     const replayState = state({
       chargedCumulativeAmount: 1_000n,
       highestVoucherSignature: depositPayload.voucher.signature,
@@ -487,11 +490,17 @@ describe("batch server lifecycle boundaries", () => {
     await store.put(replayState);
     const server = new BatchSvmScheme({ store });
     const payment = makePayment();
+    const context = {
+      declaredExtensions: {},
+      paymentPayload: payment,
+      requirements: requirements(),
+    };
+    const verified = await server.schemeHooks.onBeforeVerify!(context);
+    expect(verified).toMatchObject({ skip: true });
     await expect(
-      server.schemeHooks.onBeforeVerify!({
-        declaredExtensions: {},
-        paymentPayload: payment,
-        requirements: requirements(),
+      server.schemeHooks.onAfterVerify!({
+        ...context,
+        result: (verified as { result: { isValid: true; payer: string } }).result,
       }),
     ).resolves.toMatchObject({ abort: true, reason: "duplicate_settlement" });
   });
@@ -521,7 +530,7 @@ describe("batch server lifecycle boundaries", () => {
         expect(before).toMatchObject({ abort: true, reason: BatchError.CHANNEL_STATE });
         continue;
       }
-      expect(before).toMatchObject({ skip: true });
+      expect(before).toBeUndefined();
       await expect(
         server.schemeHooks.onAfterVerify!({
           ...ctx,
@@ -637,7 +646,7 @@ describe("batch server lifecycle boundaries", () => {
       };
       const ctx = { declaredExtensions: {}, paymentPayload: payment, requirements: requirements() };
       const before = await server.schemeHooks.onBeforeVerify!(ctx);
-      expect(before).toMatchObject({ skip: true });
+      expect(before).toBeUndefined();
       await server.schemeHooks.onAfterVerify!({
         ...ctx,
         result: { isValid: true, payer: payer.address },

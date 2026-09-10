@@ -564,7 +564,9 @@ describe("batch client lifecycle", () => {
     for (const value of invalid) await expect(resolve(value)).rejects.toThrow();
 
     vi.mocked(fetchMint).mockResolvedValueOnce({ programAddress: payer.address } as never);
-    await expect(resolve(requirements())).rejects.toThrow(/does not own/);
+    await expect(internals(new BatchSvmScheme(payer)).resolveTerms(requirements())).rejects.toThrow(
+      /does not own/,
+    );
     await expect(
       new BatchSvmScheme(payer, { salt: "bad" }).createPaymentPayload(2, requirements()),
     ).rejects.toThrow();
