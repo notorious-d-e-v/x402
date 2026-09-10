@@ -148,10 +148,13 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       config.requireDurableStore &&
       (config.store?.durable !== true ||
         config.operationStore?.durable !== true ||
-        typeof config.readChannel !== "function")
+        typeof config.readChannel !== "function" ||
+        (config.operator !== undefined &&
+          (config.store !== (config.operationStore as unknown) ||
+            typeof config.operationStore?.commitWithChannel !== "function")))
     ) {
       throw new Error(
-        "batch-settlement production mode requires durable stores and confirmed channel reads",
+        "batch-settlement production mode requires durable stores, confirmed channel reads, and atomic server-operation commits",
       );
     }
     this.store = config.store ?? new MemoryChannelStore();
@@ -579,13 +582,18 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       if (raw.type !== "authorization" && actual !== ceiling) {
         throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
       }
-      let response: SettleResponse | undefined;
-      const committed = await this.store.update(request.channelId, async current => {
+      const buildCommit = async (
+        current: ChannelState | undefined,
+        operationReservation?: Extract<BatchOperation, { status: "reserved" }>,
+      ) => {
         const reservation = current?.reservations?.[request.pendingId!];
         if (!current || !reservation) {
           throw new Error(CHANNEL_BUSY);
         }
         if (actual > reservation.ceiling) throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+        if (operationReservation && operationReservation.ceiling !== reservation.ceiling) {
+          throw new Error(CHANNEL_BUSY);
+        }
         const prior = current.chargedCumulativeAmount;
         const cumulative = prior + actual;
         const voucher =
@@ -600,6 +608,8 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           reservations: withoutReservation(current.reservations, request.pendingId!),
           signedMaxClaimable: BigInt(voucher.maxClaimableAmount),
         };
+        let operation: Extract<BatchOperation, { status: "completed" }> | undefined;
+        let response: SettleResponse;
         if (request.idempotencyKey) {
           const receipt = await this.signReceipt(
             request.channelId,
@@ -611,7 +621,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
             voucher,
           );
           response = acceptedResponse(next, ctx.requirements, receipt);
-          await this.operationStore.complete({
+          operation = {
             status: "completed",
             channelId: request.channelId,
             idempotencyKey: request.idempotencyKey,
@@ -620,14 +630,41 @@ export class BatchSvmScheme implements SchemeNetworkServer {
             cumulative,
             receipt,
             response,
-          });
+          };
         } else {
           response = acceptedResponse(next, ctx.requirements);
         }
-        return next;
-      });
+        return { channel: next, operation, response };
+      };
+
+      let committed: ChannelState;
+      let response: SettleResponse;
+      if (request.idempotencyKey && this.operationStore.commitWithChannel) {
+        const atomic = await this.operationStore.commitWithChannel(
+          request.channelId,
+          request.idempotencyKey,
+          async (current, operationReservation) => {
+            const built = await buildCommit(current, operationReservation);
+            if (!built.operation) throw new Error(CHANNEL_BUSY);
+            return { channel: built.channel, operation: built.operation };
+          },
+        );
+        committed = atomic.channel;
+        response = atomic.operation.response;
+      } else {
+        let completion: Extract<BatchOperation, { status: "completed" }> | undefined;
+        let builtResponse: SettleResponse | undefined;
+        committed = await this.store.update(request.channelId, async current => {
+          const built = await buildCommit(current);
+          completion = built.operation;
+          builtResponse = built.response;
+          return built.channel;
+        });
+        if (completion) await this.operationStore.complete(completion);
+        response = builtResponse ?? acceptedResponse(committed, ctx.requirements);
+      }
       this.requestContexts.delete(ctx.paymentPayload);
-      return { skip: true, result: response ?? acceptedResponse(committed, ctx.requirements) };
+      return { skip: true, result: response };
     } catch (error) {
       return this.abort(
         classifyError(error),
@@ -653,18 +690,23 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       if (raw.voucher && actual !== ceiling) {
         throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
       }
-      let receipt: BatchSettlementReceipt | undefined;
-      const committed = await this.store.update(request.channelId, async current => {
+      const confirmed = readChannelState(ctx.result);
+      const buildCommit = async (
+        current: ChannelState | undefined,
+        operationReservation?: Extract<BatchOperation, { status: "reserved" }>,
+      ) => {
         const reservation = current?.reservations?.[request.pendingId!];
         if (!current || !reservation) {
           throw new Error(CHANNEL_BUSY);
         }
         if (actual > reservation.ceiling) throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+        if (operationReservation && operationReservation.ceiling !== reservation.ceiling) {
+          throw new Error(CHANNEL_BUSY);
+        }
         const prior = current.chargedCumulativeAmount;
         const cumulative = prior + actual;
         const voucher =
           raw.voucher ?? (await this.signOperatorVoucher(request.channelId, cumulative));
-        const confirmed = readChannelState(ctx.result);
         const next: ChannelState = {
           ...current,
           // A top-up raises the escrow ceiling; without this the stored deposit
@@ -678,6 +720,8 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           signedMaxClaimable: BigInt(voucher.maxClaimableAmount),
           reservations: withoutReservation(current.reservations, request.pendingId!),
         };
+        let receipt: BatchSettlementReceipt | undefined;
+        let operation: Extract<BatchOperation, { status: "completed" }> | undefined;
         if (request.idempotencyKey) {
           receipt = await this.signReceipt(
             request.channelId,
@@ -696,7 +740,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
               ...withoutExistingFields(extra, ctx.result.extra),
             },
           };
-          await this.operationStore.complete({
+          operation = {
             status: "completed",
             channelId: request.channelId,
             idempotencyKey: request.idempotencyKey,
@@ -705,10 +749,35 @@ export class BatchSvmScheme implements SchemeNetworkServer {
             cumulative,
             receipt,
             response,
-          });
+          };
         }
-        return next;
-      });
+        return { channel: next, operation, receipt };
+      };
+
+      let committed: ChannelState;
+      let receipt: BatchSettlementReceipt | undefined;
+      if (request.idempotencyKey && this.operationStore.commitWithChannel) {
+        const atomic = await this.operationStore.commitWithChannel(
+          request.channelId,
+          request.idempotencyKey,
+          async (current, operationReservation) => {
+            const built = await buildCommit(current, operationReservation);
+            if (!built.operation) throw new Error(CHANNEL_BUSY);
+            return { channel: built.channel, operation: built.operation };
+          },
+        );
+        committed = atomic.channel;
+        receipt = atomic.operation.receipt;
+      } else {
+        let completion: Extract<BatchOperation, { status: "completed" }> | undefined;
+        committed = await this.store.update(request.channelId, async current => {
+          const built = await buildCommit(current);
+          completion = built.operation;
+          receipt = built.receipt;
+          return built.channel;
+        });
+        if (completion) await this.operationStore.complete(completion);
+      }
       this.settlementExtras.set(
         ctx.paymentPayload,
         settlementExtra(committed, ctx.requirements.amount, receipt),

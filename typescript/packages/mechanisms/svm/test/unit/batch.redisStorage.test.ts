@@ -7,6 +7,7 @@ import {
   type RedisScanOptions,
   type RedisSetOptions,
 } from "../../src/batch-settlement/server/redisStorage";
+import type { BatchOperation } from "../../src/batch-settlement/server/operationStore";
 import type { ChannelState } from "../../src/batch-settlement/server/storage";
 
 type Entry = { value: string; expiresAt?: number };
@@ -34,6 +35,21 @@ class FakeRedis implements RedisChannelStoreClient {
     const key = options.keys[0]!;
     this.expire(key);
     const current = this.values.get(key);
+    if (script.includes("ARGV[5]")) {
+      const operationKey = options.keys[1]!;
+      this.expire(operationKey);
+      const operation = this.values.get(operationKey);
+      const [expectedExists, expectedChannel, expectedOperation, nextChannel, nextOperation] =
+        options.arguments;
+      const channelMatches = expectedExists === "0" ? !current : current?.value === expectedChannel;
+      if (!channelMatches || operation?.value !== expectedOperation) {
+        this.conflicts += 1;
+        return 0;
+      }
+      this.values.set(key, { value: nextChannel! });
+      this.values.set(operationKey, { value: nextOperation! });
+      return 1;
+    }
     if (script.includes("ARGV[3]")) {
       const [expectedExists, expected, next] = options.arguments;
       const matches = expectedExists === "0" ? !current : current?.value === expected;
@@ -123,6 +139,80 @@ describe("RedisChannelStore", () => {
     ]);
 
     expect((await first.get("channel"))?.chargedCumulativeAmount).toBe(2n);
+    expect(client.conflicts).toBeGreaterThan(0);
+  });
+
+  it("atomically serializes concurrent channel and operation commits", async () => {
+    const client = new FakeRedis();
+    const first = new RedisChannelStore({ client, keyPrefix: "test", retryIntervalMs: 1 });
+    const second = new RedisChannelStore({ client, keyPrefix: "test", retryIntervalMs: 1 });
+    await first.put({
+      ...state("channel"),
+      reservations: {
+        first: {
+          ceiling: 1n,
+          expiresAt: Date.now() + 10_000,
+          idempotencyKey: "first",
+          kind: "server",
+        },
+        second: {
+          ceiling: 1n,
+          expiresAt: Date.now() + 10_000,
+          idempotencyKey: "second",
+          kind: "server",
+        },
+      },
+    });
+    await first.reserve("channel", "first", 1n, Date.now() + 10_000);
+    await second.reserve("channel", "second", 1n, Date.now() + 10_000);
+
+    const commit = async (store: RedisChannelStore, id: string, delay: number) =>
+      store.commitWithChannel("channel", id, async (current, reservation) => {
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        const cumulative = current!.chargedCumulativeAmount + 1n;
+        const channel = {
+          ...current!,
+          chargedCumulativeAmount: cumulative,
+          signedMaxClaimable: cumulative,
+          reservations: Object.fromEntries(
+            Object.entries(current!.reservations ?? {}).filter(
+              ([, value]) => value.idempotencyKey !== id,
+            ),
+          ),
+        };
+        const operation: Extract<BatchOperation, { status: "completed" }> = {
+          status: "completed",
+          channelId: "channel",
+          idempotencyKey: id,
+          ceiling: reservation.ceiling,
+          actual: 1n,
+          cumulative,
+          receipt: {
+            type: "receipt",
+            authorizedAmount: "1",
+            chargedAmount: "1",
+            channelId: "channel",
+            cumulativeAmount: cumulative.toString(),
+            idempotencyKey: id,
+            priorCumulativeAmount: (cumulative - 1n).toString(),
+            signature: "signature",
+            voucher: {
+              channelId: "channel",
+              expiresAt: 0,
+              maxClaimableAmount: cumulative.toString(),
+              signature: "signature",
+            },
+          },
+          response: { success: true, transaction: "", network: "solana:devnet" },
+        };
+        return { channel, operation };
+      });
+
+    await Promise.all([commit(first, "first", 5), commit(second, "second", 0)]);
+
+    expect((await first.get("channel"))?.chargedCumulativeAmount).toBe(2n);
+    expect((await first.get("channel", "first"))?.status).toBe("completed");
+    expect((await first.get("channel", "second"))?.status).toBe("completed");
     expect(client.conflicts).toBeGreaterThan(0);
   });
 

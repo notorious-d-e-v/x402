@@ -23,6 +23,10 @@ import {
   calculateDistributionAmount,
 } from "../../src/batch-settlement/facilitator/scheme";
 import { BatchSvmScheme as BatchServerScheme } from "../../src/batch-settlement/server/scheme";
+import {
+  RedisChannelStore,
+  type RedisChannelStoreClient,
+} from "../../src/batch-settlement/server/redisStorage";
 import { MemoryChannelStore, type ChannelState } from "../../src/batch-settlement/server/storage";
 import {
   isBatchPayload,
@@ -129,6 +133,35 @@ async function signedVoucher(maxClaimableAmount: bigint, expiresAt = 0): Promise
 describe("batch-settlement SVM", () => {
   afterEach(() => vi.restoreAllMocks());
   describe("resource server", () => {
+    it("requires one atomic durable store for production server-authorized requests", async () => {
+      const operator = await generateKeyPairSigner();
+      const redisClient = {} as RedisChannelStoreClient;
+      const first = new RedisChannelStore({ client: redisClient, keyPrefix: "first" });
+      const second = new RedisChannelStore({ client: redisClient, keyPrefix: "second" });
+      const readChannel = async () => undefined;
+
+      expect(
+        () =>
+          new BatchServerScheme({
+            operator,
+            operationStore: second,
+            readChannel,
+            requireDurableStore: true,
+            store: first,
+          }),
+      ).toThrow("atomic server-operation commits");
+      expect(
+        () =>
+          new BatchServerScheme({
+            operator,
+            operationStore: first,
+            readChannel,
+            requireDurableStore: true,
+            store: first,
+          }),
+      ).not.toThrow();
+    });
+
     it("refreshes during continuous vouchers and rejects an onchain close", async () => {
       let now = 1_000_000;
       let closing = false;

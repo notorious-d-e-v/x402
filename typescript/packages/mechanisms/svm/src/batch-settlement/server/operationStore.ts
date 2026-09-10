@@ -3,6 +3,7 @@
 import type { SettleResponse } from "@x402/core/types";
 
 import type { BatchSettlementReceipt } from "../types";
+import type { ChannelState } from "./storage";
 
 export type BatchOperation =
   | {
@@ -39,6 +40,31 @@ export interface BatchOperationStore {
   complete(operation: Extract<BatchOperation, { status: "completed" }>): Promise<void>;
   /** Release an uncompleted reservation after failed or canceled work. */
   release(channelId: string, idempotencyKey: string): Promise<void>;
+
+  /**
+   * Atomically update channel accounting and complete its reserved operation.
+   *
+   * Server-authorized requests need this cross-record commit in production: a
+   * receipt must never become replayable unless the matching cumulative
+   * watermark is committed at the same instant. Implementations retry the
+   * updater when another request advances the channel first.
+   */
+  commitWithChannel?(
+    channelId: string,
+    idempotencyKey: string,
+    updater: (
+      channel: ChannelState | undefined,
+      reservation: Extract<BatchOperation, { status: "reserved" }>,
+    ) =>
+      | { channel: ChannelState; operation: Extract<BatchOperation, { status: "completed" }> }
+      | Promise<{
+          channel: ChannelState;
+          operation: Extract<BatchOperation, { status: "completed" }>;
+        }>,
+  ): Promise<{
+    channel: ChannelState;
+    operation: Extract<BatchOperation, { status: "completed" }>;
+  }>;
 }
 
 /** In-memory operation store used by the reference implementation. */

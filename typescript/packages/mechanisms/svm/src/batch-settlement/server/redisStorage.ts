@@ -1,4 +1,5 @@
 /* eslint-disable jsdoc/require-jsdoc */
+import type { BatchOperation, BatchOperationStore } from "./operationStore";
 import type { ChannelState, ChannelStore } from "./storage";
 
 const DEFAULT_KEY_PREFIX = "x402:batch-settlement:svm";
@@ -13,6 +14,25 @@ elseif current ~= ARGV[2] then
   return 0
 end
 redis.call("SET", KEYS[1], ARGV[3])
+return 1
+`;
+
+const COMPARE_AND_DELETE = `
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call("DEL", KEYS[1])
+`;
+
+const COMMIT_CHANNEL_OPERATION = `
+local channel = redis.call("GET", KEYS[1])
+local operation = redis.call("GET", KEYS[2])
+if ARGV[1] == "0" then
+  if channel ~= false then return 0 end
+elseif channel ~= ARGV[2] then
+  return 0
+end
+if operation ~= ARGV[3] then return 0 end
+redis.call("SET", KEYS[1], ARGV[4])
+redis.call("SET", KEYS[2], ARGV[5])
 return 1
 `;
 
@@ -51,10 +71,11 @@ export interface RedisChannelStoreOptions {
  * Channel updates use optimistic compare-and-set. Worker leases are token
  * bound, automatically renewed, and released only by their owner.
  */
-export class RedisChannelStore implements ChannelStore {
+export class RedisChannelStore implements ChannelStore, BatchOperationStore {
   readonly durable = true;
   private readonly client: RedisChannelStoreClient;
   private readonly channelPrefix: string;
+  private readonly operationPrefix: string;
   private readonly leasePrefix: string;
   private readonly retryIntervalMs: number;
   private readonly scanCount: number;
@@ -63,13 +84,23 @@ export class RedisChannelStore implements ChannelStore {
     this.client = options.client;
     const prefix = options.keyPrefix ?? DEFAULT_KEY_PREFIX;
     this.channelPrefix = `${prefix}:server:channel`;
+    this.operationPrefix = `${prefix}:server:operation`;
     this.leasePrefix = `${prefix}:server:lease`;
     this.retryIntervalMs = options.retryIntervalMs ?? DEFAULT_RETRY_MS;
     this.scanCount = options.scanCount ?? DEFAULT_SCAN_COUNT;
   }
 
-  async get(channelId: string): Promise<ChannelState | undefined> {
-    const value = await this.client.get(this.channelKey(channelId));
+  get(channelId: string): Promise<ChannelState | undefined>;
+  get(channelId: string, idempotencyKey: string): Promise<BatchOperation | undefined>;
+  async get(
+    channelId: string,
+    idempotencyKey?: string,
+  ): Promise<ChannelState | BatchOperation | undefined> {
+    const key =
+      idempotencyKey === undefined
+        ? this.channelKey(channelId)
+        : this.operationKey(channelId, idempotencyKey);
+    const value = await this.client.get(key);
     return value === null ? undefined : deserialize(value);
   }
 
@@ -81,7 +112,7 @@ export class RedisChannelStore implements ChannelStore {
     })) {
       for (const key of Array.isArray(entry) ? entry : [entry]) {
         const value = await this.client.get(key);
-        if (value !== null) channels.push(deserialize(value));
+        if (value !== null) channels.push(deserialize<ChannelState>(value));
       }
     }
     return channels.sort((a, b) => a.channelId.localeCompare(b.channelId));
@@ -98,7 +129,9 @@ export class RedisChannelStore implements ChannelStore {
     const key = this.channelKey(channelId);
     for (;;) {
       const currentRaw = await this.client.get(key);
-      const next = await updater(currentRaw === null ? undefined : deserialize(currentRaw));
+      const next = await updater(
+        currentRaw === null ? undefined : deserialize<ChannelState>(currentRaw),
+      );
       if (next.channelId !== channelId) {
         throw new Error("ChannelStore updater cannot change channelId");
       }
@@ -107,6 +140,136 @@ export class RedisChannelStore implements ChannelStore {
         arguments: [currentRaw === null ? "0" : "1", currentRaw ?? "", serialize(next)],
       });
       if (Number(applied) === 1) return next;
+      await sleep(this.retryIntervalMs);
+    }
+  }
+
+  async reserve(
+    channelId: string,
+    idempotencyKey: string,
+    ceiling: bigint,
+    expiresAt: number,
+  ): Promise<{ created: boolean; operation: BatchOperation }> {
+    const key = this.operationKey(channelId, idempotencyKey);
+    for (;;) {
+      const currentRaw = await this.client.get(key);
+      const current = currentRaw === null ? undefined : deserialize<BatchOperation>(currentRaw);
+      if (current && current.ceiling !== ceiling) {
+        throw new Error("batch operation ceiling changed for an idempotency key");
+      }
+      if (current?.status === "completed" || (current && current.expiresAt > Date.now())) {
+        return { created: false, operation: current };
+      }
+      const operation: BatchOperation = {
+        status: "reserved",
+        channelId,
+        idempotencyKey,
+        ceiling,
+        expiresAt,
+      };
+      const applied = await this.client.eval(COMPARE_AND_SET, {
+        keys: [key],
+        arguments: [currentRaw === null ? "0" : "1", currentRaw ?? "", serialize(operation)],
+      });
+      if (Number(applied) === 1) return { created: true, operation };
+      await sleep(this.retryIntervalMs);
+    }
+  }
+
+  async complete(operation: Extract<BatchOperation, { status: "completed" }>): Promise<void> {
+    const key = this.operationKey(operation.channelId, operation.idempotencyKey);
+    for (;;) {
+      const currentRaw = await this.client.get(key);
+      if (currentRaw === null) throw new Error("batch operation reservation changed");
+      const current = deserialize<BatchOperation>(currentRaw);
+      if (
+        current.status !== "reserved" ||
+        current.ceiling !== operation.ceiling ||
+        current.channelId !== operation.channelId ||
+        current.idempotencyKey !== operation.idempotencyKey
+      ) {
+        throw new Error("batch operation reservation changed");
+      }
+      const applied = await this.client.eval(COMPARE_AND_SET, {
+        keys: [key],
+        arguments: ["1", currentRaw, serialize(operation)],
+      });
+      if (Number(applied) === 1) return;
+      await sleep(this.retryIntervalMs);
+    }
+  }
+
+  async release(channelId: string, idempotencyKey: string): Promise<void> {
+    const key = this.operationKey(channelId, idempotencyKey);
+    for (;;) {
+      const currentRaw = await this.client.get(key);
+      if (currentRaw === null) return;
+      const current = deserialize<BatchOperation>(currentRaw);
+      if (current.status !== "reserved") return;
+      const deleted = await this.client.eval(COMPARE_AND_DELETE, {
+        keys: [key],
+        arguments: [currentRaw],
+      });
+      if (Number(deleted) === 1) return;
+      await sleep(this.retryIntervalMs);
+    }
+  }
+
+  async commitWithChannel(
+    channelId: string,
+    idempotencyKey: string,
+    updater: (
+      channel: ChannelState | undefined,
+      reservation: Extract<BatchOperation, { status: "reserved" }>,
+    ) =>
+      | { channel: ChannelState; operation: Extract<BatchOperation, { status: "completed" }> }
+      | Promise<{
+          channel: ChannelState;
+          operation: Extract<BatchOperation, { status: "completed" }>;
+        }>,
+  ): Promise<{
+    channel: ChannelState;
+    operation: Extract<BatchOperation, { status: "completed" }>;
+  }> {
+    const channelKey = this.channelKey(channelId);
+    const operationKey = this.operationKey(channelId, idempotencyKey);
+    for (;;) {
+      const [channelRaw, operationRaw] = await Promise.all([
+        this.client.get(channelKey),
+        this.client.get(operationKey),
+      ]);
+      if (operationRaw === null) throw new Error("batch operation reservation changed");
+      const reservation = deserialize<BatchOperation>(operationRaw);
+      if (
+        reservation.status !== "reserved" ||
+        reservation.channelId !== channelId ||
+        reservation.idempotencyKey !== idempotencyKey
+      ) {
+        throw new Error("batch operation reservation changed");
+      }
+      const result = await updater(
+        channelRaw === null ? undefined : deserialize<ChannelState>(channelRaw),
+        reservation,
+      );
+      if (
+        result.channel.channelId !== channelId ||
+        result.operation.channelId !== channelId ||
+        result.operation.idempotencyKey !== idempotencyKey ||
+        result.operation.ceiling !== reservation.ceiling
+      ) {
+        throw new Error("atomic batch operation changed its binding");
+      }
+      const applied = await this.client.eval(COMMIT_CHANNEL_OPERATION, {
+        keys: [channelKey, operationKey],
+        arguments: [
+          channelRaw === null ? "0" : "1",
+          channelRaw ?? "",
+          operationRaw,
+          serialize(result.channel),
+          serialize(result.operation),
+        ],
+      });
+      if (Number(applied) === 1) return result;
       await sleep(this.retryIntervalMs);
     }
   }
@@ -148,15 +311,19 @@ export class RedisChannelStore implements ChannelStore {
   private channelKey(channelId: string): string {
     return `${this.channelPrefix}:${encodeURIComponent(channelId)}`;
   }
+
+  private operationKey(channelId: string, idempotencyKey: string): string {
+    return `${this.operationPrefix}:${encodeURIComponent(channelId)}:${encodeURIComponent(idempotencyKey)}`;
+  }
 }
 
-function serialize(state: ChannelState): string {
-  return JSON.stringify(state, (_key, value: unknown) =>
-    typeof value === "bigint" ? { $bigint: value.toString() } : value,
+function serialize(value: ChannelState | BatchOperation): string {
+  return JSON.stringify(value, (_key, entry: unknown) =>
+    typeof entry === "bigint" ? { $bigint: entry.toString() } : entry,
   );
 }
 
-function deserialize(value: string): ChannelState {
+function deserialize<T extends ChannelState | BatchOperation>(value: string): T {
   return JSON.parse(value, (_key, entry: unknown) => {
     if (
       entry !== null &&
@@ -168,7 +335,7 @@ function deserialize(value: string): ChannelState {
       return BigInt(entry.$bigint);
     }
     return entry;
-  }) as ChannelState;
+  }) as T;
 }
 
 function createLeaseToken(): string {
