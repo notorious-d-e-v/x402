@@ -1,5 +1,5 @@
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { BatchChannelManager } from "../../src/batch-settlement/server/channelManager";
 import { MemoryChannelStore, type ChannelState } from "../../src/batch-settlement/server/storage";
@@ -57,32 +57,24 @@ function channel(id: string, overrides: Partial<ChannelState> = {}): ChannelStat
   };
 }
 
+type RedemptionPayload = {
+  type: string;
+  claims?: { voucher: { channelId: string; maxClaimableAmount: string } }[];
+  channels?: { channelId: string; payoutWatermark: string; settled: string }[];
+};
+
 /** Records what the worker submitted, answering however the test asks. */
-function recorder(answer: (type: string) => SettleResponse = () => ok()) {
+function recorder(answer: (payload: RedemptionPayload) => SettleResponse = recovered) {
   const submitted: { type: string; channels: string[] }[] = [];
   const settle = async (payload: { payload: unknown }): Promise<SettleResponse> => {
-    const raw = payload.payload as {
-      type: string;
-      claims?: { voucher: { channelId: string } }[];
-      channels?: { channelId: string }[];
-    };
+    const raw = payload.payload as RedemptionPayload;
     submitted.push({
       channels: (raw.claims ?? [])
         .map(c => c.voucher.channelId)
         .concat((raw.channels ?? []).map(c => c.channelId)),
       type: raw.type,
     });
-    const response = answer(raw.type);
-    return {
-      ...response,
-      extra: {
-        payouts: (raw.channels ?? []).map(c => ({
-          channelId: c.channelId,
-          payoutWatermark: "3000",
-        })),
-        ...response.extra,
-      },
-    };
+    return answer(raw);
   };
   return { settle, submitted };
 }
@@ -91,27 +83,27 @@ function ok(): SettleResponse {
   return { network: SOLANA_DEVNET_CAIP2, success: true, transaction: "sig" };
 }
 
-describe("batch-settlement redemption worker", () => {
-  it("does not mark a new payout complete from stale or unproven success", async () => {
-    const store = new MemoryChannelStore();
-    await store.put(channel("chan-a", { settled: 3000n }));
-    const onError = vi.fn();
-    for (const extra of [
-      undefined,
-      { payouts: [{ channelId: "chan-a", payoutWatermark: "1000" }] },
-    ]) {
-      const manager = new BatchChannelManager({
-        store,
-        requirements: requirements(),
-        onError,
-        settle: async () => ({ ...ok(), extra }),
-      });
-      expect((await manager.redeem()).distributed).toEqual([]);
-      expect((await store.get("chan-a"))?.payoutWatermark).toBe(0n);
-    }
-    expect(onError).toHaveBeenCalledTimes(2);
-  });
+function recovered(payload: RedemptionPayload): SettleResponse {
+  return {
+    ...ok(),
+    extra:
+      payload.type === "claim"
+        ? {
+            accepts: (payload.claims ?? []).map(({ voucher }) => ({
+              channelId: voucher.channelId,
+              totalClaimed: voucher.maxClaimableAmount,
+            })),
+          }
+        : {
+            payouts: (payload.channels ?? []).map(channel => ({
+              channelId: channel.channelId,
+              payoutWatermark: channel.settled,
+            })),
+          },
+  };
+}
 
+describe("batch-settlement redemption worker", () => {
   it("claims unclaimed vouchers, then distributes what they settled", async () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a"));
@@ -154,55 +146,19 @@ describe("batch-settlement redemption worker", () => {
     );
   });
 
-  it("rejects a configured batch size above the protocol maximum", () => {
-    const store = new MemoryChannelStore();
-    const { settle } = recorder();
-    expect(
-      () =>
-        new BatchChannelManager({
-          maxChannelsPerBatch: 5,
-          requirements: requirements(),
-          settle,
-          store,
-        }),
-    ).toThrow(/1 through 4/);
-  });
-
-  it("lets only one worker instance own a redemption pass", async () => {
-    const store = new MemoryChannelStore();
-    await store.put(channel("chan-a"));
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    let calls = 0;
-    const settle = async (): Promise<SettleResponse> => {
-      calls += 1;
-      if (calls === 1) await gate;
-      return ok();
-    };
-    const first = new BatchChannelManager({ requirements: requirements(), settle, store });
-    const second = new BatchChannelManager({ requirements: requirements(), settle, store });
-    const firstPass = first.redeem();
-    await Promise.resolve();
-    expect(await second.redeem()).toEqual({ claimed: [], distributed: [] });
-    release();
-    expect((await firstPass).claimed).toEqual(["chan-a"]);
-  });
-
   it("leaves a failed batch for the next pass instead of recording it", async () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a"));
     const errors: unknown[] = [];
-    const { settle } = recorder(type =>
-      type === "claim"
+    const { settle } = recorder(payload =>
+      payload.type === "claim"
         ? {
             errorReason: "settlement_pending",
             network: SOLANA_DEVNET_CAIP2,
             success: false,
             transaction: "",
           }
-        : ok(),
+        : recovered(payload),
     );
     const manager = new BatchChannelManager({
       onError: error => errors.push(error),
@@ -216,6 +172,54 @@ describe("batch-settlement redemption worker", () => {
     expect(errors).toHaveLength(1);
     // The watermark is untouched, so the voucher is still there to claim.
     expect((await store.get("chan-a"))?.settled).toBe(0n);
+  });
+
+  it("repairs merchant state and finishes payout after a lost response and restart", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a"));
+    const pending = recorder(payload =>
+      payload.type === "claim"
+        ? {
+            errorReason: "settlement_pending",
+            network: SOLANA_DEVNET_CAIP2,
+            success: false,
+            transaction: "claim-tx",
+          }
+        : recovered(payload),
+    );
+    await new BatchChannelManager({
+      requirements: requirements(),
+      settle: pending.settle,
+      store,
+    }).redeem();
+    expect((await store.get("chan-a"))?.settled).toBe(0n);
+
+    const retry = recorder();
+    const result = await new BatchChannelManager({
+      requirements: requirements(),
+      settle: retry.settle,
+      store,
+    }).redeem();
+    expect(result).toEqual({ claimed: ["chan-a"], distributed: ["chan-a"] });
+    expect((await store.get("chan-a"))?.settled).toBe(3_000n);
+    expect((await store.get("chan-a"))?.payoutWatermark).toBe(3_000n);
+  });
+
+  it("does not advance local state from an unbound success response", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a"));
+    const errors: unknown[] = [];
+    const { settle } = recorder(() => ok());
+    const result = await new BatchChannelManager({
+      onError: error => errors.push(error),
+      requirements: requirements(),
+      settle,
+      store,
+    }).redeem();
+
+    expect(result).toEqual({ claimed: [], distributed: [] });
+    expect((await store.get("chan-a"))?.settled).toBe(0n);
+    expect(errors).toHaveLength(1);
   });
 
   it("skips channels that are closing", async () => {

@@ -148,9 +148,6 @@ export class BatchChannelManager {
     try {
       const list = this.config.store.list.bind(this.config.store);
       const claimed = await this.claim(await list());
-      // Re-read before paying out: a claim in this same pass just advanced the
-      // watermarks that decide what there is to distribute, so the snapshot the
-      // pass opened with is already stale.
       const distributed = await this.distribute(await list());
       return { claimed, distributed };
     } finally {
@@ -202,10 +199,37 @@ export class BatchChannelManager {
         );
         continue;
       }
+      const accepts = response.extra?.accepts;
+      if (
+        response.network !== this.config.requirements.network ||
+        !Array.isArray(accepts) ||
+        accepts.length !== batch.length ||
+        batch.some(channel => {
+          const matches = accepts.filter(
+            item =>
+              typeof item === "object" &&
+              item !== null &&
+              "channelId" in item &&
+              item.channelId === channel.channelId,
+          );
+          return (
+            matches.length !== 1 ||
+            !("totalClaimed" in matches[0]!) ||
+            matches[0]!.totalClaimed !== channel.signedMaxClaimable.toString()
+          );
+        })
+      ) {
+        this.config.onError?.(
+          new Error(`${BATCH_SETTLEMENT_SCHEME} claim missing confirmed settled watermark`),
+        );
+        continue;
+      }
       for (const channel of batch) {
         await this.record(channel.channelId, state => ({
           ...state,
-          settled: channel.signedMaxClaimable,
+          onchainSyncedAt: Date.now(),
+          settled:
+            state.settled > channel.signedMaxClaimable ? state.settled : channel.signedMaxClaimable,
         }));
         claimed.push(channel.channelId);
       }
@@ -232,6 +256,8 @@ export class BatchChannelManager {
             channels: batch.map(channel => ({
               channelConfig: channel.channelConfig,
               channelId: channel.channelId,
+              payoutWatermark: channel.payoutWatermark.toString(),
+              settled: channel.settled.toString(),
             })),
             type: "settle",
           },
@@ -253,8 +279,18 @@ export class BatchChannelManager {
         !Array.isArray(payouts) ||
         payouts.length !== batch.length ||
         batch.some(channel => {
-          const matches = payouts.filter(item => item?.channelId === channel.channelId);
-          return matches.length !== 1 || matches[0]?.payoutWatermark !== channel.settled.toString();
+          const matches = payouts.filter(
+            item =>
+              typeof item === "object" &&
+              item !== null &&
+              "channelId" in item &&
+              item.channelId === channel.channelId,
+          );
+          return (
+            matches.length !== 1 ||
+            !("payoutWatermark" in matches[0]!) ||
+            matches[0]!.payoutWatermark !== channel.settled.toString()
+          );
         })
       ) {
         this.config.onError?.(
@@ -265,6 +301,7 @@ export class BatchChannelManager {
       for (const channel of batch) {
         await this.record(channel.channelId, state => ({
           ...state,
+          onchainSyncedAt: Date.now(),
           payoutWatermark:
             state.payoutWatermark > channel.settled ? state.payoutWatermark : channel.settled,
         }));

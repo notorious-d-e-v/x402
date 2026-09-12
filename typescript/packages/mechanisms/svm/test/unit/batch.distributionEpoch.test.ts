@@ -119,10 +119,18 @@ async function ledger() {
   const restart = () => new BatchSvmScheme(signer, { pendingSettlementStore: pending });
   const payment = (payload: unknown) =>
     ({ x402Version: 2, accepted: requirements, payload }) as any;
-  const distribution = payment({
-    type: "settle",
-    channels: [{ channelId: built.channelId, channelConfig: built.payload.channelConfig }],
-  });
+  const distribution = (payoutWatermark: bigint, settled: bigint) =>
+    payment({
+      type: "settle",
+      channels: [
+        {
+          channelId: built.channelId,
+          channelConfig: built.payload.channelConfig,
+          payoutWatermark: payoutWatermark.toString(),
+          settled: settled.toString(),
+        },
+      ],
+    });
   const claim = async (scheme: BatchSvmScheme, cumulative: bigint) => {
     const voucher = await signBatchVoucher(payer, {
       channelId: built.channelId,
@@ -167,18 +175,20 @@ async function ledger() {
 }
 
 describe("confirmed distribution epochs", () => {
-  it("pays identical bodies across two epochs; same-epoch retries and restart do not pay twice", async () => {
+  it("pays request-bound epochs; retries and restart do not pay twice", async () => {
     const f = await ledger();
     let scheme = f.restart();
     for (const cumulative of [1000n, 3000n]) {
+      const payoutBefore = f.channel.settlement.payoutWatermark;
       expect((await f.claim(scheme, cumulative)).success).toBe(true);
-      expect(await scheme.verify(f.distribution, f.requirements)).toMatchObject({
+      const distribution = f.distribution(payoutBefore, cumulative);
+      expect(await scheme.verify(distribution, f.requirements)).toMatchObject({
         isValid: true,
         extra: {
           distributionEpoch: [{ channelId: f.built.channelId, settled: cumulative.toString() }],
         },
       });
-      expect(await scheme.settle(f.distribution, f.requirements)).toMatchObject({
+      expect(await scheme.settle(distribution, f.requirements)).toMatchObject({
         success: true,
         extra: {
           payouts: [{ channelId: f.built.channelId, payoutWatermark: cumulative.toString() }],
@@ -186,7 +196,7 @@ describe("confirmed distribution epochs", () => {
       });
       scheme = f.restart();
       const count = f.send.mock.calls.length;
-      expect((await scheme.settle(f.distribution, f.requirements)).success).toBe(true);
+      expect((await scheme.settle(distribution, f.requirements)).success).toBe(true);
       expect(f.send.mock.calls.length).toBe(count);
       expect(f.balance.receiver).toBe(cumulative);
       expect(f.channel.settlement).toEqual({ settled: cumulative, payoutWatermark: cumulative });
@@ -196,10 +206,11 @@ describe("confirmed distribution epochs", () => {
   it("preserves the reconciled signature on an already landed payout", async () => {
     const f = await ledger();
     await f.claim(f.restart(), 1000n);
+    const distribution = f.distribution(0n, 1000n);
     f.setTimeout(true);
-    const pending = await f.restart().settle(f.distribution, f.requirements);
+    const pending = await f.restart().settle(distribution, f.requirements);
     f.setTimeout(false);
-    expect(await f.restart().settle(f.distribution, f.requirements)).toMatchObject({
+    expect(await f.restart().settle(distribution, f.requirements)).toMatchObject({
       success: true,
       transaction: pending.transaction,
     });
@@ -213,21 +224,24 @@ describe("confirmed distribution epochs", () => {
       const f = await ledger();
       const scheme = f.restart();
       expect((await f.claim(scheme, 1000n)).success).toBe(true);
+      const firstDistribution = f.distribution(0n, 1000n);
       f.setTimeout(true);
       f.setLandOnSend(landed);
-      expect(await scheme.settle(f.distribution, f.requirements)).toMatchObject({
+      expect(await scheme.settle(firstDistribution, f.requirements)).toMatchObject({
         success: false,
         errorReason: "settlement_pending",
       });
       const count = f.send.mock.calls.length;
-      expect((await f.restart().settle(f.distribution, f.requirements)).success).toBe(false);
+      expect((await f.restart().settle(firstDistribution, f.requirements)).success).toBe(false);
       expect(f.send.mock.calls.length).toBe(count);
       f.landPending();
       f.setTimeout(false);
       f.setLandOnSend(true);
-      // A new claim can land while the older payout's confirmation is ambiguous.
+      expect((await f.restart().settle(firstDistribution, f.requirements)).success).toBe(true);
       expect((await f.claim(f.restart(), 3000n)).success).toBe(true);
-      expect((await f.restart().settle(f.distribution, f.requirements)).success).toBe(true);
+      expect((await f.restart().settle(f.distribution(1000n, 3000n), f.requirements)).success).toBe(
+        true,
+      );
       expect(f.balance.receiver).toBe(3000n);
       expect(f.channel.settlement.payoutWatermark).toBe(3000n);
       expect(f.balance.escrow).toBe(7000n);
