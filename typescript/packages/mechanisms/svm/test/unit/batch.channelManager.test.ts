@@ -95,15 +95,50 @@ function recovered(payload: RedemptionPayload): SettleResponse {
             })),
           }
         : {
-            payouts: (payload.channels ?? []).map(channel => ({
-              channelId: channel.channelId,
-              payoutWatermark: channel.settled,
-            })),
+            channels: (payload.channels ?? []).map(channel => channel.channelId),
           },
   };
 }
 
 describe("batch-settlement redemption worker", () => {
+  it("does not mark a newer claim paid when a retry recovers an older sweep", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a", { settled: 3000n, payoutWatermark: 1000n }));
+    const { settle } = recorder();
+    const options = { requirements: requirements(), settle, store };
+    const result = await new BatchChannelManager({
+      ...options,
+      readPayoutWatermark: async () => 1000n,
+    }).redeem();
+    expect(result.distributed).toEqual([]);
+    expect((await store.get("chan-a"))?.payoutWatermark).toBe(1000n);
+    // A recreated manager retries the unpaid balance and observes the real advance.
+    const recovered = await new BatchChannelManager({
+      ...options,
+      readPayoutWatermark: async () => 3000n,
+    }).redeem();
+    expect(recovered.distributed).toEqual(["chan-a"]);
+  });
+
+  it("keeps payout work after an unavailable or missing account read", async () => {
+    const store = new MemoryChannelStore();
+    await store.put(channel("chan-a", { settled: 3000n }));
+    const { settle } = recorder();
+    for (const reader of [
+      async () => undefined,
+      async () => {
+        throw new Error("RPC unavailable");
+      },
+    ]) {
+      await new BatchChannelManager({
+        requirements: requirements(),
+        settle,
+        store,
+        readPayoutWatermark: reader,
+      }).redeem();
+      expect((await store.get("chan-a"))?.payoutWatermark).toBe(0n);
+    }
+  });
   it("claims unclaimed vouchers, then distributes what they settled", async () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a"));
@@ -113,7 +148,12 @@ describe("batch-settlement redemption worker", () => {
     await store.put(channel("chan-c", { payoutWatermark: 3_000n, settled: 3_000n }));
     const { settle, submitted } = recorder();
 
-    const manager = new BatchChannelManager({ requirements: requirements(), settle, store });
+    const manager = new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
+      requirements: requirements(),
+      settle,
+      store,
+    });
     const result = await manager.redeem();
 
     // chan-a has a voucher above its watermark; the others do not.
@@ -134,7 +174,12 @@ describe("batch-settlement redemption worker", () => {
       await store.put(channel(`chan-${index}`));
     }
     const { settle, submitted } = recorder();
-    const manager = new BatchChannelManager({ requirements: requirements(), settle, store });
+    const manager = new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
+      requirements: requirements(),
+      settle,
+      store,
+    });
 
     const result = await manager.redeem();
     expect(result.claimed).toHaveLength(9);
@@ -161,6 +206,7 @@ describe("batch-settlement redemption worker", () => {
         : recovered(payload),
     );
     const manager = new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
       onError: error => errors.push(error),
       requirements: requirements(),
       settle,
@@ -188,6 +234,7 @@ describe("batch-settlement redemption worker", () => {
         : recovered(payload),
     );
     await new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
       requirements: requirements(),
       settle: pending.settle,
       store,
@@ -196,6 +243,7 @@ describe("batch-settlement redemption worker", () => {
 
     const retry = recorder();
     const result = await new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
       requirements: requirements(),
       settle: retry.settle,
       store,
@@ -211,6 +259,7 @@ describe("batch-settlement redemption worker", () => {
     const errors: unknown[] = [];
     const { settle } = recorder(() => ok());
     const result = await new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
       onError: error => errors.push(error),
       requirements: requirements(),
       settle,
@@ -226,7 +275,12 @@ describe("batch-settlement redemption worker", () => {
     const store = new MemoryChannelStore();
     await store.put(channel("chan-a", { status: "closing" }));
     const { settle, submitted } = recorder();
-    const manager = new BatchChannelManager({ requirements: requirements(), settle, store });
+    const manager = new BatchChannelManager({
+      readPayoutWatermark: async () => 3000n,
+      requirements: requirements(),
+      settle,
+      store,
+    });
     expect(await manager.redeem()).toEqual({ claimed: [], distributed: [] });
     expect(submitted).toEqual([]);
   });

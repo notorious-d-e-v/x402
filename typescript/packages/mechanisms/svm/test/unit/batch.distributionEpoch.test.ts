@@ -1,5 +1,8 @@
+import { findAssociatedTokenPda } from "@solana-program/token-2022";
 import {
   generateKeyPairSigner,
+  getSignatureFromTransaction,
+  address,
   getBase64Codec,
   getTransactionDecoder,
   getCompiledTransactionMessageDecoder,
@@ -67,6 +70,18 @@ async function ledger() {
     extra: { feePayer: fee.address, tokenProgram: TOKEN_PROGRAM_ADDRESS, withdrawDelay: 900 },
   } as const;
   const balance = { receiver: 0n, escrow: 10000n };
+  const [recipientAta] = await findAssociatedTokenPda({
+    mint: address(mint),
+    owner: address(receiver),
+    tokenProgram: TOKEN_PROGRAM_ADDRESS,
+  });
+  const [escrowAta] = await findAssociatedTokenPda({
+    mint: address(mint),
+    owner: address(built.channelId),
+    tokenProgram: TOKEN_PROGRAM_ADDRESS,
+  });
+  const evidence = new Map<string, any>();
+  const uniqueSends = new Set<string>();
   let timeout = false,
     landOnSend = true;
   const pendingWires = new Map<string, string>();
@@ -82,6 +97,9 @@ async function ledger() {
         : null;
   const land = (wire: string) => {
     const tx = getTransactionDecoder().decode(getBase64Codec().encode(wire));
+    const signature = getSignatureFromTransaction(tx);
+    if (evidence.has(signature)) return;
+    const before = { ...balance };
     const message = getCompiledTransactionMessageDecoder().decode(tx.messageBytes);
     for (let i = 0; i < message.instructions.length; i++) {
       const ix = message.instructions[i]!;
@@ -97,9 +115,33 @@ async function ledger() {
         channel.settlement.payoutWatermark = channel.settlement.settled;
       } else throw new Error(`unexpected ledger instruction ${ix.data![0]}`);
     }
+    const token = (accountIndex: number, owner: string, amount: bigint) => ({
+      accountIndex,
+      mint,
+      owner,
+      uiTokenAmount: { amount: amount.toString() },
+    });
+    evidence.set(signature, {
+      slot: 123n,
+      transaction: { message: { accountKeys: [recipientAta, escrowAta] } },
+      meta: {
+        err: null,
+        preTokenBalances: [
+          token(0, receiver, before.receiver),
+          token(1, built.channelId, before.escrow),
+        ],
+        postTokenBalances: [
+          token(0, receiver, balance.receiver),
+          token(1, built.channelId, balance.escrow),
+        ],
+      },
+    });
   };
   const send = vi.fn(async (wire: string) => {
-    const sig = `local-signature-${send.mock.calls.length}`;
+    const sig = getSignatureFromTransaction(
+      getTransactionDecoder().decode(getBase64Codec().encode(wire)),
+    );
+    uniqueSends.add(sig);
     if (landOnSend) land(wire);
     else pendingWires.set(sig, wire);
     return sig;
@@ -114,7 +156,9 @@ async function ledger() {
     sendTransaction: send,
     confirmTransaction: async () => {
       if (timeout) throw new Error("injected confirmation timeout");
+      return { slot: 123n };
     },
+    getConfirmedTransaction: async (signature: string) => evidence.get(signature) ?? null,
   };
   const restart = () => new BatchSvmScheme(signer, { pendingSettlementStore: pending });
   const payment = (payload: unknown) =>
@@ -126,8 +170,6 @@ async function ledger() {
         {
           channelId: built.channelId,
           channelConfig: built.payload.channelConfig,
-          payoutWatermark: payoutWatermark.toString(),
-          settled: settled.toString(),
         },
       ],
     });
@@ -157,6 +199,7 @@ async function ledger() {
     requirements,
     signer,
     send,
+    uniqueSends,
     pending,
     restart,
     distribution,
@@ -174,8 +217,8 @@ async function ledger() {
   };
 }
 
-describe("confirmed distribution epochs", () => {
-  it("pays request-bound epochs; retries and restart do not pay twice", async () => {
+describe("distribution sweeps", () => {
+  it("uses an unchanged request for new sweeps and recovers previous transactions", async () => {
     const f = await ledger();
     let scheme = f.restart();
     for (const cumulative of [1000n, 3000n]) {
@@ -191,13 +234,13 @@ describe("confirmed distribution epochs", () => {
       expect(await scheme.settle(distribution, f.requirements)).toMatchObject({
         success: true,
         extra: {
-          payouts: [{ channelId: f.built.channelId, payoutWatermark: cumulative.toString() }],
+          channels: [f.built.channelId],
         },
       });
       scheme = f.restart();
-      const count = f.send.mock.calls.length;
+      const count = f.uniqueSends.size;
       expect((await scheme.settle(distribution, f.requirements)).success).toBe(true);
-      expect(f.send.mock.calls.length).toBe(count);
+      expect(f.uniqueSends.size).toBe(count);
       expect(f.balance.receiver).toBe(cumulative);
       expect(f.channel.settlement).toEqual({ settled: cumulative, payoutWatermark: cumulative });
       expect(f.balance.escrow + f.balance.receiver).toBe(f.channel.deposit);
@@ -214,7 +257,7 @@ describe("confirmed distribution epochs", () => {
       success: true,
       transaction: pending.transaction,
     });
-    expect(f.send).toHaveBeenCalledTimes(2);
+    expect(f.uniqueSends.size).toBe(2);
     expect(f.balance.receiver).toBe(1000n);
   });
 
@@ -231,9 +274,9 @@ describe("confirmed distribution epochs", () => {
         success: false,
         errorReason: "settlement_pending",
       });
-      const count = f.send.mock.calls.length;
+      const count = f.uniqueSends.size;
       expect((await f.restart().settle(firstDistribution, f.requirements)).success).toBe(false);
-      expect(f.send.mock.calls.length).toBe(count);
+      expect(f.uniqueSends.size).toBe(count);
       f.landPending();
       f.setTimeout(false);
       f.setLandOnSend(true);
@@ -245,7 +288,7 @@ describe("confirmed distribution epochs", () => {
       expect(f.balance.receiver).toBe(3000n);
       expect(f.channel.settlement.payoutWatermark).toBe(3000n);
       expect(f.balance.escrow).toBe(7000n);
-      expect(f.send.mock.calls.length).toBe(count + 2); // one new claim + only its remaining payout
+      expect(f.uniqueSends.size).toBe(count + 2); // one new claim + only its remaining payout
     },
   );
   it("worker accounts charged, settled, payout and escrow across epochs", async () => {
@@ -279,6 +322,7 @@ describe("confirmed distribution epochs", () => {
         status: "open",
       });
       const manager = new BatchChannelManager({
+        readPayoutWatermark: async () => f.channel.settlement.payoutWatermark,
         store,
         requirements: f.requirements,
         onError,

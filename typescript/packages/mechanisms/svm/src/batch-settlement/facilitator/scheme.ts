@@ -1,3 +1,4 @@
+import { findAssociatedTokenPda } from "@solana-program/token-2022";
 import { settlementPath, verifySettlementPath } from "./settlementPath";
 /* eslint-disable jsdoc/require-jsdoc */
 import { address, type Signature } from "@solana/kit";
@@ -10,7 +11,11 @@ import type {
   VerifyResponse,
 } from "@x402/core/types";
 
-import { TOKEN_2022_PROGRAM_ADDRESS, TOKEN_PROGRAM_ADDRESS } from "../../constants";
+import {
+  MEMO_PROGRAM_ADDRESS,
+  TOKEN_2022_PROGRAM_ADDRESS,
+  TOKEN_PROGRAM_ADDRESS,
+} from "../../constants";
 import { verifyRequestCloseTransaction } from "../../payment-channels/close";
 import {
   discoverChannelsByRentPayer,
@@ -19,6 +24,7 @@ import {
 import { getChannelDecoder, type Channel } from "../../payment-channels/generated/accounts/channel";
 import {
   buildDistributeInstruction,
+  getPaymentChannelsTreasuryOwner,
   buildSettleInstructions,
   ChannelStatus,
   PAYMENT_CHANNELS_PROGRAM_ID,
@@ -33,6 +39,7 @@ import {
 import { encodeVoucherMessageBytes, verifyVoucherSignature } from "../../payment-channels/voucher";
 import { SettlementCache } from "../../settlement-cache";
 import type {
+  FacilitatorConfirmedTransaction,
   FacilitatorRpcClient,
   FacilitatorSigningCapabilities,
   FacilitatorSvmSigner,
@@ -53,9 +60,11 @@ import {
 } from "../../payment-channels/storage";
 import { createRpcClient } from "../../utils";
 import {
-  InMemoryPendingSettlementStore,
-  type PendingSettlementStore,
-} from "@x402/core/facilitator";
+  InMemoryBatchPendingSettlementStore,
+  reserveBroadcast,
+  distributionsForStore,
+  type BatchPendingSettlementStore,
+} from "./recovery";
 
 import { recordPendingOrTerminal, TransactionOnchainFailureError } from "../../utils";
 import { ErrSettlementPending } from "../../exact/facilitator/errors";
@@ -105,7 +114,12 @@ export interface BatchSvmFacilitatorConfig {
    * Defaults to an in-memory store. Production deployments should supply a
    * shared durable store whose TTL covers their client retry window.
    */
-  pendingSettlementStore?: PendingSettlementStore | undefined;
+  pendingSettlementStore?: BatchPendingSettlementStore | undefined;
+  /** Called before completing a payout; implementations must deduplicate by transaction. */
+  onDistributionConfirmed?: (
+    response: SettleResponse,
+    requirements: PaymentRequirements,
+  ) => Promise<void>;
   /** Shared, facilitator-owned lifecycle index used for rent cleanup. */
   channelStorage?: PaymentChannelStorage | undefined;
   maxPriorityFeeMicroLamports?: number | undefined;
@@ -168,8 +182,10 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
   readonly caipFamily = "solana:*";
   private readonly channelStorage: PaymentChannelStorage;
   private readonly settlementCache = new SettlementCache();
-  private readonly pendingStore: PendingSettlementStore;
+  private readonly pendingStore: BatchPendingSettlementStore;
   private readonly mintOwnerCache = new Map<string, Promise<string>>();
+  private readonly confirmationSlots = new Map<string, bigint>();
+  private readonly distributionPasses: Map<string, Promise<SettleResponse>>;
 
   constructor(
     private readonly signer: FacilitatorSvmSigner,
@@ -182,7 +198,8 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       throw new Error("BatchSvmScheme requires at least one fee payer signer");
     }
     this.channelStorage = config.channelStorage ?? new InMemoryPaymentChannelStorage();
-    this.pendingStore = config.pendingSettlementStore ?? new InMemoryPendingSettlementStore();
+    this.pendingStore = config.pendingSettlementStore ?? new InMemoryBatchPendingSettlementStore();
+    this.distributionPasses = distributionsForStore(this.pendingStore);
   }
 
   getExtra(_: Network): Record<string, unknown> {
@@ -538,140 +555,224 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
   ): Promise<SettleResponse> {
     const lease = await this.config.acquireDistributionLease?.(
       requirements.network,
-      payload.channels.map(channel => channel.channelId),
+      payload.channels.map(item => item.channelId),
     );
-    if (this.config.acquireDistributionLease && !lease) {
+    if (this.config.acquireDistributionLease && !lease)
       return this.settleFailure(payment, ErrSettlementPending, "");
-    }
     try {
-      return await this.distributeOwned(payment, payload, requirements, lease);
+      return await this.settleDistributionLocked(payment, payload, requirements, lease);
     } finally {
       await lease?.release();
     }
   }
 
-  private async distributeOwned(
+  private async settleDistributionLocked(
     payment: PaymentPayload,
     payload: BatchSettlePayload,
     requirements: PaymentRequirements,
     lease?: { assertHeld(): Promise<void> },
   ): Promise<SettleResponse> {
-    const prepared = await this.prepareDistributions(payload, requirements);
-    const feePayer = prepared[0]!.feePayer;
-    const distributeKey = `batch:distribute:${requirements.network}:${prepared
-      .map(item => `${item.channelId}:${item.payoutBefore}:${item.settled}`)
+    if (
+      payload.channels.length === 0 ||
+      payload.channels.length > MAX_CHANNELS_PER_SETTLE_TX ||
+      new Set(payload.channels.map(item => item.channelId)).size !== payload.channels.length
+    ) {
+      throw new Error(`${BatchError.PAYLOAD_TYPE}: invalid channel batch`);
+    }
+    // This identifies a sweep queue, not an immutable merchant request. A later
+    // call may sweep new earnings after the preceding transaction is resolved.
+    const key = `batch:distribute:${requirements.network}:${requirements.asset}:${requirements.payTo}:${payload.channels
+      .map(item => item.channelId)
       .sort()
       .join(",")}`;
-    const completed = await this.pendingStore.get(this.completedBroadcastKey(distributeKey));
-    if (completed) {
-      return distributionResponse(prepared, requirements.network, completed, true);
+    const active = this.distributionPasses.get(key);
+    if (active) return active;
+    const pass = this.distributeCurrent(payment, payload, requirements, key, lease);
+    this.distributionPasses.set(key, pass);
+    try {
+      return await pass;
+    } finally {
+      if (this.distributionPasses.get(key) === pass) this.distributionPasses.delete(key);
     }
-    const pending = await this.pendingStore.get(distributeKey);
-    if (pending) {
-      const recovered = await this.reconcileBroadcast(
-        distributeKey,
-        pending,
-        requirements.network,
-        "",
-      );
-      if (!recovered.ok) return recovered.response;
-      const confirmed = await this.fetchChannelsUntil(
-        requirements.network,
-        prepared.map(item => item.channelId),
-        channels =>
-          channels.every(
-            (channel, index) =>
-              channel !== undefined &&
-              channel.settlement.payoutWatermark >= prepared[index]!.settled,
-          ),
-      );
-      if (!confirmed) {
-        return this.settlementPending(
-          requirements.network,
-          "",
-          recovered.signature,
-          "distribution confirmed but its payout watermark is not visible yet",
-        );
-      }
-      this.assertRecoveredDistributions(confirmed, prepared, requirements);
-      const incomplete = await this.completeOrPending(
-        distributeKey,
-        recovered.signature,
-        requirements.network,
-        "",
-      );
-      return (
-        incomplete ??
-        distributionResponse(prepared, requirements.network, recovered.signature, true)
-      );
-    }
+  }
 
-    const channels = await this.readChannels(
-      requirements.network,
-      prepared.map(item => item.channelId),
-    );
+  private async distributeCurrent(
+    payment: PaymentPayload,
+    payload: BatchSettlePayload,
+    requirements: PaymentRequirements,
+    key: string,
+    lease?: { assertHeld(): Promise<void> },
+  ): Promise<SettleResponse> {
+    const prepared: PreparedDistribution[] = [];
+    for (const entry of payload.channels) {
+      const terms = await this.resolveTerms(entry.channelConfig, requirements);
+      const channelId = await this.deriveChannelId(entry.channelConfig, terms.feePayer);
+      if (channelId !== entry.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
+      prepared.push({
+        channelConfig: entry.channelConfig,
+        channelId,
+        feePayer: terms.feePayer,
+        payoutBefore: 0n,
+        settled: 0n,
+        terms,
+      });
+    }
+    const feePayer = prepared[0]!.feePayer;
+    if (prepared.some(item => item.feePayer !== feePayer))
+      throw new Error(BatchError.FEE_PAYER_MISMATCH);
+    const pending = await this.pendingStore.get(key);
+    if (pending) {
+      const recovered = await this.reconcileBroadcast(key, pending, requirements.network, "");
+      if (!recovered.ok) return recovered.response;
+      return this.finishDistribution(key, recovered.signature, prepared, requirements);
+    }
+    const previous = await this.pendingStore.get(`${key}:result`);
+    const previousSlot = await this.pendingStore.get(`${key}:slot`);
+    if (previousSlot) this.rememberSlot(requirements.network, BigInt(previousSlot));
     const instructions: ServerInstruction[] = [];
-    for (let index = 0; index < prepared.length; index += 1) {
-      const item = prepared[index]!;
-      const channel = channels[index];
-      if (!channel) throw new Error(`${BatchError.CHANNEL_STATE}: channel not found`);
+    for (const item of prepared) {
+      const channel = previous
+        ? await this.readChannel(requirements.network, item.channelId)
+        : await this.fetchChannel(requirements.network, item.channelId);
+      if (!channel && previous) continue; // The preceding payout may have closed it.
+      if (!channel) throw new Error(BatchError.CHANNEL_STATE);
       this.assertClaimChannel(channel, item.channelConfig, item.terms, requirements, [
         ChannelStatus.Open,
         ChannelStatus.Sealed,
+        ChannelStatus.Distributed,
       ]);
       if (
-        channel.settlement.payoutWatermark !== item.payoutBefore ||
-        channel.settlement.settled !== item.settled
-      ) {
-        throw new Error(BatchError.CHANNEL_STATE);
-      }
+        channel.status === ChannelStatus.Distributed ||
+        (channel.status === ChannelStatus.Open &&
+          channel.settlement.payoutWatermark === channel.settlement.settled)
+      )
+        continue;
       instructions.push(
         await this.distributeInstruction(item.channelId, channel, item.terms, requirements),
       );
     }
-    if (this.settlementCache.isDuplicate(distributeKey)) {
-      return this.settleFailure(payment, CHANNEL_BUSY, "");
+    if (instructions.length === 0) {
+      if (previous) return JSON.parse(previous) as SettleResponse;
+      // State alone cannot identify a previous payment or its amount.
+      return this.settleFailure(payment, BatchError.CUMULATIVE_AMOUNT_MISMATCH, "");
     }
-    await lease?.assertHeld();
+    // Different sweeps can share a recent blockhash. Give each new signed
+    // transaction its own identity; recovery always reuses these exact bytes.
+    instructions.push({
+      programAddress: address(MEMO_PROGRAM_ADDRESS),
+      accounts: [],
+      data: new TextEncoder().encode(`x402:batch:${crypto.randomUUID()}`),
+    });
+    await this.pendingStore.delete(this.completedBroadcastKey(key));
     const submitted = await this.submitRedemption(
       feePayer,
       requirements.network,
       instructions,
-      distributeKey,
+      key,
       "",
       lease ? () => lease.assertHeld() : undefined,
     );
     if (!submitted.ok) return submitted.response;
-    if (submitted.replayed) {
-      return distributionResponse(prepared, requirements.network, submitted.signature, true);
-    }
-    const confirmed = await this.fetchChannelsUntil(
-      requirements.network,
-      prepared.map(item => item.channelId),
-      observed =>
-        observed.every(
-          (channel, index) =>
-            channel !== undefined && channel.settlement.payoutWatermark >= prepared[index]!.settled,
-        ),
-    );
-    if (!confirmed) {
-      return this.settlementPending(
-        requirements.network,
-        "",
-        submitted.signature,
-        "distribution confirmed but its payout watermark is not visible yet",
+    return this.finishDistribution(key, submitted.signature, prepared, requirements);
+  }
+
+  private async finishDistribution(
+    key: string,
+    signature: string,
+    prepared: PreparedDistribution[],
+    requirements: PaymentRequirements,
+  ): Promise<SettleResponse> {
+    try {
+      // A cached result contains the actual transfer, including on its first
+      // successful recovery. Replaying an HTTP response does not change it.
+      const cached = await this.pendingStore.get(
+        `batch:transaction:${requirements.network}:${signature}:result`,
       );
+      let response = cached ? (JSON.parse(cached) as SettleResponse) : undefined;
+      if (!response) {
+        if (!this.signer.getConfirmedTransaction)
+          throw new Error("getConfirmedTransaction is required for payout accounting");
+        let evidence: FacilitatorConfirmedTransaction | null | undefined;
+        for (let attempt = 0; attempt < CHANNEL_READ_ATTEMPTS; attempt += 1) {
+          try {
+            evidence = await this.signer.getConfirmedTransaction(signature, requirements.network);
+          } catch {
+            /* An unavailable history read is pending, never zero paid. */
+          }
+          if (evidence?.meta && evidence.meta.preTokenBalances && evidence.meta.postTokenBalances)
+            break;
+          if (attempt + 1 < CHANNEL_READ_ATTEMPTS) await this.waitForChannelRead(attempt);
+        }
+        if (!evidence?.meta?.preTokenBalances || !evidence.meta.postTokenBalances)
+          throw new Error("payout transaction metadata is not visible yet");
+        if (evidence.meta.err !== null)
+          throw new TransactionOnchainFailureError("distribution transaction failed onchain");
+        this.rememberSlot(requirements.network, BigInt(evidence.slot));
+        await this.pendingStore.set(`${key}:slot`, String(evidence.slot));
+        const keys = evidence.transaction.message.accountKeys.map(item =>
+          typeof item === "string" ? item : item.pubkey,
+        );
+        const [recipient] = await findAssociatedTokenPda({
+          mint: address(requirements.asset),
+          owner: address(requirements.payTo),
+          tokenProgram: address(prepared[0]!.terms.tokenProgram),
+        });
+        const recipientIndex = keys.indexOf(recipient);
+        if (recipientIndex < 0)
+          throw new Error("recipient is absent from distribution transaction");
+        // A sealed payout can also refund the payer or sweep treasury funds.
+        // Balance evidence cannot separate those legs when beneficiaries alias.
+        for (const item of prepared) {
+          const [escrow] = await findAssociatedTokenPda({
+            mint: address(requirements.asset),
+            owner: address(item.channelId),
+            tokenProgram: address(item.terms.tokenProgram),
+          });
+          const escrowIndex = keys.indexOf(escrow);
+          if (escrowIndex < 0) continue; // Already paid channel omitted from this sweep.
+          const closed = !evidence.meta.postTokenBalances.some(
+            balance => balance.accountIndex === escrowIndex,
+          );
+          if (
+            closed &&
+            (item.channelConfig.payer === requirements.payTo ||
+              getPaymentChannelsTreasuryOwner(requirements.network) === requirements.payTo)
+          ) {
+            throw new Error(
+              "closed-channel payout shares its recipient with refund or treasury; transfer attribution is ambiguous",
+            );
+          }
+        }
+        const balance = (balances: NonNullable<typeof evidence.meta.preTokenBalances>) => {
+          const entry = balances.find(item => item.accountIndex === recipientIndex);
+          if (!entry) return 0n;
+          if (entry.mint !== requirements.asset || entry.owner !== requirements.payTo)
+            throw new Error("payout recipient balance mismatch");
+          return parseU64(entry.uiTokenAmount.amount, "payout balance");
+        };
+        const amount =
+          balance(evidence.meta.postTokenBalances) - balance(evidence.meta.preTokenBalances);
+        if (amount < 0n) throw new Error("negative recipient payout");
+        response = {
+          success: true,
+          network: requirements.network,
+          payer: "",
+          transaction: signature,
+          amount: amount.toString(),
+          extra: { channels: prepared.map(item => item.channelId) },
+        };
+        await this.pendingStore.set(
+          `batch:transaction:${requirements.network}:${signature}:result`,
+          JSON.stringify(response),
+        );
+      }
+      await this.config.onDistributionConfirmed?.(response, requirements);
+      await this.pendingStore.set(`${key}:result`, JSON.stringify(response));
+      await this.completeBroadcast(key, signature, requirements.network);
+      return response;
+    } catch (error) {
+      return this.settlementPending(requirements.network, "", signature, String(error));
     }
-    this.assertRecoveredDistributions(confirmed, prepared, requirements);
-    const incomplete = await this.completeOrPending(
-      distributeKey,
-      submitted.signature,
-      requirements.network,
-      "",
-    );
-    return (
-      incomplete ?? distributionResponse(prepared, requirements.network, submitted.signature, false)
-    );
   }
 
   private async prepareDistributions(
@@ -689,9 +790,14 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       const terms = await this.resolveTerms(entry.channelConfig, requirements);
       const channelId = await this.deriveChannelId(entry.channelConfig, terms.feePayer);
       if (channelId !== entry.channelId) throw new Error(BatchError.CHANNEL_ID_MISMATCH);
-      const payoutBefore = parseU64(entry.payoutWatermark, "payoutWatermark");
-      const settled = parseU64(entry.settled, "settled");
-      if (payoutBefore >= settled) throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+      const channel = await this.fetchChannel(requirements.network, channelId);
+      this.assertClaimChannel(channel, entry.channelConfig, terms, requirements, [
+        ChannelStatus.Open,
+        ChannelStatus.Sealed,
+        ChannelStatus.Distributed,
+      ]);
+      const payoutBefore = channel.settlement.payoutWatermark;
+      const settled = channel.settlement.settled;
       prepared.push({
         channelConfig: entry.channelConfig,
         channelId,
@@ -932,6 +1038,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
             address(terms.feePayer),
             requirements.network,
             payload.deposit.transaction,
+            undefined,
             onBroadcast,
           );
         } catch (error) {
@@ -1151,6 +1258,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
             address(terms.feePayer),
             requirements.network,
             payload.transaction,
+            undefined,
             onBroadcast,
           );
         } catch (error) {
@@ -1310,7 +1418,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     key: string,
     network: Network,
     payer: string,
-    broadcast: (onBroadcast: (signature: string) => Promise<void>) => Promise<string>,
+    broadcast: (onPrepared: (signature: string, wire: string) => Promise<void>) => Promise<string>,
   ): Promise<DurableBroadcastResult> {
     const completed = await this.pendingStore.get(this.completedBroadcastKey(key));
     if (completed) return { ok: true, replayed: true, signature: completed };
@@ -1327,10 +1435,20 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     }
     let signature: string;
     try {
-      signature = await broadcast(async broadcastSignature => {
-        await this.pendingStore.set(key, broadcastSignature);
+      signature = await broadcast(async (broadcastSignature, wire) => {
+        await this.pendingStore.set(
+          `batch:transaction:${network}:${broadcastSignature}:wire`,
+          wire,
+        );
+        if (!(await reserveBroadcast(this.pendingStore, key, broadcastSignature))) {
+          const existing = await this.pendingStore.get(key);
+          if (existing) throw new SettlementConfirmationTimeoutError(existing as Signature);
+          throw new Error("concurrent broadcast reservation changed");
+        }
       });
     } catch (error) {
+      const recorded = await this.pendingStore.get(key);
+      if (recorded) return this.reconcileBroadcast(key, recorded, network, payer);
       const pending = pendingSignatureOf(error);
       if (pending === undefined) throw error;
       return {
@@ -1350,7 +1468,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     // Keep the signature until the caller observes the operation-specific
     // postcondition. Confirmation can precede a fresh account view when RPC
     // requests are load-balanced across nodes.
-    return { ok: true, replayed: false, signature };
+    return this.reconcileBroadcast(key, signature, network, payer, false);
   }
 
   /**
@@ -1360,6 +1478,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
    * @param signature - The recorded signature
    * @param network - Network the transaction was submitted to
    * @param payer - Payer reported on a pending or failed response
+   * @param resend - Resend previously recorded bytes when recovering a stopped attempt
    * @returns The confirmed signature, or the response to answer with
    */
   private async reconcileBroadcast(
@@ -1367,14 +1486,30 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     signature: string,
     network: Network,
     payer: string,
+    resend = true,
   ): Promise<DurableBroadcastResult> {
     try {
-      await this.signer.confirmTransaction(signature, network);
+      // The process may have stopped after recording but before sending.
+      // Re-send the same signed bytes; never construct a replacement on timeout.
+      const wire = await this.pendingStore.get(`batch:transaction:${network}:${signature}:wire`);
+      if (wire && resend) {
+        try {
+          await this.signer.sendTransaction(wire, network);
+        } catch {
+          /* confirm by identity */
+        }
+      }
+      const status = await this.signer.confirmTransaction(signature, network);
+      if (status && status.slot !== undefined) {
+        const slot = BigInt(status.slot);
+        if (slot > (this.confirmationSlots.get(network) ?? 0n))
+          this.confirmationSlots.set(network, slot);
+      }
     } catch (error) {
       if (error instanceof TransactionOnchainFailureError) {
         // A definite onchain rejection: nothing landed, so the record is
         // dropped and the caller reports a failure rather than a pending.
-        await this.forgetPending(key);
+        await this.forgetPending(key, signature);
         return {
           ok: false,
           response: {
@@ -1409,12 +1544,20 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
    *
    * @param key - Deterministic operation key
    * @param signature - Confirmed transaction signature
+   * @param network - Network containing the transaction
    */
-  private async completeBroadcast(key: string, signature: string): Promise<void> {
+  private async completeBroadcast(key: string, signature: string, network: string): Promise<void> {
     // Write completion first. A crash before the pending delete leaves both
     // records, and completed is deliberately checked first on recovery.
     await this.pendingStore.set(this.completedBroadcastKey(key), signature);
-    await this.forgetPending(key);
+    await this.forgetPending(key, signature);
+    // The completed identity/result now survives response loss; signed bytes
+    // are no longer needed for rebroadcast. Artifact cleanup is best effort.
+    try {
+      await this.pendingStore.delete(`batch:transaction:${network}:${signature}:wire`);
+    } catch {
+      /* keep confirmed result */
+    }
   }
 
   private async completeOrPending(
@@ -1424,7 +1567,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     payer: string,
   ): Promise<SettleResponse | undefined> {
     try {
-      await this.completeBroadcast(key, signature);
+      await this.completeBroadcast(key, signature, network);
       return undefined;
     } catch (error) {
       return this.settlementPending(
@@ -1460,10 +1603,15 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
    * Drop a pending record; a storage hiccup must not mask a confirmed result.
    *
    * @param key - The pending record to drop
+   * @param signature - The transaction being completed
    */
-  private async forgetPending(key: string): Promise<void> {
+  private async forgetPending(key: string, signature: string): Promise<void> {
     try {
-      await this.pendingStore.delete(key);
+      if (this.pendingStore.deleteIfEquals) {
+        await this.pendingStore.deleteIfEquals(key, signature);
+      } else if ((await this.pendingStore.get(key)) === signature) {
+        await this.pendingStore.delete(key);
+      }
     } catch {
       // Best effort: the work is confirmed either way.
     }
@@ -1504,7 +1652,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           this.signer,
           network,
           instructions,
-          { onBroadcast, beforeBroadcast },
+          { onPrepared: onBroadcast, beforeBroadcast },
         );
       } catch (error) {
         if (error instanceof ChannelSimulationError) {
@@ -1550,6 +1698,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     const account = await this.signer.getAccountInfo(channelId, network, {
       commitment: "confirmed",
       encoding: "base64",
+      minContextSlot: this.confirmationSlots.get(network),
     });
     if (!account) return undefined;
     if (account.owner !== PAYMENT_CHANNELS_PROGRAM_ID) throw new Error(BatchError.CHANNEL_STATE);
@@ -1567,6 +1716,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     const accounts = await this.signer.getMultipleAccounts(channelIds, network, {
       commitment: "confirmed",
       encoding: "base64",
+      minContextSlot: this.confirmationSlots.get(network),
     });
     if (accounts.length !== channelIds.length) {
       throw new Error(`${BatchError.CHANNEL_STATE}: incomplete batched account response`);
@@ -1631,8 +1781,12 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     predicate: (channel: Channel | undefined) => boolean,
   ): Promise<Channel | undefined | false> {
     for (let attempt = 0; attempt < CHANNEL_READ_ATTEMPTS; attempt += 1) {
-      const channel = await this.readChannel(network, channelId);
-      if (predicate(channel)) return channel;
+      try {
+        const channel = await this.readChannel(network, channelId);
+        if (predicate(channel)) return channel;
+      } catch {
+        /* A lagging backend may reject minContextSlot; retry. */
+      }
       if (attempt + 1 < CHANNEL_READ_ATTEMPTS) await this.waitForChannelRead(attempt);
     }
     return false;
@@ -1652,13 +1806,21 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     predicate: (channels: readonly (Channel | undefined)[]) => boolean,
   ): Promise<Channel[] | undefined> {
     for (let attempt = 0; attempt < CHANNEL_READ_ATTEMPTS; attempt += 1) {
-      const channels = await this.readChannels(network, channelIds);
-      if (predicate(channels) && channels.every((value): value is Channel => value !== undefined)) {
-        return channels;
+      try {
+        const channels = await Promise.all(channelIds.map(id => this.readChannel(network, id)));
+        if (predicate(channels) && channels.every((value): value is Channel => value !== undefined))
+          return channels;
+      } catch {
+        /* Keep transaction identity while the RPC catches up. */
       }
       if (attempt + 1 < CHANNEL_READ_ATTEMPTS) await this.waitForChannelRead(attempt);
     }
     return undefined;
+  }
+
+  private rememberSlot(network: string, slot: bigint): void {
+    if (slot > (this.confirmationSlots.get(network) ?? 0n))
+      this.confirmationSlots.set(network, slot);
   }
 
   private async waitForChannelRead(attempt: number): Promise<void> {
@@ -1686,22 +1848,6 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           ChannelStatus.Distributed,
         ],
       );
-    }
-  }
-
-  private assertRecoveredDistributions(
-    channels: readonly Channel[],
-    prepared: readonly PreparedDistribution[],
-    requirements: PaymentRequirements,
-  ): void {
-    for (let index = 0; index < prepared.length; index += 1) {
-      const item = prepared[index]!;
-      this.assertClaimChannel(channels[index]!, item.channelConfig, item.terms, requirements, [
-        ChannelStatus.Open,
-        ChannelStatus.Sealed,
-        ChannelStatus.Closing,
-        ChannelStatus.Distributed,
-      ]);
     }
   }
 
@@ -1865,7 +2011,7 @@ function claimResponse(
   claims: readonly PreparedClaim[],
   network: Network,
   transaction: string,
-  replayed: boolean,
+  _: boolean,
 ): SettleResponse {
   return {
     amount: "",
@@ -1874,40 +2020,6 @@ function claimResponse(
         channelId: item.channelId,
         totalClaimed: item.cumulative.toString(),
       })),
-      replayed,
-    },
-    network,
-    payer: "",
-    success: true,
-    transaction,
-  };
-}
-
-function distributionResponse(
-  channels: readonly PreparedDistribution[],
-  network: Network,
-  transaction: string,
-  replayed: boolean,
-): SettleResponse {
-  return {
-    // Any retry of an already-broadcast transaction reports zero new volume.
-    // Concurrent replicas can all reconcile the same signature without an
-    // atomic storage claim, while the watermark still repairs merchant state.
-    amount: replayed
-      ? "0"
-      : calculateDistributionAmount(
-          channels.map(item => ({
-            payoutWatermark: item.payoutBefore,
-            settled: item.settled,
-          })),
-        ).toString(),
-    extra: {
-      channels: channels.map(item => item.channelId),
-      payouts: channels.map(item => ({
-        channelId: item.channelId,
-        payoutWatermark: item.settled.toString(),
-      })),
-      replayed,
     },
     network,
     payer: "",
@@ -1921,14 +2033,14 @@ function refundResponse(
   channel: Channel,
   network: Network,
   transaction: string,
-  replayed: boolean,
+  _: boolean,
 ): SettleResponse {
   return {
     success: true,
     payer: channel.payer,
     transaction,
     network,
-    extra: { channelState: snapshotChannel(channelId, channel), replayed },
+    extra: { channelState: snapshotChannel(channelId, channel) },
   };
 }
 
@@ -1939,7 +2051,7 @@ function recoveredRefundResponse(
   transaction: string,
 ): SettleResponse {
   return {
-    extra: { channelId, replayed: true },
+    extra: { channelId },
     network,
     payer,
     success: true,
