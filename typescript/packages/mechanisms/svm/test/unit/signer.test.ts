@@ -1,9 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
-import { toClientSvmSigner, toFacilitatorSvmSigner } from "../../src/signer";
+import {
+  createRpcCapabilitiesFromRpc,
+  toClientSvmSigner,
+  toFacilitatorSvmSigner,
+} from "../../src/signer";
 import type { ClientSvmSigner } from "../../src/signer";
 import { SOLANA_DEVNET_CAIP2 } from "../../src/constants";
 
 describe("SVM Signer Converters", () => {
+  it("searches older history only when recovery requests it", async () => {
+    const getSignatureStatuses = vi.fn().mockReturnValue({
+      send: async () => ({ value: [{ slot: 55n, confirmationStatus: "confirmed", err: null }] }),
+    });
+    const caps = createRpcCapabilitiesFromRpc({ getSignatureStatuses } as never);
+    await caps.confirmTransaction("fresh");
+    expect(getSignatureStatuses).toHaveBeenLastCalledWith(["fresh"]);
+    await caps.confirmTransaction("recover", { searchTransactionHistory: true });
+    expect(getSignatureStatuses).toHaveBeenLastCalledWith(["recover"], {
+      searchTransactionHistory: true,
+    });
+    expect(getSignatureStatuses).toHaveBeenCalledTimes(2);
+  });
+
   describe("toClientSvmSigner", () => {
     it("should return the same signer (identity function)", () => {
       const mockSigner: ClientSvmSigner = {
@@ -269,7 +287,7 @@ describe("SVM Signer Converters", () => {
 
       await expect(
         facilitator.confirmTransaction("okSignature", SOLANA_DEVNET_CAIP2),
-      ).resolves.toMatchObject({err: null, confirmationStatus: "finalized"});
+      ).resolves.toMatchObject({ err: null, confirmationStatus: "finalized" });
     });
 
     it("should simulate with sigVerify disabled", async () => {
