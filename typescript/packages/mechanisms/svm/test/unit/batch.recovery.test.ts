@@ -175,6 +175,31 @@ function payment(payload: unknown): PaymentPayload {
 }
 
 describe("batch-settlement outcome recovery", () => {
+  it("recovers a completed claim after cleanup without recreating its lifecycle record", async () => {
+    const payload = await claimPayload();
+    const store = new InMemoryPendingSettlementStore();
+    await store.set(`batch:claim:${NETWORK}:${channelId}:1000:completed`, TX);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const transport = signer();
+      const restarted = new BatchSvmScheme(transport as never, { pendingSettlementStore: store });
+      const api = configure(restarted);
+      api.readChannel = vi.fn().mockResolvedValue(undefined);
+      api.submitRedemption = vi.fn();
+      expect(await restarted.settleClaims(payment(payload), payload, requirements())).toMatchObject(
+        {
+          success: true,
+          transaction: TX,
+        },
+      );
+      expect(api.trackChannel).not.toHaveBeenCalled();
+      expect(api.readChannel).not.toHaveBeenCalled();
+      expect(transport.getAccountInfo).not.toHaveBeenCalled();
+      expect(transport.confirmTransaction).not.toHaveBeenCalled();
+      expect(api.submitRedemption).not.toHaveBeenCalled();
+      expect(transport.sendTransaction).not.toHaveBeenCalled();
+    }
+  });
+
   it("recovers a restart between preparation and broadcast using identical bytes", async () => {
     const store = new InMemoryPendingSettlementStore();
     const key = `batch:claim:${NETWORK}:${channelId}:1000`;

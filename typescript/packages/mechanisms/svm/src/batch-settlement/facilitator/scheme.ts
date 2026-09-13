@@ -420,6 +420,16 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (!feePayer || prepared.some(item => item.feePayer !== feePayer)) {
       throw new Error(BatchError.FEE_PAYER_MISMATCH);
     }
+    // Keyed by exactly what this batch advances, so a retry of the same claim
+    // reconciles while a different one proceeds.
+    const claimKey = `batch:claim:${requirements.network}:${prepared
+      .map(item => `${item.channelId}:${item.cumulative}`)
+      .sort()
+      .join(",")}`;
+    const completed = await this.pendingStore.get(this.completedBroadcastKey(claimKey));
+    if (completed) return claimResponse(prepared, requirements.network, completed, true);
+
+    // A completed replay must not re-register a channel already reclaimed by cleanup.
     await Promise.all(
       prepared.map(item =>
         this.trackChannel({
@@ -431,14 +441,6 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         }),
       ),
     );
-    // Keyed by exactly what this batch advances, so a retry of the same claim
-    // reconciles while a different one proceeds.
-    const claimKey = `batch:claim:${requirements.network}:${prepared
-      .map(item => `${item.channelId}:${item.cumulative}`)
-      .sort()
-      .join(",")}`;
-    const completed = await this.pendingStore.get(this.completedBroadcastKey(claimKey));
-    if (completed) return claimResponse(prepared, requirements.network, completed, true);
 
     const pending = await this.pendingStore.get(claimKey);
     if (pending) {
