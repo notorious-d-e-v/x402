@@ -38,6 +38,7 @@ import {
 import { encodeVoucherMessageBytes, verifyVoucherSignature } from "../../payment-channels/voucher";
 import { SettlementCache } from "../../settlement-cache";
 import type {
+  FacilitatorAccountInfo,
   FacilitatorConfirmedTransaction,
   FacilitatorSigningCapabilities,
   FacilitatorSvmSigner,
@@ -1630,11 +1631,26 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           "Use toFacilitatorSvmSigner() which provides all required methods.",
       );
     }
-    const account = await this.signer.getAccountInfo(channelId, network, {
-      commitment: "confirmed",
-      encoding: "base64",
-      minContextSlot: this.confirmationSlots.get(network),
-    });
+    const minContextSlot = this.confirmationSlots.get(network);
+    let account: FacilitatorAccountInfo | null;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        account = await this.signer.getAccountInfo(channelId, network, {
+          commitment: "confirmed",
+          encoding: "base64",
+          minContextSlot,
+        });
+        break;
+      } catch (error) {
+        // A slot floor is only advisory for the read: a load-balanced RPC node
+        // that has not reached the remembered confirmation slot rejects it.
+        // Give the backend time to catch up instead of failing a deposit or
+        // claim that merely wanted the channel's current state. Reads without
+        // a floor have nothing to wait for and surface the error at once.
+        if (minContextSlot === undefined || attempt + 1 >= CHANNEL_READ_ATTEMPTS) throw error;
+        await this.waitForChannelRead(attempt);
+      }
+    }
     if (!account) return undefined;
     const encoded = Array.isArray(account.data) ? account.data[0] : account.data;
     return getChannelDecoder().decode(Buffer.from(encoded, "base64"));
