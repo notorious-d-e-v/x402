@@ -311,6 +311,14 @@ export type FacilitatorSvmSigner = {
   getSlot?(network: string, commitment?: string): Promise<bigint>;
 
   /**
+   * Whether a blockhash can still serve as a transaction lifetime. Optional —
+   * lets batch recovery classify a broadcast that was never confirmed as
+   * expired once its blockhash has left the validity window;
+   * {@link toFacilitatorSvmSigner} provides an implementation.
+   */
+  isBlockhashValid?(blockhash: string, network: string): Promise<boolean>;
+
+  /**
    * Scan program accounts. Optional — required only for `upto` rent-cleanup
    * discovery sweeps; {@link toFacilitatorSvmSigner} provides an implementation.
    */
@@ -441,10 +449,16 @@ export function createRpcCapabilitiesFromRpc(
       const fallbackDelayMs = 1_000;
       const maxWaitMs = 30_000;
       const startedAt = Date.now();
+      let lookups = 0;
 
       while (Date.now() - startedAt < maxWaitMs) {
+        // Only the first lookup needs the history index: a transaction that
+        // landed before this poll started is found there once, and anything
+        // landing while we wait is in the recent-status cache anyway.
+        const searchHistory = options?.searchTransactionHistory === true && lookups === 0;
+        lookups += 1;
         const status = await (
-          options?.searchTransactionHistory
+          searchHistory
             ? rpc.getSignatureStatuses([signature as never], { searchTransactionHistory: true })
             : rpc.getSignatureStatuses([signature as never])
         ).send();
@@ -807,6 +821,14 @@ export function toFacilitatorSvmSigner(
     getSlot: async (network: string, commitment = "finalized") => {
       const rpc = getRpcForNetwork(network);
       return await rpc.getSlot({ commitment: commitment as never }).send();
+    },
+
+    isBlockhashValid: async (blockhash: string, network: string) => {
+      const rpc = getRpcForNetwork(network);
+      const result = await rpc
+        .isBlockhashValid(blockhash as never, { commitment: "confirmed" })
+        .send();
+      return result.value;
     },
 
     getProgramAccounts: async (network, programId, config) => {

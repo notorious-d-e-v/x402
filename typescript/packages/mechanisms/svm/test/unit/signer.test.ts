@@ -28,11 +28,9 @@ import { encodeSignedTransaction, placeholderFeePayerSignature } from "./helpers
 
 describe("SVM Signer Converters", () => {
   it("searches older history only when recovery requests it", async () => {
-    const getSignatureStatuses = vi
-      .fn()
-      .mockReturnValue({
-        send: async () => ({ value: [{ slot: 55n, confirmationStatus: "confirmed", err: null }] }),
-      });
+    const getSignatureStatuses = vi.fn().mockReturnValue({
+      send: async () => ({ value: [{ slot: 55n, confirmationStatus: "confirmed", err: null }] }),
+    });
     const caps = createRpcCapabilitiesFromRpc({ getSignatureStatuses } as never);
     await caps.confirmTransaction("fresh");
     expect(getSignatureStatuses).toHaveBeenLastCalledWith(["fresh"]);

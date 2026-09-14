@@ -61,8 +61,11 @@ import {
 import { createRpcClient } from "../../utils";
 import {
   InMemoryBatchPendingSettlementStore,
-  reserveBroadcast,
+  PayoutAttributionAmbiguousError,
+  broadcastExpiredWithoutLanding,
+  discardWire,
   distributionsForStore,
+  reserveBroadcast,
   type BatchPendingSettlementStore,
 } from "./recovery";
 
@@ -157,8 +160,6 @@ type PreparedDistribution = {
   channelConfig: BatchSettlePayload["channels"][number]["channelConfig"];
   channelId: string;
   feePayer: string;
-  payoutBefore: bigint;
-  settled: bigint;
   terms: BatchTerms;
 };
 
@@ -382,7 +383,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       .sort()
       .join(",")}`;
     const completed = await this.pendingStore.get(this.completedBroadcastKey(claimKey));
-    if (completed) return claimResponse(prepared, requirements.network, completed, true);
+    if (completed) return claimResponse(prepared, requirements.network, completed);
 
     // A completed replay must not re-register a channel already reclaimed by cleanup.
     await Promise.all(
@@ -430,7 +431,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         requirements.network,
         prepared[0]?.claim.voucher.channelConfig.payer ?? "",
       );
-      return incomplete ?? claimResponse(prepared, requirements.network, recovered.signature, true);
+      return incomplete ?? claimResponse(prepared, requirements.network, recovered.signature);
     }
 
     const channels = await Promise.all(
@@ -474,7 +475,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     );
     if (!submitted.ok) return submitted.response;
     if (submitted.replayed) {
-      return claimResponse(prepared, requirements.network, submitted.signature, true);
+      return claimResponse(prepared, requirements.network, submitted.signature);
     }
     const confirmed = await this.fetchChannelsUntil(
       requirements.network,
@@ -500,7 +501,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       requirements.network,
       prepared[0]?.claim.voucher.channelConfig.payer ?? "",
     );
-    return incomplete ?? claimResponse(prepared, requirements.network, submitted.signature, false);
+    return incomplete ?? claimResponse(prepared, requirements.network, submitted.signature);
   }
 
   async settleDistributions(
@@ -547,8 +548,6 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         channelConfig: entry.channelConfig,
         channelId,
         feePayer: terms.feePayer,
-        payoutBefore: 0n,
-        settled: 0n,
         terms,
       });
     }
@@ -672,9 +671,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
             (item.channelConfig.payer === requirements.payTo ||
               getPaymentChannelsTreasuryOwner(requirements.network) === requirements.payTo)
           ) {
-            throw new Error(
-              "closed-channel payout shares its recipient with refund or treasury; transfer attribution is ambiguous",
-            );
+            throw new PayoutAttributionAmbiguousError();
           }
         }
         const balance = (balances: NonNullable<typeof evidence.meta.preTokenBalances>) => {
@@ -705,6 +702,23 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       await this.completeBroadcast(key, signature, requirements.network);
       return response;
     } catch (error) {
+      if (error instanceof PayoutAttributionAmbiguousError) {
+        // The sweep landed, so holding the queue pending would only block
+        // every later sweep of these channels. Release it and answer with an
+        // explicit reason an operator can reconcile by signature; the
+        // recording callback is skipped because no amount can be attributed.
+        const response: SettleResponse = {
+          errorMessage: error.message,
+          errorReason: BatchError.PAYOUT_ATTRIBUTION_AMBIGUOUS,
+          network: requirements.network,
+          payer: "",
+          success: false,
+          transaction: signature,
+        };
+        await this.pendingStore.set(`${key}:result`, JSON.stringify(response));
+        await this.completeBroadcast(key, signature, requirements.network);
+        return response;
+      }
       return this.settlementPending(requirements.network, "", signature, String(error));
     }
   }
@@ -1070,7 +1084,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           ChannelStatus.Sealed,
           ChannelStatus.Distributed,
         ]);
-        return refundResponse(channelId, observed, requirements.network, completed, true);
+        return refundResponse(channelId, observed, requirements.network, completed);
       }
       return recoveredRefundResponse(
         channelId,
@@ -1120,7 +1134,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       );
       if (incomplete) return incomplete;
       return observed
-        ? refundResponse(channelId, observed, requirements.network, recovered.signature, true)
+        ? refundResponse(channelId, observed, requirements.network, recovered.signature)
         : recoveredRefundResponse(
             channelId,
             payload.channelConfig.payer,
@@ -1135,7 +1149,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       ChannelStatus.Closing,
     ]);
     if (channel.status === ChannelStatus.Closing) {
-      return refundResponse(channelId, channel, requirements.network, "", true);
+      return refundResponse(channelId, channel, requirements.network, "");
     }
     if (this.settlementCache.isDuplicate(key)) {
       return this.settleFailure(payment, "duplicate_settlement", channel.payer);
@@ -1209,8 +1223,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       payload.channelConfig.payer,
     );
     return (
-      incomplete ??
-      refundResponse(channelId, closing, requirements.network, broadcast.signature, false)
+      incomplete ?? refundResponse(channelId, closing, requirements.network, broadcast.signature)
     );
   }
 
@@ -1354,6 +1367,8 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           wire,
         );
         if (!(await reserveBroadcast(this.pendingStore, key, broadcastSignature))) {
+          // Another worker owns this key; the bytes just written will never be sent.
+          await discardWire(this.pendingStore, network, broadcastSignature);
           const existing = await this.pendingStore.get(key);
           if (existing) throw new SettlementConfirmationTimeoutError(existing as Signature);
           throw new Error("concurrent broadcast reservation changed");
@@ -1424,10 +1439,12 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     payer: string,
     resend = true,
   ): Promise<DurableBroadcastResult> {
+    const wire = await this.pendingStore
+      .get(`batch:transaction:${network}:${signature}:wire`)
+      .catch(() => undefined);
     try {
       // The process may have stopped after recording but before sending.
       // Re-send the same signed bytes; never construct a replacement on timeout.
-      const wire = await this.pendingStore.get(`batch:transaction:${network}:${signature}:wire`);
       if (wire && resend) {
         try {
           await this.signer.sendTransaction(wire, network);
@@ -1452,6 +1469,24 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           ok: false,
           response: {
             errorMessage: error.message,
+            errorReason: "transaction_failed",
+            network,
+            payer,
+            success: false,
+            transaction: signature,
+          },
+        };
+      }
+      if (await broadcastExpiredWithoutLanding(this.signer, signature, network, wire)) {
+        // The blockhash left its validity window and the network has no record
+        // of the signature: the bytes can never land, so the queue is released
+        // instead of staying pending until an operator clears it.
+        await this.forgetPending(key, signature);
+        await discardWire(this.pendingStore, network, signature);
+        return {
+          ok: false,
+          response: {
+            errorMessage: `transaction ${signature} expired before confirmation: its blockhash is no longer valid and the network has no record of it`,
             errorReason: "transaction_failed",
             network,
             payer,
@@ -1490,12 +1525,8 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     await this.pendingStore.set(this.completedBroadcastKey(key), signature);
     await this.forgetPending(key, signature);
     // The completed identity/result now survives response loss; signed bytes
-    // are no longer needed for rebroadcast. Artifact cleanup is best effort.
-    try {
-      await this.pendingStore.delete(`batch:transaction:${network}:${signature}:wire`);
-    } catch {
-      /* keep confirmed result */
-    }
+    // are no longer needed for rebroadcast.
+    await discardWire(this.pendingStore, network, signature);
   }
 
   private async completeOrPending(
@@ -1910,7 +1941,6 @@ function claimResponse(
   claims: readonly PreparedClaim[],
   network: Network,
   transaction: string,
-  _: boolean,
 ): SettleResponse {
   return {
     amount: "",
@@ -1932,7 +1962,6 @@ function refundResponse(
   channel: Channel,
   network: Network,
   transaction: string,
-  _: boolean,
 ): SettleResponse {
   return {
     success: true,

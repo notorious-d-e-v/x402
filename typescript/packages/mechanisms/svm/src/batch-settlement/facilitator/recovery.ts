@@ -1,5 +1,12 @@
 /* eslint-disable jsdoc/require-jsdoc */
+import {
+  getBase64Codec,
+  getCompiledTransactionMessageDecoder,
+  getTransactionDecoder,
+} from "@solana/kit";
 import type { PendingSettlementStore } from "@x402/core/facilitator";
+
+import type { FacilitatorSvmSigner } from "../../signer";
 
 /** Batch recovery records must outlive an unresolved transaction. */
 export interface BatchPendingSettlementStore extends PendingSettlementStore {
@@ -81,5 +88,72 @@ export async function reserveBroadcast(
     return await next;
   } finally {
     if (pending.get(key) === next) pending.delete(key);
+  }
+}
+
+/**
+ * Thrown when a confirmed sweep cannot be attributed from balance evidence
+ * because the merchant recipient is also the refund or treasury beneficiary
+ * of a closed channel. The transaction landed; only its accounting is
+ * unresolved, so it is reported with its own reason rather than left pending.
+ */
+export class PayoutAttributionAmbiguousError extends Error {
+  constructor() {
+    super(
+      "closed-channel payout shares its recipient with refund or treasury; transfer attribution is ambiguous",
+    );
+    this.name = "PayoutAttributionAmbiguousError";
+  }
+}
+
+/**
+ * Whether a broadcast whose confirmation was never observed can no longer
+ * land. Blockhash validity is checked before the final history lookup, so a
+ * transaction included right before its blockhash expired is still found and
+ * stays on the reconcile path. Anything uncertain answers `false`: a
+ * transaction that may have landed is never reported as failed.
+ *
+ * @param signer - Facilitator signer; needs `isBlockhashValid` and `getConfirmedTransaction`
+ * @param signature - Recorded signature of the broadcast
+ * @param network - Network it was submitted to
+ * @param wire - The signed bytes that were (or would have been) sent
+ * @returns `true` only when the blockhash is invalid and no record of the signature exists
+ */
+export async function broadcastExpiredWithoutLanding(
+  signer: Pick<FacilitatorSvmSigner, "isBlockhashValid" | "getConfirmedTransaction">,
+  signature: string,
+  network: string,
+  wire: string | undefined,
+): Promise<boolean> {
+  if (!wire || !signer.isBlockhashValid || !signer.getConfirmedTransaction) return false;
+  try {
+    const transaction = getTransactionDecoder().decode(getBase64Codec().encode(wire));
+    const { lifetimeToken } = getCompiledTransactionMessageDecoder().decode(
+      transaction.messageBytes,
+    );
+    if (await signer.isBlockhashValid(lifetimeToken, network)) return false;
+    return (await signer.getConfirmedTransaction(signature, network)) === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Drop the signed bytes kept for rebroadcast. Best effort: the outcome they
+ * describe is already recorded elsewhere.
+ *
+ * @param store - Recovery storage holding the wire record
+ * @param network - Network the bytes were built for
+ * @param signature - Their locally derived signature
+ */
+export async function discardWire(
+  store: PendingSettlementStore,
+  network: string,
+  signature: string,
+): Promise<void> {
+  try {
+    await store.delete(`batch:transaction:${network}:${signature}:wire`);
+  } catch {
+    /* keep recorded outcome */
   }
 }

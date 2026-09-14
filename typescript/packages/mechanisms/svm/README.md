@@ -69,7 +69,7 @@ Long-lived channels support cumulative client vouchers or concurrent server-sign
 
 Distribution keeps its existing request: `type: "settle"` with `channelId` and `channelConfig` for each channel. It sweeps what is currently owed; a later retry may also pay newly claimed earnings. No payout idempotency key or request watermarks are required.
 
-The facilitator records signed bytes and their signature before submission, then reconciles or resends that same transaction after an uncertain outcome. Unresolved operations remain `settlement_pending`; a timeout or unavailable transaction history does not justify building a replacement. Confirmed account reads use the execution slot as `minContextSlot` when supplied by the signer.
+The facilitator records signed bytes and their signature before submission, then reconciles or resends that same transaction after an uncertain outcome. Unresolved operations remain `settlement_pending`; a timeout or unavailable transaction history does not justify building a replacement. The one conclusive expiry signal is the transaction's own blockhash: when the signer reports it invalid (`isBlockhashValid`) and a history lookup (`getConfirmedTransaction`) still finds no record of the signature, the bytes can never land, so the operation is reported as `transaction_failed` and its queue released instead of staying pending. Confirmed account reads use the execution slot as `minContextSlot` when supplied by the signer; a read the backend rejects for that floor is retried before it fails the request.
 
 Distribution `amount` is the receiver's actual token credit in the identified transaction, including on recovery. Deduplicate accounting by network, transaction, asset and recipient rather than summing HTTP responses. The optional facilitator `onDistributionConfirmed` callback runs before recovery completion and may run more than once; it must be idempotent. Recording failures leave the original signature pending.
 
@@ -79,7 +79,7 @@ After distribution, `BatchChannelManager` reads the confirmed channel payout wat
 
 Custom signers should return the execution slot from `confirmTransaction`, honor `minContextSlot`, and implement `getConfirmedTransaction` with confirmed token-balance metadata. The default adapter supports these capabilities. Missing payout metadata leaves the original transaction pending.
 
-When a sealed channel's receiver is also the refund recipient or protocol treasury, aggregate token balances can combine earnings with other credits. That payout remains pending for reconciliation instead of reporting the combined amount as earnings. The transaction may already have completed and must not be repeated as a replacement payment.
+When a sealed channel's receiver is also the refund recipient or protocol treasury, aggregate token balances can combine earnings with other credits. That payout is answered with `invalid_batch_settlement_svm_payout_attribution_ambiguous` and the transaction signature instead of the combined amount, and the sweep queue is released so later sweeps of those channels are not blocked. The transaction has completed onchain: reconcile it by signature, and never repeat it as a replacement payment. The `onDistributionConfirmed` callback is not invoked for it because no amount can be attributed.
 
 ### V1 Package (`@x402/svm/v1`)
 
