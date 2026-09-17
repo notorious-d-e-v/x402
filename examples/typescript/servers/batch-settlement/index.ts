@@ -142,7 +142,9 @@ async function main() {
         `[SVM] Redeeming every 60s; facilitator idle window: ${String(svmKind.extra?.maxIdleSecs ?? "none")}s`,
       );
     } else {
-      console.warn("[SVM] facilitator does not advertise batch-settlement; no redemption worker started");
+      console.warn(
+        "[SVM] facilitator does not advertise batch-settlement; no redemption worker started",
+      );
     }
   }
 
