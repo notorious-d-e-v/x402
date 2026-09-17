@@ -1,5 +1,6 @@
 /* eslint-disable jsdoc/require-jsdoc */
 import type {
+  FacilitatorClient,
   SettleContext,
   SettleFailureContext,
   SettleResultContext,
@@ -54,6 +55,7 @@ import {
   type BatchOperationStore,
   MemoryBatchOperationStore,
 } from "./operationStore";
+import { BatchChannelManager, type BatchChannelManagerConfig } from "./channelManager";
 import { type ChannelState, type ChannelStore, MemoryChannelStore } from "./storage";
 
 type ParsedMoney = { amount: number; stablecoin?: SvmStablecoinSymbol };
@@ -260,6 +262,41 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           ? { operator: this.config.operator.address, voucherSigner: "server" }
           : {}),
       },
+    });
+  }
+
+  /**
+   * Build the redemption worker over this scheme's channel store: it claims
+   * accumulated vouchers and distributes what they settle, through the same
+   * facilitator the server verifies with.
+   *
+   * `requirements` are the terms channels were opened against — network,
+   * asset, `payTo` and `extra.feePayer` — normally the output of
+   * {@link enhancePaymentRequirements} for the route's requirements and the
+   * facilitator's `/supported` kind.
+   *
+   * @param facilitator - Facilitator client that submits redemption payloads
+   * @param requirements - Enhanced requirements the channels were opened against
+   * @param options - Worker tuning: batch size, RPC, watermark reader, error hook
+   * @returns A worker the caller starts, or drives with `redeem()`
+   */
+  createChannelManager(
+    facilitator: Pick<FacilitatorClient, "settle">,
+    requirements: PaymentRequirements,
+    options: Omit<BatchChannelManagerConfig, "store" | "settle" | "requirements"> = {},
+  ): BatchChannelManager {
+    if (typeof requirements.extra?.feePayer !== "string") {
+      throw new Error(
+        "createChannelManager requires requirements.extra.feePayer; pass the requirements " +
+          "returned by enhancePaymentRequirements for the facilitator's /supported kind",
+      );
+    }
+    return new BatchChannelManager({
+      ...options,
+      requirements,
+      settle: (payload, accepted) =>
+        facilitator.settle(payload as unknown as PaymentPayload, accepted),
+      store: this.store,
     });
   }
 

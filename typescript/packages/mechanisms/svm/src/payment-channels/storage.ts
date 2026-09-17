@@ -5,10 +5,11 @@ import type { Network } from "@x402/core/types";
  *
  * Only stores what the channel account refetch does not provide:
  * `payTo` (distribution preimage), `tokenProgram`, abandon-policy
- * `firstSeenAt`, voucher `expiresAt`, and `network`. Payer/payee/mint/
- * openSlot/status are read live before acting.
+ * `firstSeenAt` and `lastActivityAt`, voucher `expiresAt`, and `network`.
+ * Payer/payee/mint/openSlot/status are read live before acting.
  *
- * Written on deposit (pre-broadcast) and claim settle; deleted when the PDA is gone.
+ * Written on deposit (pre-broadcast), claim and distribution settles; deleted
+ * when the PDA is gone.
  */
 export interface PaymentChannelRecord {
   channelId: string;
@@ -19,6 +20,14 @@ export interface PaymentChannelRecord {
   firstSeenAt: number;
   /** Client voucher expiry (Unix seconds). Never shrinks on later upserts. */
   expiresAt: number;
+  /**
+   * Wall-clock ms of the last facilitator-visible lifecycle activity on the
+   * channel: an open, top-up, claim or distribution the facilitator
+   * processed. Offchain voucher acceptance on the server is invisible here.
+   * Drives the idle abandon-close of non-expiring (`expiresAt === 0`)
+   * channels after the advertised `maxIdleSecs`. Never moves backwards.
+   */
+  lastActivityAt: number;
   network: Network;
 }
 
@@ -36,7 +45,8 @@ export interface PaymentChannelStorage {
 
 /**
  * In-memory {@link PaymentChannelStorage}. Preserves `firstSeenAt` and the
- * maximum `expiresAt` across upserts of the same `channelId`.
+ * maximum `expiresAt` and `lastActivityAt` across upserts of the same
+ * `channelId`.
  */
 export class InMemoryPaymentChannelStorage implements PaymentChannelStorage {
   private readonly channels = new Map<string, PaymentChannelRecord>();
@@ -62,7 +72,8 @@ export class InMemoryPaymentChannelStorage implements PaymentChannelStorage {
 
   /**
    * Insert or replace a record. Keeps the earlier `firstSeenAt` and the
-   * later `expiresAt` when the channel was already stored.
+   * later `expiresAt` and `lastActivityAt` when the channel was already
+   * stored.
    *
    * @param record - Full channel storage record
    */
@@ -72,6 +83,9 @@ export class InMemoryPaymentChannelStorage implements PaymentChannelStorage {
       ...record,
       firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
       expiresAt: existing ? Math.max(existing.expiresAt, record.expiresAt) : record.expiresAt,
+      lastActivityAt: existing
+        ? Math.max(existing.lastActivityAt, record.lastActivityAt)
+        : record.lastActivityAt,
     });
   }
 

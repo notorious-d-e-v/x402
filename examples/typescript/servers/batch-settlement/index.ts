@@ -11,6 +11,7 @@ import {
   x402HTTPResourceServer,
   x402ResourceServer,
 } from "@x402/express";
+import type { BatchChannelManager } from "@x402/svm/batch-settlement/server";
 import { BatchSvmScheme, MemoryChannelStore } from "@x402/svm/batch-settlement/server";
 import { config } from "dotenv";
 import express from "express";
@@ -61,6 +62,7 @@ async function main() {
 
   let resourceServer = new x402ResourceServer(facilitatorClient);
   let channelManager: ReturnType<BatchSettlementEvmScheme["createChannelManager"]> | undefined;
+  let svmChannelManager: BatchChannelManager | undefined;
 
   if (evmAddress) {
     const batchedEvmScheme = new BatchSettlementEvmScheme(evmAddress, {
@@ -95,22 +97,60 @@ async function main() {
   }
 
   if (svmAddress) {
-    resourceServer = resourceServer.register(
-      SVM_NETWORK,
-      new BatchSvmScheme({
-        withdrawDelay,
-        ...(svmReceiverAuthorizerSigner
-          ? { receiverAuthorizer: svmReceiverAuthorizerSigner.address }
-          : {}),
-        store: new MemoryChannelStore(),
-      }),
+    const batchedSvmScheme = new BatchSvmScheme({
+      withdrawDelay,
+      ...(svmReceiverAuthorizerSigner
+        ? { receiverAuthorizer: svmReceiverAuthorizerSigner.address }
+        : {}),
+      store: new MemoryChannelStore(),
+    });
+    resourceServer = resourceServer.register(SVM_NETWORK, batchedSvmScheme);
+
+    // The redemption worker claims accumulated vouchers and distributes what
+    // they settle. It redeems against the same terms the 402 advertises, so
+    // build them the way the resource server does: route requirements plus
+    // the facilitator's /supported kind (which carries feePayer and the idle
+    // window maxIdleSecs the server must claim inside).
+    const supported = await facilitatorClient.getSupported();
+    const svmKind = supported.kinds.find(
+      kind => kind.scheme === "batch-settlement" && kind.network === SVM_NETWORK,
     );
+    if (svmKind) {
+      const svmRequirements = await batchedSvmScheme.enhancePaymentRequirements(
+        {
+          scheme: "batch-settlement",
+          network: SVM_NETWORK,
+          // $0.01 in USDC atomic units: the worker only reads network, asset,
+          // payTo and extra.feePayer from these terms.
+          amount: "10000",
+          asset: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+          payTo: svmAddress,
+          maxTimeoutSeconds: 300,
+          extra: {},
+        },
+        svmKind,
+        [],
+      );
+      svmChannelManager = batchedSvmScheme.createChannelManager(
+        facilitatorClient,
+        svmRequirements,
+        { onError: (e: unknown) => console.error("[SVM] Redemption error:", e) },
+      );
+      // Well inside the facilitator's idle window (default seven days).
+      svmChannelManager.start(60);
+      console.log(
+        `[SVM] Redeeming every 60s; facilitator idle window: ${String(svmKind.extra?.maxIdleSecs ?? "none")}s`,
+      );
+    } else {
+      console.warn("[SVM] facilitator does not advertise batch-settlement; no redemption worker started");
+    }
   }
 
-  if (channelManager) {
+  if (channelManager || svmChannelManager) {
     process.on("SIGINT", async () => {
-      console.log("Shutting down — flushing pending EVM claims…");
-      await channelManager!.stop({ flush: true });
+      console.log("Shutting down — flushing pending claims…");
+      await channelManager?.stop({ flush: true });
+      svmChannelManager?.stop();
       process.exit(0);
     });
   }

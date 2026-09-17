@@ -121,14 +121,22 @@ async function main(): Promise<void> {
         ? `REQUESTING PARTIAL REFUND of ${refundAmount} base units`
         : "REQUESTING FULL REFUND of remaining channel balance",
     );
-    const refundT0 = performance.now();
-    const settle = evmScheme
-      ? await evmScheme.refund(url, {
-          ...(refundAmount ? { amount: refundAmount } : {}),
-        })
-      : await svmScheme!.refund(url);
-    console.log(JSON.stringify(settle, null, 2));
-    console.log(`Refund completed in ${((performance.now() - refundT0) / 1000).toFixed(3)}s`);
+    // Each registered scheme refunds its own channel, so a dual-network run
+    // closes both the EVM and the SVM channel.
+    if (evmScheme) {
+      const refundT0 = performance.now();
+      const settle = await evmScheme.refund(url, {
+        ...(refundAmount ? { amount: refundAmount } : {}),
+      });
+      console.log("[EVM]", JSON.stringify(settle, null, 2));
+      console.log(`[EVM] Refund completed in ${((performance.now() - refundT0) / 1000).toFixed(3)}s`);
+    }
+    if (svmScheme) {
+      const refundT0 = performance.now();
+      const settle = await svmScheme.refund(url);
+      console.log("[SVM]", JSON.stringify(settle, null, 2));
+      console.log(`[SVM] Refund completed in ${((performance.now() - refundT0) / 1000).toFixed(3)}s`);
+    }
   }
 }
 

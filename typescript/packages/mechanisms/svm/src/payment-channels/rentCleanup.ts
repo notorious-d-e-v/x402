@@ -11,8 +11,11 @@
  *
  * Policy note (spec §8): sealing abandoned Open channels before the server
  * settles freezes the watermark and refunds the unsettled remainder to the
- * client. Abandon timing uses `min(expiresAt + grace, firstSeenAt + max)` so
- * normal vouchers expire cleanly while misconfigured long timeouts are capped.
+ * client. Expiring vouchers (`upto`) abandon at `expiresAt + grace`.
+ * Non-expiring vouchers (`batch-settlement`, `expiresAt === 0`) abandon only
+ * after `maxIdleSecs` without facilitator-visible lifecycle activity — the
+ * window the facilitator advertises as `extra.maxIdleSecs`, so servers know
+ * how long they have to claim before unclaimed vouchers are forfeited.
  */
 
 import { address, type Address, type Signature } from "@solana/kit";
@@ -141,6 +144,43 @@ function resolveCleanupCount(
 /** Default grace after voucher expiry before abandon-closing an Open channel. */
 export const DEFAULT_ABANDON_GRACE_SECS = 120;
 
+/**
+ * Default idle window, in seconds, after which an Open channel with
+ * non-expiring vouchers (`expiresAt === 0`) and no facilitator-visible
+ * lifecycle activity is abandon-closed at its onchain settled watermark.
+ * Advertised to servers as `extra.maxIdleSecs`. Seven days.
+ */
+export const DEFAULT_MAX_IDLE_SECS = 7 * 24 * 60 * 60;
+
+/**
+ * Resolve an idle window: `undefined` or invalid means the default; `0`
+ * disables idle abandon-close entirely.
+ *
+ * @param value - Configured idle window in seconds
+ * @returns The idle window to enforce
+ */
+export function resolveMaxIdleSecs(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : DEFAULT_MAX_IDLE_SECS;
+}
+
+/**
+ * Validate a configured idle window: a non-negative integer number of seconds
+ * (`0` disables), defaulting to {@link DEFAULT_MAX_IDLE_SECS} when absent.
+ *
+ * @param value - Configured idle window in seconds
+ * @returns The validated idle window
+ * @throws Error when the value is negative or not an integer
+ */
+export function assertMaxIdleSecs(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_IDLE_SECS;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error("maxIdleSecs must be a non-negative integer number of seconds");
+  }
+  return value;
+}
+
 /** Default reclaim instructions per cleanup transaction. */
 export const DEFAULT_MAX_RECLAIMS_PER_TX = 8;
 
@@ -180,6 +220,14 @@ export interface RentCleanupReclaimResult {
 export interface RentCleanupOptions {
   /** Seconds after `expiresAt` before abandon-close. Default 120. */
   abandonGraceSecs?: number;
+  /**
+   * Seconds without facilitator-visible lifecycle activity before an Open
+   * channel with non-expiring vouchers (`expiresAt === 0`) is abandon-closed
+   * at its onchain settled watermark. Defaults to the manager's configured
+   * window, then {@link DEFAULT_MAX_IDLE_SECS}; `0` disables. Should match
+   * what the facilitator advertises as `extra.maxIdleSecs`.
+   */
+  maxIdleSecs?: number;
   /** Max `reclaim` instructions packed into one transaction. */
   maxReclaimsPerTx?: number;
   /**
@@ -259,6 +307,12 @@ export interface PaymentChannelRentCleanupManagerConfig {
   settleComputeUnitLimit?: number;
   /** Injected RPC client used instead of building one from `rpcUrl`. */
   rpc?: ChannelRpc;
+  /**
+   * Default idle window for passes that do not set
+   * {@link RentCleanupOptions.maxIdleSecs}. Facilitator schemes pass the value
+   * they advertise so cleanup and advertisement cannot diverge.
+   */
+  maxIdleSecs?: number;
 }
 
 /**
@@ -276,6 +330,7 @@ export class PaymentChannelRentCleanupManager {
   private readonly computeUnitPriceMicroLamports: number | undefined;
   private readonly settleComputeUnitLimit: number | undefined;
   private readonly rpc: ChannelRpc | undefined;
+  private readonly maxIdleSecs: number | undefined;
 
   private timer: ReturnType<typeof setInterval> | undefined;
   private discoveryTimer: ReturnType<typeof setInterval> | undefined;
@@ -327,6 +382,7 @@ export class PaymentChannelRentCleanupManager {
     this.computeUnitPriceMicroLamports = config.computeUnitPriceMicroLamports;
     this.settleComputeUnitLimit = config.settleComputeUnitLimit;
     this.rpc = config.rpc;
+    this.maxIdleSecs = config.maxIdleSecs;
   }
 
   /**
@@ -433,6 +489,7 @@ export class PaymentChannelRentCleanupManager {
    */
   private async runPass(opts: RentCleanupOptions): Promise<void> {
     const abandonGraceSecs = resolveCleanupCount(opts.abandonGraceSecs, DEFAULT_ABANDON_GRACE_SECS);
+    const maxIdleSecs = resolveMaxIdleSecs(opts.maxIdleSecs ?? this.maxIdleSecs);
     const maxReclaimsPerTx = resolveCleanupCount(
       opts.maxReclaimsPerTx,
       DEFAULT_MAX_RECLAIMS_PER_TX,
@@ -485,12 +542,22 @@ export class PaymentChannelRentCleanupManager {
           status === ChannelStatus.Sealed
         ) {
           if (status === ChannelStatus.Open) {
-            // Batch-settlement vouchers use expiresAt = 0, which means
-            // non-expiring. Such channels are not abandonment candidates
-            // solely because their recorded expiry predates the Unix epoch.
-            if (record.expiresAt === 0) continue;
-            const readyAt = record.expiresAt + abandonGraceSecs;
-            if (nowSecs < readyAt) continue;
+            if (record.expiresAt === 0) {
+              // Batch-settlement vouchers never expire, so the channel is an
+              // abandonment candidate only once it has seen no
+              // facilitator-visible lifecycle activity for the advertised
+              // idle window. Closing at the onchain settled watermark
+              // forfeits whatever the server left unclaimed, which is why
+              // the window is published as `extra.maxIdleSecs`.
+              if (maxIdleSecs <= 0) continue;
+              const idleSinceSecs = Math.floor(
+                (record.lastActivityAt || record.firstSeenAt) / 1_000,
+              );
+              if (nowSecs < idleSinceSecs + maxIdleSecs) continue;
+            } else {
+              const readyAt = record.expiresAt + abandonGraceSecs;
+              if (nowSecs < readyAt) continue;
+            }
           } else if (
             status === ChannelStatus.Closing &&
             BigInt(nowSecs) < live.closureStartedAt + BigInt(live.gracePeriod)
@@ -612,6 +679,7 @@ export class PaymentChannelRentCleanupManager {
             tokenProgram: "",
             firstSeenAt: Date.now(),
             expiresAt: 0,
+            lastActivityAt: Date.now(),
             network: this.network,
           });
           discovered.push(channelId);

@@ -46,19 +46,20 @@ import type {
 import {
   broadcastOpen,
   getChannelDistributionHash,
-  simulateOpenSettleDistribute,
   submitChannelTransactionWithSigner,
   ChannelSimulationError,
-  ChannelBroadcastConfirmationError,
   SettlementConfirmationTimeoutError,
 } from "../../payment-channels/facilitator";
-import { PaymentChannelRentCleanupManager } from "../../payment-channels/rentCleanup";
+import {
+  assertMaxIdleSecs,
+  PaymentChannelRentCleanupManager,
+} from "../../payment-channels/rentCleanup";
 import {
   InMemoryPaymentChannelStorage,
   type PaymentChannelRecord,
   type PaymentChannelStorage,
 } from "../../payment-channels/storage";
-import { createRpcClient } from "../../utils";
+import { simulateOpenSettleDistribute } from "../../upto/facilitator/channel";
 import {
   InMemoryBatchPendingSettlementStore,
   PayoutAttributionAmbiguousError,
@@ -68,6 +69,17 @@ import {
   reserveBroadcast,
   type BatchPendingSettlementStore,
 } from "./recovery";
+import {
+  CHANNEL_BUSY,
+  claimResponse,
+  classifyError,
+  depositResponse,
+  parseOptionalSlot,
+  pendingSignatureOf,
+  recoveredRefundResponse,
+  refundResponse,
+  snapshotChannel,
+} from "./responses";
 
 import { recordPendingOrTerminal, TransactionOnchainFailureError } from "../../utils";
 import { ErrSettlementPending } from "../../exact/facilitator/errors";
@@ -75,7 +87,6 @@ import { BatchError } from "../errors";
 import {
   BATCH_SETTLEMENT_SCHEME,
   type BatchChannelConfig,
-  type BatchChannelState,
   type BatchDepositPayload,
   type BatchClaimPayload,
   type BatchPayload,
@@ -88,7 +99,6 @@ const MIN_WITHDRAW_DELAY = 900;
 const MAX_WITHDRAW_DELAY = 2_592_000;
 const CHANNEL_READ_ATTEMPTS = 5;
 const CHANNEL_READ_INITIAL_BACKOFF_MS = 200;
-const CHANNEL_BUSY = "duplicate_settlement";
 const COMPLETED_BROADCAST_SUFFIX = ":completed";
 
 /** Four Ed25519+settle pairs fit under Solana's transaction packet limit. */
@@ -110,6 +120,13 @@ export interface BatchSvmFacilitatorConfig {
   ) => Promise<void>;
   /** Shared, facilitator-owned lifecycle index used for rent cleanup. */
   channelStorage?: PaymentChannelStorage | undefined;
+  /**
+   * Idle window advertised as `extra.maxIdleSecs`: seconds without
+   * facilitator-visible lifecycle activity after which rent cleanup MAY
+   * abandon-close an Open channel at its settled watermark. `0` disables and
+   * is not advertised. Defaults to `DEFAULT_MAX_IDLE_SECS` (seven days).
+   */
+  maxIdleSecs?: number | undefined;
   maxPriorityFeeMicroLamports?: number | undefined;
   maxComputeUnits?: number | undefined;
   maxRequiredSignatures?: number | undefined;
@@ -171,6 +188,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
   private readonly pendingStore: BatchPendingSettlementStore;
   private readonly confirmationSlots = new Map<string, bigint>();
   private readonly distributionPasses: Map<string, Promise<SettleResponse>>;
+  private readonly maxIdleSecs: number;
 
   constructor(
     private readonly signer: FacilitatorSvmSigner,
@@ -185,12 +203,16 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     this.channelStorage = config.channelStorage ?? new InMemoryPaymentChannelStorage();
     this.pendingStore = config.pendingSettlementStore ?? new InMemoryBatchPendingSettlementStore();
     this.distributionPasses = distributionsForStore(this.pendingStore);
+    this.maxIdleSecs = assertMaxIdleSecs(config.maxIdleSecs);
   }
 
   getExtra(_: Network): Record<string, unknown> {
     const addresses = this.signer.getAddresses();
     return {
       feePayer: addresses[Math.floor(Math.random() * addresses.length)],
+      // Servers copy the idle window into the 402: it is how long they have
+      // to claim before an idle channel is closed at its onchain watermark.
+      ...(this.maxIdleSecs > 0 ? { maxIdleSecs: this.maxIdleSecs } : {}),
     };
   }
 
@@ -204,6 +226,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
 
   createRentCleanupManager(network: Network): PaymentChannelRentCleanupManager {
     return new PaymentChannelRentCleanupManager({
+      maxIdleSecs: this.maxIdleSecs,
       network,
       rpcUrl: this.config.rpcUrl,
       signer: this.signer,
@@ -865,12 +888,12 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         // across signer backends that will not sign the same bytes twice.
         await this.signer.simulateTransaction(payload.deposit.transaction, requirements.network);
       } else {
-        // The only read still on its own client: this shared helper simulates
-        // the open/settle/distribute chain through an rpc of its own, and is
-        // used by `upto` too.
+        // Simulates the open/settle/distribute chain through the facilitator
+        // signer's own RPC, like every other read and broadcast here.
         await simulateOpenSettleDistribute(
           terms.feePayerSigner,
-          createRpcClient(requirements.network, this.config.rpcUrl),
+          this.signer,
+          requirements.network,
           {
             channel: {
               channelId,
@@ -1847,8 +1870,12 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     });
   }
 
-  private trackChannel(record: Omit<PaymentChannelRecord, "firstSeenAt">): Promise<void> {
-    return this.channelStorage.upsert({ ...record, firstSeenAt: Date.now() });
+  private trackChannel(
+    record: Omit<PaymentChannelRecord, "firstSeenAt" | "lastActivityAt">,
+  ): Promise<void> {
+    // Every upsert is facilitator-visible activity: it resets the idle clock.
+    const now = Date.now();
+    return this.channelStorage.upsert({ ...record, firstSeenAt: now, lastActivityAt: now });
   }
 
   private verifyFailure(reason: string, payer: string, message?: string): VerifyResponse {
@@ -1886,115 +1913,4 @@ export function calculateDistributionAmount(
     }
     return total + channel.settled - channel.payoutWatermark;
   }, 0n);
-}
-
-/**
- * The signature carried by an error that means "broadcast, outcome unknown",
- * or `undefined` for anything else.
- *
- * @param error - The error a broadcast attempt threw
- * @returns The signature already on the network, when there is one
- */
-function pendingSignatureOf(error: unknown): string | undefined {
-  if (error instanceof ChannelBroadcastConfirmationError) return error.signature;
-  if (error instanceof SettlementConfirmationTimeoutError) return String(error.signature);
-  return undefined;
-}
-
-function snapshotChannel(
-  channelId: string,
-  channel: Channel,
-  chargedCumulativeAmount?: bigint,
-): BatchChannelState {
-  const snapshot: BatchChannelState = {
-    channelId,
-    balance: channel.deposit.toString(),
-    totalClaimed: channel.settlement.settled.toString(),
-    withdrawRequestedAt:
-      channel.status === ChannelStatus.Closing ? Number(channel.closureStartedAt) : 0,
-  };
-  if (chargedCumulativeAmount !== undefined) {
-    snapshot.chargedCumulativeAmount = chargedCumulativeAmount.toString();
-  }
-  return snapshot;
-}
-
-function depositResponse(
-  channelId: string,
-  channel: Channel,
-  network: Network,
-  transaction: string,
-): SettleResponse {
-  return {
-    success: true,
-    payer: channel.payer,
-    transaction,
-    network,
-    amount: channel.deposit.toString(),
-    extra: {
-      channelState: snapshotChannel(channelId, channel),
-    },
-  };
-}
-
-function claimResponse(
-  claims: readonly PreparedClaim[],
-  network: Network,
-  transaction: string,
-): SettleResponse {
-  return {
-    amount: "",
-    extra: {
-      accepts: claims.map(item => ({
-        channelId: item.channelId,
-        totalClaimed: item.cumulative.toString(),
-      })),
-    },
-    network,
-    payer: "",
-    success: true,
-    transaction,
-  };
-}
-
-function refundResponse(
-  channelId: string,
-  channel: Channel,
-  network: Network,
-  transaction: string,
-): SettleResponse {
-  return {
-    success: true,
-    payer: channel.payer,
-    transaction,
-    network,
-    extra: { channelState: snapshotChannel(channelId, channel) },
-  };
-}
-
-function recoveredRefundResponse(
-  channelId: string,
-  payer: string,
-  network: Network,
-  transaction: string,
-): SettleResponse {
-  return {
-    extra: { channelId },
-    network,
-    payer,
-    success: true,
-    transaction,
-  };
-}
-
-function classifyError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  if (message.includes(CHANNEL_BUSY)) return CHANNEL_BUSY;
-  const known = Object.values(BatchError).find(value => message.includes(value));
-  return known ?? "transaction_failed";
-}
-
-function parseOptionalSlot(value: unknown): bigint | undefined {
-  if (value === undefined || value === null) return undefined;
-  return parseU64(value as string | number | bigint, "extra.recentSlot");
 }

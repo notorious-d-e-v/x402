@@ -188,6 +188,7 @@ and `SettlementResponse` types are defined in
 | `recentBlockhash` | string | no | Pre-fetched blockhash the client MAY use to build an `open` or `top_up` transaction without an RPC round trip. The client MUST refresh it if it is no longer valid. |
 | `recentSlot` | number | no | Recent slot the client MAY use as `channelConfig.openSlot` when it does not fetch its own slot. The program still enforces the open-slot window. |
 | `minDeposit` | string | no | Atomic deposit target. When present, MUST be a positive integer greater than or equal to `amount`. |
+| `maxIdleSecs` | number | no | Facilitator idle window in seconds, copied from the facilitator's `/supported` `extra`. After this long with no facilitator-visible lifecycle activity on an `Open` channel, the facilitator MAY abandon-close it at the onchain `settled` watermark (see Phase 4). Absent means the facilitator does not idle-close. |
 | `channelState` | object | no | Corrective-only server channel snapshot for cumulative amount resynchronization. |
 | `voucherState` | object | no | Corrective-only signed voucher proof for cumulative amount resynchronization. |
 
@@ -1035,9 +1036,14 @@ server marks the channel closed after confirmation.
 
 #### `GET /supported`
 
-The facilitator advertises its SVM transaction fee payer. The server MUST copy
-that value into `PaymentRequirements.extra.feePayer`, then set
-`extra.tokenProgram` from the selected asset's verified mint owner. The scheme
+The facilitator advertises its SVM transaction fee payer and, when it runs
+idle rent cleanup, the idle window `maxIdleSecs` (a positive integer number of
+seconds; the reference implementation defaults to `604800`, seven days). The
+server MUST copy both values into `PaymentRequirements.extra`, then set
+`extra.tokenProgram` from the selected asset's verified mint owner. A server
+SHOULD claim every channel well inside `maxIdleSecs`, because the facilitator
+may close an idle channel at its onchain `settled` watermark and any voucher
+value above it is then forfeited. The scheme
 resolves to the protocol-default `authorization` payment flow, so
 `extra.paymentFlow` is normally omitted; when either party emits it, the value
 MUST be `"authorization"`. The server
@@ -1054,7 +1060,8 @@ facilitator:
       "scheme": "batch-settlement",
       "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
       "extra": {
-        "feePayer": "<facilitator-fee-payer>"
+        "feePayer": "<facilitator-fee-payer>",
+        "maxIdleSecs": 604800
       }
     }
   ],
@@ -1473,6 +1480,21 @@ server has authenticated that close. After the grace period, anyone can call
 `seal`; the payer can recover unspent deposit via `withdraw_payer` or sealed
 `distribute`, and vouchers not yet claimed are forfeited by the server.
 
+**Idle abandon-close.** Vouchers in this scheme never expire, so an `Open`
+channel whose payer walks away would lock sponsored rent forever. A facilitator
+that advertises `extra.maxIdleSecs` MAY, once an `Open` channel has seen no
+facilitator-visible lifecycle activity for that many seconds, close it at the
+current onchain `settled` watermark with `settle_and_seal` (`has_voucher =
+0`), then `distribute` and `reclaim`. Facilitator-visible activity is any
+`deposit`, `claim` or `settle` the facilitator processed for the channel;
+offchain voucher acceptance on the server does not reset the clock. Closing at
+the watermark forfeits every voucher the server has not claimed, so the server
+MUST treat `maxIdleSecs` as a second clock it races against, and SHOULD claim
+long before it elapses (the reference channel manager redeems on an interval
+well inside the seven-day default). A facilitator MUST NOT idle-close earlier
+than the window it advertised, and MUST NOT apply an idle policy it does not
+advertise.
+
 ### Phase 5 - Duplicate and Concurrent Operation Handling
 
 The cumulative voucher and payment-channel state machine prevent duplicate
@@ -1580,10 +1602,12 @@ request path. After startup or local state loss, a rent sponsor MUST:
 2. Refetch and revalidate a channel immediately before acting. If another worker
    or user changes its status, refetch and reclassify it instead of treating the
    stale transition failure as permanent.
-3. For an `Open` channel, allow the server a policy-defined notice or idle
-   timeout to submit its latest voucher. The facilitator MAY then close at the
-   current onchain watermark using `settle_and_seal` with `has_voucher = 0`,
-   followed by `distribute` and, when necessary, `reclaim`.
+3. For an `Open` channel, wait until it has been idle for the advertised
+   `extra.maxIdleSecs` (Phase 4), giving the server that window to submit its
+   latest voucher. The facilitator MAY then close at the current onchain
+   watermark using `settle_and_seal` with `has_voucher = 0`, followed by
+   `distribute` and, when necessary, `reclaim`. A channel rediscovered after
+   local state loss starts its idle clock at rediscovery.
 4. For a `Closing` channel, schedule a recheck at the grace deadline. During the
    grace period, the facilitator MAY apply a final voucher supplied by the
    server when it has a valid cooperative authorization; afterward the normal
@@ -1714,7 +1738,9 @@ Standard x402 codes apply. The facilitator reports verification failures in
 - **Facilitator rent recovery.** Because the facilitator is channel `payee`, it
   can run `settle_and_seal` with `has_voucher = 0`, then `distribute` and
   `reclaim`, without client or server cooperation. Abandoned channels cannot
-  permanently lock sponsored rent.
+  permanently lock sponsored rent. The idle window that triggers this is
+  published as `extra.maxIdleSecs`, so the forfeiture it implies is a known,
+  bounded term rather than an opaque facilitator policy.
 - **Facilitator early-close exposure.** Closing before the latest voucher is
   claimed freezes the onchain watermark and returns the remainder to the
   client. The server MUST bound its exposure by claiming promptly and SHOULD

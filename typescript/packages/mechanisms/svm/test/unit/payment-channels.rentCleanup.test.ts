@@ -14,6 +14,7 @@ import {
 import { SEAL_DISCRIMINATOR } from "../../src/payment-channels/generated/instructions/seal";
 import { OPEN_SLOT_WINDOW } from "../../src/payment-channels/open";
 import {
+  DEFAULT_MAX_IDLE_SECS,
   MAX_SAFE_RECLAIMS_PER_TX,
   PaymentChannelRentCleanupManager,
 } from "../../src/payment-channels/rentCleanup";
@@ -225,11 +226,86 @@ describe("UptoSvmRentCleanupManager — cleanup", () => {
       tokenProgram: overrides.tokenProgram ?? TOKEN_PROGRAM_ADDRESS,
       firstSeenAt: overrides.firstSeenAt ?? Date.now() - 7_200_000,
       expiresAt: overrides.expiresAt ?? FAR_FUTURE,
+      lastActivityAt: overrides.lastActivityAt ?? overrides.firstSeenAt ?? Date.now() - 7_200_000,
       network: overrides.network ?? NETWORK,
     };
     await storage.upsert(record);
     return record;
   }
+
+  // Batch-settlement channels record `expiresAt = 0` (non-expiring vouchers),
+  // so abandonment is governed by the advertised idle window instead.
+  describe("non-expiring channels and the idle window", () => {
+    const DAY_MS = 86_400_000;
+
+    it("keeps an Open channel with recent lifecycle activity", async () => {
+      const record = await seed({
+        firstSeenAt: Date.now() - 30 * DAY_MS,
+        lastActivityAt: Date.now() - DAY_MS,
+        expiresAt: 0,
+      });
+      fetchMaybeChannelMock.mockResolvedValue(channelAccount({ status: ChannelStatus.Open }));
+
+      const onClose = vi.fn();
+      await manager.cleanup({ onClose });
+      expect(onClose).not.toHaveBeenCalled();
+      expect(submitSettleMock).not.toHaveBeenCalled();
+      expect(await storage.get(record.channelId)).toBeDefined();
+    });
+
+    it("abandon-closes an Open channel idle for the default window", async () => {
+      const record = await seed({
+        firstSeenAt: Date.now() - 30 * DAY_MS,
+        lastActivityAt: Date.now() - (DEFAULT_MAX_IDLE_SECS * 1_000 + DAY_MS),
+        expiresAt: 0,
+      });
+      fetchMaybeChannelMock
+        .mockResolvedValueOnce(channelAccount({ status: ChannelStatus.Open }))
+        .mockResolvedValueOnce({ exists: false });
+
+      const onClose = vi.fn();
+      await manager.cleanup({ onClose });
+      expect(onClose).toHaveBeenCalledWith(
+        expect.objectContaining({ channelId: record.channelId, action: "abandon_close" }),
+      );
+      expect(submitSettleMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("honours a per-pass idle window and a zero window disables idle cleanup", async () => {
+      await seed({
+        firstSeenAt: Date.now() - 30 * DAY_MS,
+        lastActivityAt: Date.now() - 2 * DAY_MS,
+        expiresAt: 0,
+      });
+      fetchMaybeChannelMock.mockResolvedValue(channelAccount({ status: ChannelStatus.Open }));
+
+      await manager.cleanup({ maxIdleSecs: 0 });
+      expect(submitSettleMock).not.toHaveBeenCalled();
+
+      fetchMaybeChannelMock
+        .mockReset()
+        .mockResolvedValueOnce(channelAccount({ status: ChannelStatus.Open }))
+        .mockResolvedValueOnce({ exists: false });
+      const onClose = vi.fn();
+      await manager.cleanup({ maxIdleSecs: 86_400, onClose });
+      expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ action: "abandon_close" }));
+    });
+
+    it("falls back to firstSeenAt when a record predates activity tracking", async () => {
+      await seed({
+        firstSeenAt: Date.now() - (DEFAULT_MAX_IDLE_SECS * 1_000 + DAY_MS),
+        lastActivityAt: 0,
+        expiresAt: 0,
+      });
+      fetchMaybeChannelMock
+        .mockResolvedValueOnce(channelAccount({ status: ChannelStatus.Open }))
+        .mockResolvedValueOnce({ exists: false });
+
+      const onClose = vi.fn();
+      await manager.cleanup({ onClose });
+      expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ action: "abandon_close" }));
+    });
+  });
 
   it("does not abandon-close Open channels before expiry plus grace", async () => {
     const nowSecs = Math.floor(Date.now() / 1_000);

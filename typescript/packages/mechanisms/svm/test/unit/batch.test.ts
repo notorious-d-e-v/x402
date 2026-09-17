@@ -1157,8 +1157,46 @@ describe("batch-settlement SVM", () => {
       const facilitator = new BatchFacilitatorScheme(toFacilitatorSvmSigner(feePayer));
       expect(facilitator.getExtra(SOLANA_DEVNET_CAIP2)).toEqual({
         feePayer: feePayer.address,
+        maxIdleSecs: 604_800,
       });
       expect(facilitator.getSigners(SOLANA_DEVNET_CAIP2)).toEqual([feePayer.address]);
+    });
+
+    it("advertises the configured idle window and omits a disabled one", () => {
+      const tuned = new BatchFacilitatorScheme(toFacilitatorSvmSigner(feePayer), {
+        maxIdleSecs: 3_600,
+      });
+      expect(tuned.getExtra(SOLANA_DEVNET_CAIP2)).toMatchObject({ maxIdleSecs: 3_600 });
+      const disabled = new BatchFacilitatorScheme(toFacilitatorSvmSigner(feePayer), {
+        maxIdleSecs: 0,
+      });
+      expect(disabled.getExtra(SOLANA_DEVNET_CAIP2)).toEqual({ feePayer: feePayer.address });
+      expect(
+        () => new BatchFacilitatorScheme(toFacilitatorSvmSigner(feePayer), { maxIdleSecs: -1 }),
+      ).toThrow(/maxIdleSecs/);
+    });
+
+    it("copies the facilitator's idle window into the challenge", async () => {
+      const server = new BatchServerScheme({ store: new MemoryChannelStore() });
+      const enhanced = await server.enhancePaymentRequirements(
+        {
+          amount: "1000",
+          asset: USDC_DEVNET_ADDRESS,
+          extra: {},
+          maxTimeoutSeconds: 300,
+          network: SOLANA_DEVNET_CAIP2,
+          payTo: feePayer.address,
+          scheme: "batch-settlement",
+        },
+        {
+          extra: { feePayer: feePayer.address, maxIdleSecs: 604_800 },
+          network: SOLANA_DEVNET_CAIP2,
+          scheme: "batch-settlement",
+          x402Version: 2,
+        },
+        [],
+      );
+      expect(enhanced.extra).toMatchObject({ feePayer: feePayer.address, maxIdleSecs: 604_800 });
     });
 
     it("rejects vouchers with a nonzero expiry", async () => {

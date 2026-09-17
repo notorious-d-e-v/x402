@@ -9,6 +9,7 @@
 
 import { address } from "@solana/kit";
 import { createRpcClient } from "../../utils";
+import type { ChannelRpc } from "../../payment-channels/facilitator";
 import { getChannelDecoder } from "../../payment-channels/generated/accounts/channel";
 import { PAYMENT_CHANNELS_PROGRAM_ID } from "../../payment-channels/onchain";
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
@@ -41,8 +42,10 @@ export interface BatchChannelManagerConfig {
   requirements: PaymentRequirements;
   /** Channels per claim transaction. Defaults to the spec's four. */
   maxChannelsPerBatch?: number | undefined;
-  /** RPC used to reconcile paid state after a sweep response. */
+  /** RPC URL used to reconcile paid state after a sweep response, when no `rpc` is injected. */
   rpcUrl?: string | undefined;
+  /** Injected RPC client, so the worker shares the server's client instead of building its own. */
+  rpc?: ChannelRpc | undefined;
   /** Optional confirmed channel reader for custom transports; never estimate from the response amount. */
   readPayoutWatermark?: ((channelId: string) => Promise<bigint | undefined>) | undefined;
   /** Reports a pass that failed, so an operator can see it. */
@@ -297,7 +300,9 @@ export class BatchChannelManager {
    */
   private async readPayoutWatermark(channelId: string): Promise<bigint | undefined> {
     if (this.config.readPayoutWatermark) return this.config.readPayoutWatermark(channelId);
-    const account = await createRpcClient(this.config.requirements.network, this.config.rpcUrl)
+    const rpc =
+      this.config.rpc ?? createRpcClient(this.config.requirements.network, this.config.rpcUrl);
+    const account = await rpc
       .getAccountInfo(address(channelId), { commitment: "confirmed", encoding: "base64" })
       .send();
     if (!account.value) return undefined;
