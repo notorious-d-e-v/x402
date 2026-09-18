@@ -430,16 +430,14 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     if (completed) return claimResponse(prepared, requirements.network, completed, true);
 
     // A completed replay must not re-register a channel already reclaimed by cleanup.
-    await Promise.all(
-      prepared.map(item =>
-        this.trackChannel({
-          channelId: item.channelId,
-          expiresAt: item.expiresAt,
-          network: requirements.network,
-          payTo: item.payTo,
-          tokenProgram: item.tokenProgram,
-        }),
-      ),
+    await this.trackChannels(
+      prepared.map(item => ({
+        channelId: item.channelId,
+        expiresAt: item.expiresAt,
+        network: requirements.network,
+        payTo: item.payTo,
+        tokenProgram: item.tokenProgram,
+      })),
     );
 
     const pending = await this.pendingStore.get(claimKey);
@@ -1942,6 +1940,16 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
 
   private trackChannel(record: Omit<PaymentChannelRecord, "firstSeenAt">): Promise<void> {
     return this.channelStorage.upsert({ ...record, firstSeenAt: Date.now() });
+  }
+
+  private trackChannels(
+    records: readonly Omit<PaymentChannelRecord, "firstSeenAt">[],
+  ): Promise<void> {
+    if (!this.channelStorage.upsertMany) {
+      return Promise.all(records.map(record => this.trackChannel(record))).then(() => undefined);
+    }
+    const firstSeenAt = Date.now();
+    return this.channelStorage.upsertMany(records.map(record => ({ ...record, firstSeenAt })));
   }
 
   private verifyFailure(reason: string, payer: string, message?: string): VerifyResponse {

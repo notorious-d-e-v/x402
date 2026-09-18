@@ -31,6 +31,12 @@ export interface PaymentChannelStorage {
    */
   list(): Promise<PaymentChannelRecord[]>;
   upsert(record: PaymentChannelRecord): Promise<void>;
+  /**
+   * Persist several lifecycle records as one storage operation when supported.
+   * Facilitator claims contain multiple channels and storage adapters may use
+   * this hook to avoid acquiring the same database lock once per channel.
+   */
+  upsertMany?(records: readonly PaymentChannelRecord[]): Promise<void>;
   delete(channelId: string): Promise<void>;
 }
 
