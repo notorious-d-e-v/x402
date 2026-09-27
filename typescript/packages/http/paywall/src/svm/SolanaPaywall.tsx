@@ -50,6 +50,7 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
   }
 
   const network = firstRequirement.network;
+  const rpcUrl = x402.rpcUrls?.[network];
   const chainName = getNetworkDisplayName(network);
   const tokenName = (firstRequirement.extra?.name as string) || "USDC";
   const testnet = isTestnetNetwork(network);
@@ -61,6 +62,7 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
     useSolanaBalance({
       activeAccount,
       paymentRequired,
+      rpcUrl,
       onStatus: setStatus,
     });
 
@@ -186,7 +188,7 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
 
       const client = new x402Client();
       client.setSpendControls(false); // UI already confirms
-      client.register("solana:*", new ExactSvmScheme(walletSigner));
+      client.register("solana:*", new ExactSvmScheme(walletSigner, { rpcUrl }));
 
       const paymentPayload = await client.createPaymentPayload(paymentRequired);
 
@@ -218,6 +220,7 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
     refreshBalance,
     chainName,
     paymentRequired,
+    rpcUrl,
     onSuccessfulResponse,
   ]);
 
