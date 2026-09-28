@@ -5,7 +5,7 @@ import type { WalletWithSolanaFeatures } from "@solana/wallet-standard-features"
 import { ExactSvmScheme } from "@x402/svm/exact/client";
 import { x402Client } from "@x402/core/client";
 import { encodePaymentSignatureHeader } from "@x402/core/http";
-import type { PaymentRequired } from "@x402/core/types";
+import type { Network, PaymentRequired } from "@x402/core/types";
 
 import { Spinner } from "./Spinner";
 import { getNetworkDisplayName, isTestnetNetwork, SOLANA_NETWORK_REFS } from "../paywallUtils";
@@ -188,7 +188,14 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
 
       const client = new x402Client();
       client.setSpendControls(false); // UI already confirms
-      client.register("solana:*", new ExactSvmScheme(walletSigner, { rpcUrl }));
+      client.register("solana:*", new ExactSvmScheme(walletSigner));
+      // Exact network matches take precedence over the wildcard, so each
+      // configured network gets its own RPC whichever requirement is selected.
+      for (const [rpcNetwork, url] of Object.entries(x402.rpcUrls ?? {})) {
+        if (rpcNetwork.startsWith("solana:")) {
+          client.register(rpcNetwork as Network, new ExactSvmScheme(walletSigner, { rpcUrl: url }));
+        }
+      }
 
       const paymentPayload = await client.createPaymentPayload(paymentRequired);
 
@@ -220,7 +227,6 @@ export function SolanaPaywall({ paymentRequired, onSuccessfulResponse }: SolanaP
     refreshBalance,
     chainName,
     paymentRequired,
-    rpcUrl,
     onSuccessfulResponse,
   ]);
 
