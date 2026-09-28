@@ -167,7 +167,7 @@ app.use(paymentMiddleware(routes, resourceServer, {
 }));
 ```
 
-`@x402/paywall` is imported at request time rather than bundled, so deployments that ship without `node_modules` (edge runtimes, Workers, standalone builds) serve the basic HTML. Pass a paywall explicitly there.
+`@x402/paywall` is imported by `@x402/core` at request time rather than bundled, so deployments that ship without `node_modules` (edge runtimes, Workers, standalone builds) and strict resolvers such as Yarn PnP serve the basic HTML. Pass a paywall explicitly there.
 
 ## Custom Network Handlers
 
