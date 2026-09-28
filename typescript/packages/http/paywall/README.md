@@ -156,8 +156,8 @@ app.use(paymentMiddleware(
 ### Automatic Detection
 
 If you don't provide a custom paywall, `@x402/core` automatically:
-1. Tries to load `@x402/paywall` if installed, with the EVM, Solana and Algorand handlers
-2. Falls back to basic HTML if not installed, or if no handler supports the route's networks
+1. Tries to load `@x402/paywall` if installed, and renders its EVM, Solana or Algorand paywall
+2. Falls back to basic HTML if not installed, or if the route's first payment option isn't an `exact` payment on one of those networks
 
 ```typescript
 // Simple usage - auto-detects @x402/paywall

@@ -3,6 +3,7 @@ import {
   x402HTTPResourceServer,
   HTTPAdapter,
   PaywallProvider,
+  RouteConfig,
 } from "../../../src/http/x402HTTPResourceServer";
 import { x402ResourceServer } from "../../../src/server/x402ResourceServer";
 import {
@@ -10,32 +11,27 @@ import {
   MockSchemeNetworkServer,
   buildSupportedResponse,
 } from "../../mocks";
-import { Network, Price } from "../../../src/types";
+import { Network, PaymentRequirements, Price } from "../../../src/types";
 
 // Stands in for an installed @x402/paywall. Without this mock the package is
 // not resolvable from core, which the fallback tests in
 // x402HTTPResourceService.test.ts rely on.
 const paywall = vi.hoisted(() => {
-  const generateHtml = vi.fn();
-  const builder = {
-    withNetwork: vi.fn(() => builder),
-    build: vi.fn(() => ({ generateHtml })),
-  };
+  const handler = (prefix: string) => ({
+    supports: (requirement: PaymentRequirements) => requirement.network.startsWith(prefix),
+    generateHtml: vi.fn(() => `<html>${prefix} paywall</html>`),
+  });
   return {
-    generateHtml,
-    builder,
-    module: {
-      createPaywall: vi.fn(() => builder),
-      evmPaywall: { network: "evm" },
-      svmPaywall: { network: "svm" },
-      avmPaywall: { network: "avm" },
-    },
+    evmPaywall: handler("eip155:"),
+    svmPaywall: handler("solana:"),
+    avmPaywall: handler("algorand:"),
   };
 });
 
-vi.mock("@x402/paywall", () => paywall.module);
+vi.mock("@x402/paywall", () => paywall);
 
-const network = "eip155:8453" as Network;
+const evm = "eip155:8453" as Network;
+const stellar = "stellar:testnet" as Network;
 
 const browserAdapter: HTTPAdapter = {
   getHeader: () => undefined,
@@ -46,34 +42,54 @@ const browserAdapter: HTTPAdapter = {
   getUserAgent: () => "Mozilla/5.0",
 };
 
+/**
+ * Builds a payment option for the protected route.
+ *
+ * @param scheme - Payment scheme
+ * @param network - Payment network
+ * @returns Route payment option
+ */
+function option(scheme: string, network: Network) {
+  return { scheme, payTo: "0xabc", price: "$1.00" as Price, network };
+}
+
 describe("x402HTTPResourceServer paywall", () => {
-  let httpServer: x402HTTPResourceServer;
+  let resourceServer: x402ResourceServer;
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    paywall.generateHtml.mockReturnValue("<html>@x402/paywall</html>");
 
-    const resourceServer = new x402ResourceServer(
-      new MockFacilitatorClient(
-        buildSupportedResponse({ kinds: [{ x402Version: 2, scheme: "exact", network }] }),
-      ),
+    const kinds = [
+      { x402Version: 2, scheme: "exact", network: evm },
+      { x402Version: 2, scheme: "upto", network: evm },
+      { x402Version: 2, scheme: "exact", network: stellar },
+    ];
+    resourceServer = new x402ResourceServer(
+      new MockFacilitatorClient(buildSupportedResponse({ kinds })),
     );
-    resourceServer.register(network, new MockSchemeNetworkServer("exact"));
+    for (const { scheme, network } of kinds) {
+      resourceServer.register(network, new MockSchemeNetworkServer(scheme));
+    }
     await resourceServer.initialize();
-
-    httpServer = new x402HTTPResourceServer(resourceServer, {
-      "/api/protected": {
-        accepts: { scheme: "exact", payTo: "0xabc", price: "$1.00" as Price, network },
-      },
-    });
   });
 
   /**
    * Sends an unpaid browser request and returns the HTML body.
    *
+   * @param accepts - Payment options for the protected route
+   * @param provider - Optional paywall provider to register
    * @returns The paywall HTML
    */
-  async function renderPaywall(): Promise<string> {
+  async function renderPaywall(
+    accepts: RouteConfig["accepts"],
+    provider?: PaywallProvider,
+  ): Promise<string> {
+    const httpServer = new x402HTTPResourceServer(resourceServer, {
+      "/api/protected": { accepts },
+    });
+    if (provider) {
+      httpServer.registerPaywallProvider(provider);
+    }
     const result = await httpServer.processHTTPRequest(
       { adapter: browserAdapter, path: "/api/protected", method: "GET" },
       { appName: "Test App", testnet: true },
@@ -85,38 +101,33 @@ describe("x402HTTPResourceServer paywall", () => {
   }
 
   it("renders @x402/paywall when it is installed and no provider is registered", async () => {
-    const html = await renderPaywall();
+    const html = await renderPaywall(option("exact", evm));
 
-    expect(html).toBe("<html>@x402/paywall</html>");
-    expect(paywall.builder.withNetwork.mock.calls).toEqual([
-      [paywall.module.evmPaywall],
-      [paywall.module.svmPaywall],
-      [paywall.module.avmPaywall],
-    ]);
-    expect(paywall.generateHtml).toHaveBeenCalledWith(
-      expect.objectContaining({
-        accepts: [expect.objectContaining({ scheme: "exact", network, payTo: "0xabc" })],
-      }),
+    expect(html).toBe("<html>eip155: paywall</html>");
+    const requirement = expect.objectContaining({ scheme: "exact", network: evm });
+    expect(paywall.evmPaywall.generateHtml).toHaveBeenCalledWith(
+      requirement,
+      expect.objectContaining({ accepts: [requirement] }),
       { appName: "Test App", testnet: true },
     );
   });
 
   it("prefers a registered paywall provider over @x402/paywall", async () => {
-    const provider: PaywallProvider = { generateHtml: () => "<html>custom</html>" };
-    httpServer.registerPaywallProvider(provider);
-
-    expect(await renderPaywall()).toBe("<html>custom</html>");
-    expect(paywall.module.createPaywall).not.toHaveBeenCalled();
-  });
-
-  it("falls back to the static page when @x402/paywall has no handler for the network", async () => {
-    paywall.generateHtml.mockImplementation(() => {
-      throw new Error("No paywall handler supports networks");
+    const html = await renderPaywall(option("exact", evm), {
+      generateHtml: () => "<html>custom</html>",
     });
 
-    const html = await renderPaywall();
+    expect(html).toBe("<html>custom</html>");
+    expect(paywall.evmPaywall.generateHtml).not.toHaveBeenCalled();
+  });
 
-    expect(html).toMatch(/Payment Required/);
+  it.each([
+    ["the first option's network has no handler", [option("exact", stellar), option("exact", evm)]],
+    ["the first option's scheme is not exact", [option("upto", evm), option("exact", evm)]],
+  ])("serves the static page when %s", async (_, accepts) => {
+    const html = await renderPaywall(accepts);
+
     expect(html).toContain("install <code>@x402/paywall</code>");
+    expect(paywall.evmPaywall.generateHtml).not.toHaveBeenCalled();
   });
 });

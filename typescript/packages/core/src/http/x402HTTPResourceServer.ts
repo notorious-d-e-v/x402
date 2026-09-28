@@ -405,6 +405,18 @@ const FALLBACK_PAYWALL_HTML = `<!DOCTYPE html>
 const PAYWALL_PACKAGE = "@x402/paywall";
 
 /**
+ * Network handler exported by @x402/paywall (its PaywallNetworkHandler)
+ */
+interface PaywallNetworkHandler {
+  supports(requirement: PaymentRequirements): boolean;
+  generateHtml(
+    requirement: PaymentRequirements,
+    paymentRequired: PaymentRequired,
+    config: PaywallConfig,
+  ): string;
+}
+
+/**
  * HTTP-enhanced x402 resource server
  * Provides framework-agnostic HTTP protocol handling
  */
@@ -413,8 +425,8 @@ export class x402HTTPResourceServer {
   private compiledRoutes: CompiledRoute[] = [];
   private routesConfig: RoutesConfig;
   private paywallProvider?: PaywallProvider;
-  private defaultPaywallProvider?: PaywallProvider;
-  private defaultPaywallProviderLoad?: Promise<void>;
+  private defaultPaywallHandlers?: PaywallNetworkHandler[];
+  private defaultPaywallLoad?: Promise<void>;
   private protectedRequestHooks: ProtectedRequestHook[] = [];
   private warnedMissingBeforeHandlerSettlement = false;
 
@@ -612,7 +624,7 @@ export class x402HTTPResourceServer {
 
       const isWebBrowser = this.isWebBrowser(adapter);
       if (isWebBrowser && !this.paywallProvider && !routeConfig.customPaywallHtml) {
-        await this.loadDefaultPaywallProvider();
+        await this.loadDefaultPaywallHandlers();
       }
 
       return {
@@ -1477,38 +1489,36 @@ export class x402HTTPResourceServer {
       return this.paywallProvider.generateHtml(paymentRequired, paywallConfig);
     }
 
-    // Use @x402/paywall if installed (see loadDefaultPaywallProvider)
-    if (this.defaultPaywallProvider) {
-      try {
-        return this.defaultPaywallProvider.generateHtml(paymentRequired, paywallConfig);
-      } catch {
-        // No @x402/paywall handler for these networks, fall back to basic HTML
-      }
+    // Use @x402/paywall if installed (see loadDefaultPaywallHandlers). Its UIs
+    // render accepts[0] and only pay with the exact scheme.
+    const [requirement] = paymentRequired.accepts;
+    const handler =
+      requirement?.scheme === "exact"
+        ? this.defaultPaywallHandlers?.find(h => h.supports(requirement))
+        : undefined;
+    if (handler) {
+      return handler.generateHtml(requirement, paymentRequired, paywallConfig ?? {});
     }
 
     return FALLBACK_PAYWALL_HTML;
   }
 
   /**
-   * Load @x402/paywall, if installed, as the default paywall provider.
+   * Load the @x402/paywall network handlers, if the package is installed.
    * Resolved at runtime so core neither depends on nor bundles it.
    *
    * @returns Promise that resolves once loading has been attempted
    */
-  private loadDefaultPaywallProvider(): Promise<void> {
-    if (!this.defaultPaywallProviderLoad) {
-      this.defaultPaywallProviderLoad = import(/* webpackIgnore: true */ PAYWALL_PACKAGE)
-        .then(({ createPaywall, evmPaywall, svmPaywall, avmPaywall }) => {
-          this.defaultPaywallProvider = createPaywall()
-            .withNetwork(evmPaywall)
-            .withNetwork(svmPaywall)
-            .withNetwork(avmPaywall)
-            .build();
+  private loadDefaultPaywallHandlers(): Promise<void> {
+    if (!this.defaultPaywallLoad) {
+      this.defaultPaywallLoad = import(/* webpackIgnore: true */ PAYWALL_PACKAGE)
+        .then(({ evmPaywall, svmPaywall, avmPaywall }) => {
+          this.defaultPaywallHandlers = [evmPaywall, svmPaywall, avmPaywall];
         })
         .catch(() => {
           // @x402/paywall not installed, fall back to basic HTML
         });
     }
-    return this.defaultPaywallProviderLoad;
+    return this.defaultPaywallLoad;
   }
 }
