@@ -155,17 +155,19 @@ app.use(paymentMiddleware(
 
 ### Automatic Detection
 
-If you provide `paywallConfig` without a custom paywall, `@x402/core` automatically:
-1. Tries to load `@x402/paywall` if installed
-2. Falls back to basic HTML if not installed
+If you don't provide a custom paywall, `@x402/core` automatically:
+1. Tries to load `@x402/paywall` if installed, with the EVM, Solana and Algorand handlers
+2. Falls back to basic HTML if not installed, or if no handler supports the route's networks
 
 ```typescript
 // Simple usage - auto-detects @x402/paywall
-app.use(paymentMiddleware(routes, facilitators, schemes, {
+app.use(paymentMiddleware(routes, resourceServer, {
   appName: 'My App',
   testnet: true
 }));
 ```
+
+`@x402/paywall` is imported at request time rather than bundled, so deployments that ship without `node_modules` (edge runtimes, Workers, standalone builds) serve the basic HTML. Pass a paywall explicitly there.
 
 ## Custom Network Handlers
 

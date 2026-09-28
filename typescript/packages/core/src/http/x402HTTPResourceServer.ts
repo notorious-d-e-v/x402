@@ -400,6 +400,10 @@ const FALLBACK_PAYWALL_HTML = `<!DOCTYPE html>
   </body>
 </html>`;
 
+// Optional package, imported by a non-literal specifier so TypeScript and
+// bundlers do not try to resolve it from core.
+const PAYWALL_PACKAGE = "@x402/paywall";
+
 /**
  * HTTP-enhanced x402 resource server
  * Provides framework-agnostic HTTP protocol handling
@@ -409,6 +413,8 @@ export class x402HTTPResourceServer {
   private compiledRoutes: CompiledRoute[] = [];
   private routesConfig: RoutesConfig;
   private paywallProvider?: PaywallProvider;
+  private defaultPaywallProvider?: PaywallProvider;
+  private defaultPaywallProviderLoad?: Promise<void>;
   private protectedRequestHooks: ProtectedRequestHook[] = [];
   private warnedMissingBeforeHandlerSettlement = false;
 
@@ -604,11 +610,16 @@ export class x402HTTPResourceServer {
         ? await routeConfig.unpaidResponseBody(enrichedContext)
         : undefined;
 
+      const isWebBrowser = this.isWebBrowser(adapter);
+      if (isWebBrowser && !this.paywallProvider && !routeConfig.customPaywallHtml) {
+        await this.loadDefaultPaywallProvider();
+      }
+
       return {
         type: "payment-error",
         response: this.createHTTPResponse(
           paymentRequired,
-          this.isWebBrowser(adapter),
+          isWebBrowser,
           paywallConfig,
           routeConfig.customPaywallHtml,
           unpaidBody,
@@ -1466,45 +1477,38 @@ export class x402HTTPResourceServer {
       return this.paywallProvider.generateHtml(paymentRequired, paywallConfig);
     }
 
-    // Try to use @x402/paywall if available (optional dependency)
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const paywall = require("@x402/paywall");
-      const displayAmount = this.getDisplayAmount(paymentRequired);
-      const resource = paymentRequired.resource;
-
-      return paywall.getPaywallHtml({
-        amount: displayAmount,
-        paymentRequired,
-        currentUrl: resource?.url || paywallConfig?.currentUrl || "",
-        testnet: paywallConfig?.testnet ?? true,
-        appName: paywallConfig?.appName,
-        appLogo: paywallConfig?.appLogo,
-        sessionTokenEndpoint: paywallConfig?.sessionTokenEndpoint,
-      });
-    } catch {
-      // @x402/paywall not installed, fall back to basic HTML
+    // Use @x402/paywall if installed (see loadDefaultPaywallProvider)
+    if (this.defaultPaywallProvider) {
+      try {
+        return this.defaultPaywallProvider.generateHtml(paymentRequired, paywallConfig);
+      } catch {
+        // No @x402/paywall handler for these networks, fall back to basic HTML
+      }
     }
 
     return FALLBACK_PAYWALL_HTML;
   }
 
   /**
-   * Extract display amount from payment requirements.
-   * Uses the registered scheme's decimal precision for the asset, falling back to 6.
+   * Load @x402/paywall, if installed, as the default paywall provider.
+   * Resolved at runtime so core neither depends on nor bundles it.
    *
-   * @param paymentRequired - The payment required object
-   * @returns The display amount in decimal format
+   * @returns Promise that resolves once loading has been attempted
    */
-  private getDisplayAmount(paymentRequired: PaymentRequired): number {
-    const accepts = paymentRequired.accepts;
-    if (accepts && accepts.length > 0) {
-      const firstReq = accepts[0];
-      if ("amount" in firstReq) {
-        const decimals = this.ResourceServer.getAssetDecimalsForRequirements(firstReq);
-        return parseFloat(firstReq.amount) / 10 ** decimals;
-      }
+  private loadDefaultPaywallProvider(): Promise<void> {
+    if (!this.defaultPaywallProviderLoad) {
+      this.defaultPaywallProviderLoad = import(/* webpackIgnore: true */ PAYWALL_PACKAGE)
+        .then(({ createPaywall, evmPaywall, svmPaywall, avmPaywall }) => {
+          this.defaultPaywallProvider = createPaywall()
+            .withNetwork(evmPaywall)
+            .withNetwork(svmPaywall)
+            .withNetwork(avmPaywall)
+            .build();
+        })
+        .catch(() => {
+          // @x402/paywall not installed, fall back to basic HTML
+        });
     }
-    return 0;
+    return this.defaultPaywallProviderLoad;
   }
 }
