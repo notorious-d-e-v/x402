@@ -191,3 +191,17 @@ def test_server_default_paywall_injects_rpc_urls() -> None:
         _make_svm_payment_required(), PaywallConfig(rpc_urls=urls), None
     )
     assert _injected_config(html)["rpcUrls"] == urls
+
+
+def test_server_default_paywall_injects_faucet_urls() -> None:
+    """The built-in template path honors faucet_urls like the paywall handlers do."""
+    from x402.http.types import PaywallConfig
+    from x402.http.x402_http_server_base import x402HTTPServerBase
+    from x402.server import x402ResourceServerSync
+
+    urls = {"eip155:84532": "https://example.com/base-faucet"}
+    server = x402HTTPServerBase(x402ResourceServerSync(), {})
+    html = server._generate_paywall_html(
+        _make_evm_payment_required(), PaywallConfig(faucet_urls=urls), None
+    )
+    assert _injected_config(html)["faucetUrls"] == urls
