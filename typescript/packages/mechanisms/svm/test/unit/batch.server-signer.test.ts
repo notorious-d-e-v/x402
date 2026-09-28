@@ -434,6 +434,31 @@ describe("batch server voucher signer boundaries", () => {
       chargedCumulativeAmount: 1_000n,
       signedMaxClaimable: 1_000n,
     });
+    const depositReplayPayment = { ...depositPayment, payload: { ...serverDeposit } };
+    const depositReplayContext = { ...depositContext, paymentPayload: depositReplayPayment };
+    await expect(server.schemeHooks.onBeforeVerify!(depositReplayContext)).resolves.toBeUndefined();
+    await expect(
+      server.schemeHooks.onAfterVerify!({
+        ...depositReplayContext,
+        result: { isValid: true, payer: payer.address },
+      }),
+    ).resolves.toMatchObject({ skipHandler: true });
+    await expect(
+      server.schemeHooks.onBeforeSettle!({
+        ...depositReplayContext,
+        phase: "after-handler",
+      }),
+    ).resolves.toMatchObject({
+      skip: true,
+      result: {
+        extra: {
+          chargedAmount: "1000",
+          commitmentId: `${channelId}:1000`,
+        },
+        success: true,
+        transaction: "open-signature",
+      },
+    });
 
     const authorizationPayment: PaymentPayload = {
       accepted: requirements(),
@@ -487,6 +512,10 @@ describe("batch server voucher signer boundaries", () => {
     await expect(operationStore.get(channelId, "request-2")).resolves.toMatchObject({
       actual: 400n,
       cumulative: 1_400n,
+      response: {
+        extra: { chargedAmount: "400", commitmentId: `${channelId}:1400` },
+        success: true,
+      },
       status: "completed",
     });
 
@@ -527,17 +556,46 @@ describe("batch server voucher signer boundaries", () => {
       payload: { ...authorizationPayment.payload },
     } as PaymentPayload;
     const replayContext = { ...authorizationContext, paymentPayload: replayPayment };
-    await expect(server.schemeHooks.onBeforeVerify!(replayContext)).resolves.toMatchObject({
-      skip: true,
+    const restartedServer = new BatchServerScheme({
+      receiverAuthorizer,
+      operator,
+      operationStore,
+      store,
     });
-    const replayVerified = await server.schemeHooks.onAfterVerify!({
+    await expect(restartedServer.schemeHooks.onBeforeVerify!(replayContext)).resolves.toMatchObject(
+      {
+        skip: true,
+      },
+    );
+    const replayVerified = await restartedServer.schemeHooks.onAfterVerify!({
       ...replayContext,
       result: { isValid: true, payer: payer.address },
     });
-    expect(replayVerified).toMatchObject({ abort: true, reason: "duplicate_settlement" });
+    expect(replayVerified).toMatchObject({ skipHandler: true });
+    await expect(
+      restartedServer.schemeHooks.onBeforeSettle!({
+        ...replayContext,
+        // The original measured charge wins even if a retrying handler would
+        // have reported a different amount.
+        requirements: { ...replayContext.requirements, amount: "999" },
+        phase: "after-handler",
+      }),
+    ).resolves.toMatchObject({
+      skip: true,
+      result: {
+        extra: {
+          chargedAmount: "400",
+          channelState: { chargedCumulativeAmount: "1400" },
+          commitmentId: `${channelId}:1400`,
+          voucher: receipt,
+        },
+        success: true,
+      },
+    });
+    expect(await store.get(channelId)).toMatchObject({ chargedCumulativeAmount: 1_400n });
   });
 
-  it("reserves concurrent ceilings, completes out of order, and rejects reused ids", async () => {
+  it("reserves concurrent ceilings, completes out of order, and replays completed ids", async () => {
     const store = new MemoryChannelStore();
     const operationStore = new MemoryBatchOperationStore();
     const server = new BatchServerScheme({ receiverAuthorizer, operator, operationStore, store });
@@ -674,7 +732,24 @@ describe("batch server voucher signer boundaries", () => {
     });
 
     const replay = await reserve(replacementPayment, exhaustedRequirements);
-    expect(replay.result).toMatchObject({ abort: true, reason: "duplicate_settlement" });
+    expect(replay.result).toMatchObject({ skipHandler: true });
+    await expect(
+      server.schemeHooks.onBeforeSettle!({
+        ...replay.context,
+        requirements: exhaustedRequirements,
+        phase: "after-handler",
+      }),
+    ).resolves.toMatchObject({
+      skip: true,
+      result: {
+        extra: {
+          chargedAmount: "500",
+          channelState: { chargedCumulativeAmount: "1500" },
+          commitmentId: `${channelId}:1500`,
+        },
+        success: true,
+      },
+    });
   });
 
   it("enriches server-mode refunds with the stored operator voucher", async () => {

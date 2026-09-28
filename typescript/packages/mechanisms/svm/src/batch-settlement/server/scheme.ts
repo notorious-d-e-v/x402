@@ -60,7 +60,11 @@ import type {
   CloseAuthorization,
 } from "../types";
 import { BATCH_SETTLEMENT_SCHEME, isBatchPayload, proofOf } from "../types";
-import { type BatchOperationStore, MemoryBatchOperationStore } from "./operationStore";
+import {
+  type BatchOperation,
+  type BatchOperationStore,
+  MemoryBatchOperationStore,
+} from "./operationStore";
 import { BatchChannelManager, type BatchChannelManagerConfig } from "./channelManager";
 import { MemoryChannelStore } from "./storage";
 import {
@@ -111,7 +115,10 @@ export class BatchSvmScheme implements SchemeNetworkServer {
 
   private readonly store: ChannelStore;
   private readonly operationStore: BatchOperationStore;
-  private readonly requestContexts = new WeakMap<DeepReadonly<PaymentPayload>, RequestContext>();
+  private readonly requestContexts = new WeakMap<
+    DeepReadonly<PaymentPayload>,
+    RequestContext & { replay?: Extract<BatchOperation, { status: "completed" }> }
+  >();
   private readonly settlementExtras = new WeakMap<
     DeepReadonly<PaymentPayload>,
     Record<string, unknown>
@@ -724,6 +731,13 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           request.ceiling,
         );
         if (!reserved.created) {
+          if (reserved.operation.status === "completed" && reserved.operation.response) {
+            this.requestContexts.set(ctx.paymentPayload, {
+              ...request,
+              replay: reserved.operation,
+            });
+            return { skipHandler: true };
+          }
           throw new Error(CHANNEL_BUSY);
         }
         operationReserved = true;
@@ -805,6 +819,10 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     if (!isBatchPayload(raw) || raw.type === "refund") return;
 
     const request = this.requestContexts.get(ctx.paymentPayload);
+    if (request?.replay) {
+      this.requestContexts.delete(ctx.paymentPayload);
+      return { skip: true, result: request.replay.response! };
+    }
     const pendingId = request?.pendingId;
     if (!request || !pendingId) return this.abort(CHANNEL_BUSY, "missing reservation");
     const state = await this.store.get(request.channelId);
@@ -824,7 +842,12 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       if (actual > ceiling || (proof.signer === "client" && actual !== ceiling)) {
         throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
       }
-      const committed = await this.commitCharge({ ...request, pendingId }, proof, actual);
+      const committed = await this.commitCharge(
+        { ...request, pendingId },
+        proof,
+        actual,
+        ctx.requirements,
+      );
       this.requestContexts.delete(ctx.paymentPayload);
       return { skip: true, result: acceptedResponse(committed, ctx.requirements) };
     } catch (error) {
@@ -862,6 +885,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         { ...request, pendingId },
         proof,
         actual,
+        ctx.requirements,
         current => {
           const confirmed = readChannelState(ctx.result);
           return {
@@ -873,6 +897,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
             onchainSyncedAt: Date.now(),
           };
         },
+        ctx.result,
       );
       this.settlementExtras.set(
         ctx.paymentPayload,
@@ -1174,14 +1199,18 @@ export class BatchSvmScheme implements SchemeNetworkServer {
    * @param request - Request context including the reservation id
    * @param proof - Client voucher or server authorization proof
    * @param actual - Measured charge for this request
+   * @param requirements - Accepted payment requirements for the response
    * @param patch - Optional extra fields to merge after a deposit settle
+   * @param baseResponse - Facilitator response to preserve for a deposit
    * @returns Updated channel state after the commit
    */
   private async commitCharge(
     request: RequestContext & { pendingId: string },
     proof: BatchProof,
     actual: bigint,
+    requirements: PaymentRequirements,
     patch?: (current: ChannelState) => Partial<ChannelState>,
+    baseResponse?: SettleResponse,
   ): Promise<ChannelState> {
     return this.store.update(request.channelId, async current => {
       const reservation = current?.reservations?.[request.pendingId];
@@ -1189,17 +1218,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       if (actual > reservation.ceiling) throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
       const cumulative = current.chargedCumulativeAmount + actual;
       const voucher = await this.voucherForCharge(proof, request.channelId, cumulative);
-      if (request.requestId) {
-        await this.operationStore.complete({
-          actual,
-          ceiling: reservation.ceiling,
-          channelId: request.channelId,
-          cumulative,
-          requestId: request.requestId,
-          status: "completed",
-        });
-      }
-      return {
+      const next = {
         ...current,
         ...patch?.(current),
         chargedCumulativeAmount: BigInt(voucher.maxClaimableAmount),
@@ -1208,6 +1227,18 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         reservations: withoutReservation(current.reservations, request.pendingId),
         signedMaxClaimable: BigInt(voucher.maxClaimableAmount),
       };
+      if (request.requestId) {
+        await this.operationStore.complete({
+          actual,
+          ceiling: reservation.ceiling,
+          channelId: request.channelId,
+          cumulative,
+          requestId: request.requestId,
+          response: acceptedResponse(next, requirements, baseResponse),
+          status: "completed",
+        });
+      }
+      return next;
     });
   }
 
@@ -1473,16 +1504,22 @@ export class BatchSvmScheme implements SchemeNetworkServer {
  *
  * @param state - Channel state after the commit
  * @param requirements - Requirements that were settled
+ * @param base - Optional facilitator response to preserve
  * @returns Settle response with channel extras for the client
  */
-function acceptedResponse(state: ChannelState, requirements: PaymentRequirements): SettleResponse {
+function acceptedResponse(
+  state: ChannelState,
+  requirements: PaymentRequirements,
+  base?: SettleResponse,
+): SettleResponse {
   return {
+    ...base,
     success: true,
-    payer: state.payer,
-    transaction: "",
+    payer: base?.payer ?? state.payer,
+    transaction: base?.transaction ?? "",
     network: requirements.network,
-    amount: "",
-    extra: settlementExtra(state, requirements.amount),
+    amount: base?.amount ?? "",
+    extra: { ...base?.extra, ...settlementExtra(state, requirements.amount) },
   };
 }
 

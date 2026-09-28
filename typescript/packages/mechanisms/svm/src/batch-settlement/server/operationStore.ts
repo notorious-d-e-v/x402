@@ -1,3 +1,5 @@
+import type { SettleResponse } from "@x402/core/types";
+
 /** Single-use server-mode request records, separate from channel accounting. */
 
 export type BatchOperation =
@@ -14,6 +16,8 @@ export type BatchOperation =
       ceiling: bigint;
       actual: bigint;
       cumulative: bigint;
+      /** Exact payment response returned for an idempotent retry. */
+      response?: SettleResponse | undefined;
     };
 
 export interface BatchOperationStore {
