@@ -1,5 +1,6 @@
 import type { PaymentRequired } from "../types";
 import { getSvmTemplate } from "./template-loader";
+import { toScriptJson } from "../scriptJson";
 
 /**
  * Escapes a string for safe injection into JavaScript string literals
@@ -69,7 +70,7 @@ export function getSvmPaywallHtml(options: SvmPaywallOptions): string {
       appName: "${escapeString(appName || "")}",
       appLogo: "${escapeString(appLogo || "")}",
       faucetUrls: ${faucetUrls ? JSON.stringify(faucetUrls) : "undefined"},
-      rpcUrls: ${rpcUrls ? JSON.stringify(rpcUrls) : "undefined"},
+      rpcUrls: ${rpcUrls ? toScriptJson(rpcUrls) : "undefined"},
     };
     ${logOnTestnet}
   </script>`;

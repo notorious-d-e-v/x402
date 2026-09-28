@@ -286,12 +286,12 @@ describe("Network Handlers", () => {
       expect(html).toContain('appName: "App \\"Name\\""');
     });
 
-    it("injects rpcUrls as a JSON object keyed by CAIP-2 network", () => {
+    it("injects rpcUrls as a script-safe JSON object keyed by CAIP-2 network", () => {
       const html = svmPaywall.generateHtml(svmRequirement, mockPaymentRequired, {
-        rpcUrls: { [svmRequirement.network]: 'https://rpc.example/?key="k"' },
+        rpcUrls: { [svmRequirement.network]: 'https://rpc.example/?key="k"</script>' },
       });
       expect(html).toContain(
-        'rpcUrls: {"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp":"https://rpc.example/?key=\\"k\\""},',
+        'rpcUrls: {"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp":"https://rpc.example/?key=\\"k\\"\\u003c/script>"},',
       );
     });
 
