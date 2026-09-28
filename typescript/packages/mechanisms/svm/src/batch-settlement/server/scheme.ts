@@ -539,6 +539,28 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       if (state) {
         this.assertStoredConfig(state, raw.channelConfig, ctx.requirements);
       }
+      if (raw.type === "deposit" || raw.type === "authorization") {
+        const proof = proofOf(raw);
+        if (
+          proof.signer === "server" &&
+          (await this.isCompletedReplay(
+            channelId,
+            proof.authorization.requestId,
+            proof.authorization.authorizedAmount,
+          ))
+        ) {
+          this.requestContexts.set(ctx.paymentPayload, {
+            channelId,
+            proof,
+            ceiling: BigInt(proof.authorization.authorizedAmount),
+            requestId: proof.authorization.requestId,
+          });
+          return {
+            skip: true,
+            result: { isValid: true, payer: raw.channelConfig.payer, extra: { channelId } },
+          };
+        }
+      }
       if (raw.type === "deposit" && !state) {
         const extra = ctx.requirements.extra!;
         const receiverAuthorizer = extra.receiverAuthorizer;
@@ -1132,7 +1154,13 @@ export class BatchSvmScheme implements SchemeNetworkServer {
         await this.assertSignedVoucher(proof.voucher, channelId, raw.channelConfig.payerAuthorizer);
         return;
       case "server":
-        await this.assertPayerAuthorization(proof.authorization, raw, channelId, authorizedAmount);
+        await this.assertPayerAuthorization(
+          proof.authorization,
+          raw,
+          channelId,
+          authorizedAmount,
+          await this.isCompletedReplay(channelId, proof.authorization.requestId, authorizedAmount),
+        );
         return;
       default: {
         const unexpected: never = proof;
@@ -1174,12 +1202,14 @@ export class BatchSvmScheme implements SchemeNetworkServer {
    * @param raw - Parent batch payload
    * @param channelId - Expected channel id
    * @param authorizedAmount - Amount the authorization must cover
+   * @param allowExpired - Whether a completed operation may replay after proof expiry
    */
   private async assertPayerAuthorization(
     authorization: BatchAuthorization,
     raw: BatchPayload,
     channelId: string,
     authorizedAmount: string,
+    allowExpired = false,
   ): Promise<void> {
     if (
       authorization.channelId !== channelId ||
@@ -1187,10 +1217,39 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       authorization.authorizedAmount !== authorizedAmount ||
       typeof authorization.requestId !== "string" ||
       authorization.requestId.length === 0 ||
-      !(await verifyBatchAuthorization(authorization, raw.channelConfig.payerAuthorizer))
+      !(await verifyBatchAuthorization(
+        authorization,
+        raw.channelConfig.payerAuthorizer,
+        allowExpired ? 0 : undefined,
+      ))
     ) {
       throw new Error(BatchError.VOUCHER_SIGNATURE);
     }
+  }
+
+  /**
+   * Check whether a signed request already has a durable response to replay.
+   *
+   * A completed request remains safe to replay after its bearer proof expires:
+   * the original signature is still verified, while the stored operation fixes
+   * both its authorized ceiling and exact response.
+   *
+   * @param channelId - Derived channel id
+   * @param requestId - Signed request id
+   * @param authorizedAmount - Amount bound into the payer authorization
+   * @returns Whether the operation has a response eligible for replay
+   */
+  private async isCompletedReplay(
+    channelId: string,
+    requestId: string,
+    authorizedAmount: string,
+  ): Promise<boolean> {
+    const operation = await this.operationStore.get(channelId, requestId);
+    return (
+      operation?.status === "completed" &&
+      operation.response !== undefined &&
+      operation.ceiling === BigInt(authorizedAmount)
+    );
   }
 
   /**

@@ -1,6 +1,6 @@
 import { generateKeyPairSigner, getBase58Decoder } from "@solana/kit";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   encodeBatchAuthorizationMessage,
@@ -436,7 +436,9 @@ describe("batch server voucher signer boundaries", () => {
     });
     const depositReplayPayment = { ...depositPayment, payload: { ...serverDeposit } };
     const depositReplayContext = { ...depositContext, paymentPayload: depositReplayPayment };
-    await expect(server.schemeHooks.onBeforeVerify!(depositReplayContext)).resolves.toBeUndefined();
+    await expect(server.schemeHooks.onBeforeVerify!(depositReplayContext)).resolves.toMatchObject({
+      skip: true,
+    });
     await expect(
       server.schemeHooks.onAfterVerify!({
         ...depositReplayContext,
@@ -562,6 +564,8 @@ describe("batch server voucher signer boundaries", () => {
       operationStore,
       store,
     });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 7_200_000);
     await expect(restartedServer.schemeHooks.onBeforeVerify!(replayContext)).resolves.toMatchObject(
       {
         skip: true,
@@ -593,6 +597,7 @@ describe("batch server voucher signer boundaries", () => {
       },
     });
     expect(await store.get(channelId)).toMatchObject({ chargedCumulativeAmount: 1_400n });
+    vi.useRealTimers();
   });
 
   it("reserves concurrent ceilings, completes out of order, and replays completed ids", async () => {
