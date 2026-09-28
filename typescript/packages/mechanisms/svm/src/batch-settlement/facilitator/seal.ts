@@ -74,6 +74,9 @@ export interface PreparedRefund {
 
 /** Scheme internals the seal path borrows, so it can live outside the scheme file. */
 export interface SealDependencies {
+  onDistributionConfirmed?:
+    | ((response: SettleResponse, requirements: PaymentRequirements) => Promise<void>)
+    | undefined;
   pendingStore: BatchPendingSettlementStore;
   settlementCache: SettlementCache;
   resolveTerms(
@@ -121,6 +124,24 @@ export interface SealDependencies {
   ): Promise<SettleResponse | undefined>;
   trackChannel(record: Omit<PaymentChannelRecord, "firstSeenAt" | "lastActivityAt">): Promise<void>;
   nowSeconds(): number;
+}
+
+/**
+ * Notify the operator for a durable seal result, retrying the callback on replay.
+ *
+ * @param deps - Scheme internals containing the optional payout callback
+ * @param response - Confirmed seal response containing the payout amount
+ * @param requirements - Payment requirements identifying the payout recipient and asset
+ * @param intent - Close operation kind; refunds do not notify the payout callback
+ */
+async function notifySealDistribution(
+  deps: SealDependencies,
+  response: SettleResponse,
+  requirements: PaymentRequirements,
+  intent: CloseIntent,
+): Promise<void> {
+  if (intent !== "seal" || !deps.onDistributionConfirmed) return;
+  await deps.onDistributionConfirmed(response, requirements);
 }
 
 /**
@@ -185,7 +206,11 @@ export async function settleSeal(
   // Namespace from spec Phase 5: ("close", channelId, maxClaimableAmount).
   const key = `batch:${intent}:${network}:${channelId}:${cumulative}`;
   const previous = await deps.pendingStore.get(`${key}:result`);
-  if (previous) return JSON.parse(previous) as SettleResponse;
+  if (previous) {
+    const response = JSON.parse(previous) as SettleResponse;
+    await notifySealDistribution(deps, response, requirements, intent);
+    return response;
+  }
 
   const channel = await deps.fetchChannel(network, channelId);
   const requiredStatus = intent === "seal" ? ChannelStatus.Closing : ChannelStatus.Open;
@@ -257,6 +282,8 @@ export async function settleSeal(
   });
   const response =
     intent === "refund" ? { ...sealed, amount: (channel.deposit - cumulative).toString() } : sealed;
+  // Persist the confirmed response first so a callback failure can retry the
+  // same payout without reading a channel the seal may have deallocated.
   await deps.pendingStore.set(`${key}:result`, JSON.stringify(response));
   // A confirmed seal is facilitator-visible activity; cleanup will find the
   // PDA gone or Distributed and reclaim rent from there.
@@ -267,6 +294,9 @@ export async function settleSeal(
     payTo: requirements.payTo,
     tokenProgram: terms.tokenProgram,
   });
+  // This callback may repeat on replay and must deduplicate by transaction,
+  // matching the configuration contract used by batched distributions.
+  await notifySealDistribution(deps, response, requirements, intent);
   return response;
 }
 
