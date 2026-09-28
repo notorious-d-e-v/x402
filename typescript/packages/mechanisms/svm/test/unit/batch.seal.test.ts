@@ -165,6 +165,7 @@ async function facilitator(
   options: {
     live?: Channel;
     bound?: boolean;
+    onDistributionConfirmed?: ReturnType<typeof vi.fn>;
   } = {},
 ) {
   const store = new InMemoryPaymentChannelStorage();
@@ -182,6 +183,7 @@ async function facilitator(
   }
   const scheme = new BatchSvmScheme(signer() as never, {
     channelStorage: store,
+    onDistributionConfirmed: options.onDistributionConfirmed,
   });
   const api = scheme as unknown as Internals;
   api.resolveTerms = vi.fn().mockResolvedValue({
@@ -228,7 +230,8 @@ describe("batch-settlement seal", () => {
   });
 
   it("applies the final voucher with settle_and_seal and a sealed distribute in one transaction", async () => {
-    const { api, scheme } = await facilitator();
+    const record = vi.fn().mockResolvedValue(undefined);
+    const { api, scheme } = await facilitator({ onDistributionConfirmed: record });
     const response = await settle(scheme, await sealPayload(3_000n));
     expect(response).toMatchObject({
       // 3000 settled less the 500 already paid out reaches the receiver now.
@@ -251,6 +254,8 @@ describe("batch-settlement seal", () => {
     // Ed25519 precompile, settle_and_seal, distribute.
     expect(instructions).toHaveLength(3);
     expect(key).toBe(`batch:seal:${NETWORK}:${channelId}:3000`);
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith(response, requirements());
 
     // The same close replays from the recorded result without a second broadcast.
     await expect(settle(scheme, await sealPayload(3_000n))).resolves.toMatchObject({
@@ -258,6 +263,28 @@ describe("batch-settlement seal", () => {
       success: true,
     });
     expect(api.submitRedemption).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries payout recording from the durable seal result without rebroadcasting", async () => {
+    const record = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ledger unavailable"))
+      .mockResolvedValue(undefined);
+    const { api, scheme } = await facilitator({ onDistributionConfirmed: record });
+    const payload = await sealPayload(3_000n);
+
+    await expect(settle(scheme, payload)).resolves.toMatchObject({
+      errorReason: "transaction_failed",
+      success: false,
+    });
+    await expect(settle(scheme, payload)).resolves.toMatchObject({
+      amount: "2500",
+      success: true,
+      transaction: SIGNATURE,
+    });
+    expect(api.submitRedemption).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledTimes(2);
   });
 
   it("seals at the current watermark without a precompile when the voucher equals settled", async () => {
