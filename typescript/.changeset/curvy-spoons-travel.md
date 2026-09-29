@@ -1,5 +1,8 @@
 ---
 "@x402/express": patch
+"@x402/fastify": patch
+"@x402/hono": patch
+"@x402/next": patch
 ---
 
-Document Solana Mainnet Express setup and link a runnable facilitator-backed example.
+Added Solana alongside EVM in middleware README payment examples.
