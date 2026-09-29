@@ -48,6 +48,33 @@ app.get("/protected-route", (req, res) => {
 app.listen(3000);
 ```
 
+## Solana Mainnet
+
+The same middleware supports Solana. Install `@x402/svm`, register its server scheme with the Solana Mainnet CAIP-2 identifier, and use a facilitator whose `/supported` response includes that network and the `exact` scheme:
+
+```bash
+pnpm install @x402/svm
+```
+
+```typescript
+import { HTTPFacilitatorClient } from "@x402/core/server";
+import { x402ResourceServer } from "@x402/express";
+import { ExactSvmScheme } from "@x402/svm/exact/server";
+
+const solanaMainnet = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+const facilitatorClient = new HTTPFacilitatorClient({
+  url: "https://your-facilitator.example",
+});
+const resourceServer = new x402ResourceServer(facilitatorClient).register(
+  solanaMainnet,
+  new ExactSvmScheme(),
+);
+```
+
+Pass this `resourceServer` to `paymentMiddleware` in place of the EVM resource server from the Quick Start. Use `solanaMainnet` as the route's `network` and a Solana address as `payTo`. The receiving wallet must have an associated token account for the accepted token before settlement.
+
+For a complete merchant and buyer using a public PayAI facilitator, see the [Solana Mainnet Express guide](https://docs.payai.network/x402/solana-mainnet-express) and [runnable example](https://github.com/PayAINetwork/docs/tree/main/examples/solana-mainnet-express).
+
 ## Configuration
 
 The `paymentMiddleware` function accepts the following parameters:
