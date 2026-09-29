@@ -91,6 +91,7 @@ export interface BatchSvmServerConfig {
   onchainStateTtlMs?: number | undefined;
   /** Reject deposits below the announced `extra.minDeposit` hint. Defaults to false. */
   enforceMinDeposit?: boolean | undefined;
+  /** Durable implementations must persist completed operation responses to enable replay. */
   operationStore?: BatchOperationStore | undefined;
   /** Operator key used to sign cumulative vouchers after successful requests. */
   operator?: MessagePartialSigner | undefined;
@@ -237,7 +238,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     // its state.
     let channelId: string;
     try {
-      channelId = await this.validatePayload(raw, ctx.paymentPayload!.accepted);
+      ({ channelId } = await this.validatePayload(raw, ctx.paymentPayload!.accepted));
     } catch {
       return;
     }
@@ -534,26 +535,22 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     const raw = ctx.paymentPayload.payload;
     if (!isBatchPayload(raw)) return;
     try {
-      const channelId = await this.validatePayload(raw, ctx.requirements);
+      const { channelId, operation } = await this.validatePayload(raw, ctx.requirements);
       const state = await this.store.get(channelId);
       if (state) {
         this.assertStoredConfig(state, raw.channelConfig, ctx.requirements);
       }
       if (raw.type === "deposit" || raw.type === "authorization") {
         const proof = proofOf(raw);
-        if (
-          proof.signer === "server" &&
-          (await this.isCompletedReplay(
-            channelId,
-            proof.authorization.requestId,
-            proof.authorization.authorizedAmount,
-          ))
-        ) {
+        if (proof.signer === "server" && operation) {
+          const replay = completedReplay(operation, proof.authorization.authorizedAmount);
+          if (!replay) throw new Error(CHANNEL_BUSY);
           this.requestContexts.set(ctx.paymentPayload, {
             channelId,
             proof,
             ceiling: BigInt(proof.authorization.authorizedAmount),
             requestId: proof.authorization.requestId,
+            replay,
           });
           return {
             skip: true,
@@ -711,6 +708,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     }
     const request = this.requestContexts.get(ctx.paymentPayload);
     if (!request) return this.abort(BatchError.CHANNEL_STATE, "missing request state");
+    if (request.replay) return { skipHandler: true };
     // The facilitator has now confirmed this payload against onchain state and
     // returned the channel snapshot. Persisting it is what lets a server with
     // no record of a live channel serve it, and what keeps `deposit`, `settled`
@@ -753,10 +751,11 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           request.ceiling,
         );
         if (!reserved.created) {
-          if (reserved.operation.status === "completed" && reserved.operation.response) {
+          const replay = completedReplay(reserved.operation, request.ceiling.toString());
+          if (replay) {
             this.requestContexts.set(ctx.paymentPayload, {
               ...request,
-              replay: reserved.operation,
+              replay,
             });
             return { skipHandler: true };
           }
@@ -843,7 +842,11 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     const request = this.requestContexts.get(ctx.paymentPayload);
     if (request?.replay) {
       this.requestContexts.delete(ctx.paymentPayload);
-      return { skip: true, result: request.replay.response! };
+      const response = request.replay.response!;
+      return {
+        skip: true,
+        result: { ...response, extra: { ...response.extra, replayed: true } },
+      };
     }
     const pendingId = request?.pendingId;
     if (!request || !pendingId) return this.abort(CHANNEL_BUSY, "missing reservation");
@@ -1040,12 +1043,12 @@ export class BatchSvmScheme implements SchemeNetworkServer {
    *
    * @param raw - Batch-settlement payload from the client
    * @param requirements - Accepted payment requirements
-   * @returns Channel id for the payload
+   * @returns Derived channel id and any existing server-mode operation
    */
   private async validatePayload(
     raw: BatchPayload,
     requirements: PaymentRequirements,
-  ): Promise<string> {
+  ): Promise<{ channelId: string; operation?: BatchOperation }> {
     const extra = requirements.extra;
     if (!extra || (extra.paymentFlow !== undefined && extra.paymentFlow !== "authorization")) {
       throw new Error(BatchError.PAYMENT_FLOW);
@@ -1107,7 +1110,14 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     });
     const proofAmount =
       raw.type === "refund" && voucherSigner === "server" ? "0" : requirements.amount;
-    await this.validateRequestProof(raw, channelId, voucherSigner, proofAmount);
+    let operation: BatchOperation | undefined;
+    if (raw.type !== "refund") {
+      const proof = proofOf(raw);
+      if (proof.signer === "server") {
+        operation = await this.operationStore.get(channelId, proof.authorization.requestId);
+      }
+    }
+    await this.validateRequestProof(raw, channelId, voucherSigner, proofAmount, operation);
     if (
       raw.type === "deposit" &&
       this.config.enforceMinDeposit === true &&
@@ -1116,7 +1126,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     ) {
       throw new Error(BatchError.DEPOSIT_BELOW_MIN_DEPOSIT);
     }
-    return channelId;
+    return operation ? { channelId, operation } : { channelId };
   }
 
   /**
@@ -1126,12 +1136,14 @@ export class BatchSvmScheme implements SchemeNetworkServer {
    * @param channelId - Derived channel id
    * @param voucherSigner - Expected signer mode from requirements
    * @param authorizedAmount - Amount the proof must authorize
+   * @param operation - Existing operation loaded while validating this payload
    */
   private async validateRequestProof(
     raw: BatchPayload,
     channelId: string,
     voucherSigner: "client" | "server",
     authorizedAmount: string,
+    operation?: BatchOperation,
   ): Promise<void> {
     if (raw.type === "refund") {
       if (voucherSigner === "server") {
@@ -1159,7 +1171,7 @@ export class BatchSvmScheme implements SchemeNetworkServer {
           raw,
           channelId,
           authorizedAmount,
-          await this.isCompletedReplay(channelId, proof.authorization.requestId, authorizedAmount),
+          completedReplay(operation, authorizedAmount) !== undefined,
         );
         return;
       default: {
@@ -1225,31 +1237,6 @@ export class BatchSvmScheme implements SchemeNetworkServer {
     ) {
       throw new Error(BatchError.VOUCHER_SIGNATURE);
     }
-  }
-
-  /**
-   * Check whether a signed request already has a durable response to replay.
-   *
-   * A completed request remains safe to replay after its bearer proof expires:
-   * the original signature is still verified, while the stored operation fixes
-   * both its authorized ceiling and exact response.
-   *
-   * @param channelId - Derived channel id
-   * @param requestId - Signed request id
-   * @param authorizedAmount - Amount bound into the payer authorization
-   * @returns Whether the operation has a response eligible for replay
-   */
-  private async isCompletedReplay(
-    channelId: string,
-    requestId: string,
-    authorizedAmount: string,
-  ): Promise<boolean> {
-    const operation = await this.operationStore.get(channelId, requestId);
-    return (
-      operation?.status === "completed" &&
-      operation.response !== undefined &&
-      operation.ceiling === BigInt(authorizedAmount)
-    );
   }
 
   /**
@@ -1556,6 +1543,21 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       extra: {},
     };
   }
+}
+
+/**
+ * Return a completed operation only when its durable response matches this authorization.
+ *
+ * @param operation - Existing request operation, if any
+ * @param authorizedAmount - Amount bound into the payer authorization
+ * @returns Replayable completed operation, or undefined
+ */
+function completedReplay(
+  operation: BatchOperation | undefined,
+  authorizedAmount: string,
+): Extract<BatchOperation, { status: "completed" }> | undefined {
+  if (operation?.status !== "completed" || operation.response === undefined) return undefined;
+  return operation.ceiling === BigInt(authorizedAmount) ? operation : undefined;
 }
 
 /**

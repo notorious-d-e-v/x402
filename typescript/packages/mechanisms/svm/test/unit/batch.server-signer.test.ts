@@ -310,7 +310,10 @@ describe("batch server voucher signer boundaries", () => {
   it("rejects every server-mode term and proof mismatch", async () => {
     type Internals = {
       signOperatorVoucher(channelId: string, cumulative: bigint): Promise<unknown>;
-      validatePayload(raw: BatchDepositPayload, requirements: PaymentRequirements): Promise<string>;
+      validatePayload(
+        raw: BatchDepositPayload,
+        requirements: PaymentRequirements,
+      ): Promise<{ channelId: string }>;
       validateRequestProof(
         raw: BatchDepositPayload,
         channelId: string,
@@ -456,6 +459,7 @@ describe("batch server voucher signer boundaries", () => {
         extra: {
           chargedAmount: "1000",
           commitmentId: `${channelId}:1000`,
+          replayed: true,
         },
         success: true,
         transaction: "open-signature",
@@ -521,6 +525,50 @@ describe("batch server voucher signer boundaries", () => {
       status: "completed",
     });
 
+    const changedRequirements = { ...requirements(), amount: "2000" };
+    const changedAuthorizationPayment: PaymentPayload = {
+      accepted: changedRequirements,
+      payload: {
+        authorization: await authorizationFor("request-2", 2_000n),
+        channelConfig: serverDeposit.channelConfig,
+        type: "authorization",
+      },
+      x402Version: 2,
+    };
+    await expect(
+      server.schemeHooks.onBeforeVerify!({
+        declaredExtensions: {},
+        paymentPayload: changedAuthorizationPayment,
+        requirements: changedRequirements,
+      }),
+    ).resolves.toMatchObject({ abort: true, reason: "duplicate_settlement" });
+
+    await operationStore.reserve(channelId, "legacy-completed", 1_000n);
+    await operationStore.complete({
+      actual: 1_000n,
+      ceiling: 1_000n,
+      channelId,
+      cumulative: 2_400n,
+      requestId: "legacy-completed",
+      status: "completed",
+    });
+    const legacyCompletionPayment: PaymentPayload = {
+      accepted: requirements(),
+      payload: {
+        authorization: await authorizationFor("legacy-completed"),
+        channelConfig: serverDeposit.channelConfig,
+        type: "authorization",
+      },
+      x402Version: 2,
+    };
+    await expect(
+      server.schemeHooks.onBeforeVerify!({
+        declaredExtensions: {},
+        paymentPayload: legacyCompletionPayment,
+        requirements: requirements(),
+      }),
+    ).resolves.toMatchObject({ abort: true, reason: "duplicate_settlement" });
+
     const zeroPayment = {
       ...authorizationPayment,
       payload: {
@@ -564,6 +612,7 @@ describe("batch server voucher signer boundaries", () => {
       operationStore,
       store,
     });
+    const operationGet = vi.spyOn(operationStore, "get");
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 7_200_000);
     await expect(restartedServer.schemeHooks.onBeforeVerify!(replayContext)).resolves.toMatchObject(
@@ -571,11 +620,13 @@ describe("batch server voucher signer boundaries", () => {
         skip: true,
       },
     );
+    expect(operationGet).toHaveBeenCalledTimes(1);
     const replayVerified = await restartedServer.schemeHooks.onAfterVerify!({
       ...replayContext,
       result: { isValid: true, payer: payer.address },
     });
     expect(replayVerified).toMatchObject({ skipHandler: true });
+    expect(operationGet).toHaveBeenCalledTimes(1);
     await expect(
       restartedServer.schemeHooks.onBeforeSettle!({
         ...replayContext,
@@ -591,12 +642,14 @@ describe("batch server voucher signer boundaries", () => {
           chargedAmount: "400",
           channelState: { chargedCumulativeAmount: "1400" },
           commitmentId: `${channelId}:1400`,
+          replayed: true,
           voucher: receipt,
         },
         success: true,
       },
     });
     expect(await store.get(channelId)).toMatchObject({ chargedCumulativeAmount: 1_400n });
+    operationGet.mockRestore();
     vi.useRealTimers();
   });
 
@@ -751,6 +804,7 @@ describe("batch server voucher signer boundaries", () => {
           chargedAmount: "500",
           channelState: { chargedCumulativeAmount: "1500" },
           commitmentId: `${channelId}:1500`,
+          replayed: true,
         },
         success: true,
       },
