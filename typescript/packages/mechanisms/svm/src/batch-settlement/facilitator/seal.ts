@@ -42,6 +42,7 @@ import {
   type BatchVoucher,
 } from "../types";
 import type { BatchDelegatedSettleContext } from "./delegatedAuthStore";
+import type { BatchSvmFacilitatorConfig } from "./bindingSource";
 import { requireReceiverAuthorizer } from "./receiverAuthorizerStore";
 import type { BatchPendingSettlementStore } from "./recovery";
 import {
@@ -74,9 +75,7 @@ export interface PreparedRefund {
 
 /** Scheme internals the seal path borrows, so it can live outside the scheme file. */
 export interface SealDependencies {
-  onDistributionConfirmed?:
-    | ((response: SettleResponse, requirements: PaymentRequirements) => Promise<void>)
-    | undefined;
+  onDistributionConfirmed?: BatchSvmFacilitatorConfig["onDistributionConfirmed"];
   pendingStore: BatchPendingSettlementStore;
   settlementCache: SettlementCache;
   resolveTerms(
@@ -127,21 +126,66 @@ export interface SealDependencies {
 }
 
 /**
- * Notify the operator for a durable seal result, retrying the callback on replay.
+ * Notify the operator once for a durable close result.
  *
  * @param deps - Scheme internals containing the optional payout callback
- * @param response - Confirmed seal response containing the payout amount
+ * @param key - Durable close operation key
+ * @param response - Confirmed close response containing the receiver payout
  * @param requirements - Payment requirements identifying the payout recipient and asset
- * @param intent - Close operation kind; refunds do not notify the payout callback
+ * @param intent - Close operation kind, used to safely read older seal results
  */
 async function notifySealDistribution(
   deps: SealDependencies,
+  key: string,
   response: SettleResponse,
   requirements: PaymentRequirements,
   intent: CloseIntent,
 ): Promise<void> {
-  if (intent !== "seal" || !deps.onDistributionConfirmed) return;
-  await deps.onDistributionConfirmed(response, requirements);
+  if (!deps.onDistributionConfirmed) return;
+  const recordedKey = `${key}:recorded`;
+  if (await deps.pendingStore.get(recordedKey)) return;
+  const storedPaidToReceiver = response.extra?.paidToReceiver;
+  const paidToReceiver =
+    typeof storedPaidToReceiver === "string"
+      ? storedPaidToReceiver
+      : intent === "seal"
+        ? response.amount
+        : undefined;
+  if (paidToReceiver === undefined) {
+    throw new Error("durable refund response is missing extra.paidToReceiver");
+  }
+  await deps.onDistributionConfirmed({ ...response, amount: paidToReceiver }, requirements);
+  await deps.pendingStore.set(recordedKey, "1");
+}
+
+/**
+ * Finish accounting for a close that is already confirmed onchain.
+ *
+ * @param deps - Scheme internals containing payout persistence
+ * @param key - Durable close operation key
+ * @param response - Confirmed close response returned to the payer
+ * @param requirements - Payment requirements identifying the receiver
+ * @param intent - Close operation kind
+ * @returns The confirmed result, or a retryable pending result if recording failed
+ */
+async function completeSealDistribution(
+  deps: SealDependencies,
+  key: string,
+  response: SettleResponse,
+  requirements: PaymentRequirements,
+  intent: CloseIntent,
+): Promise<SettleResponse> {
+  try {
+    await notifySealDistribution(deps, key, response, requirements, intent);
+    return response;
+  } catch (error) {
+    return settlementPending(
+      response.network,
+      response.payer ?? "",
+      response.transaction,
+      String(error),
+    );
+  }
 }
 
 /**
@@ -208,8 +252,7 @@ export async function settleSeal(
   const previous = await deps.pendingStore.get(`${key}:result`);
   if (previous) {
     const response = JSON.parse(previous) as SettleResponse;
-    await notifySealDistribution(deps, response, requirements, intent);
-    return response;
+    return completeSealDistribution(deps, key, response, requirements, intent);
   }
 
   const channel = await deps.fetchChannel(network, channelId);
@@ -294,10 +337,7 @@ export async function settleSeal(
     payTo: requirements.payTo,
     tokenProgram: terms.tokenProgram,
   });
-  // This callback may repeat on replay and must deduplicate by transaction,
-  // matching the configuration contract used by batched distributions.
-  await notifySealDistribution(deps, response, requirements, intent);
-  return response;
+  return completeSealDistribution(deps, key, response, requirements, intent);
 }
 
 /**

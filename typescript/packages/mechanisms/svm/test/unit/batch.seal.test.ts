@@ -234,6 +234,7 @@ describe("batch-settlement seal", () => {
           totalClaimed: "3000",
           withdrawRequestedAt: 0,
         },
+        paidToReceiver: "2500",
       },
       payer: payer.address,
       success: true,
@@ -255,7 +256,7 @@ describe("batch-settlement seal", () => {
       success: true,
     });
     expect(api.submitRedemption).toHaveBeenCalledOnce();
-    expect(record).toHaveBeenCalledTimes(2);
+    expect(record).toHaveBeenCalledOnce();
   });
 
   it("retries payout recording from the durable seal result without rebroadcasting", async () => {
@@ -267,8 +268,9 @@ describe("batch-settlement seal", () => {
     const payload = await sealPayload(3_000n);
 
     await expect(settle(scheme, payload)).resolves.toMatchObject({
-      errorReason: "transaction_failed",
+      errorReason: "settlement_pending",
       success: false,
+      transaction: SIGNATURE,
     });
     await expect(settle(scheme, payload)).resolves.toMatchObject({
       amount: "2500",
@@ -277,6 +279,8 @@ describe("batch-settlement seal", () => {
     });
     expect(api.submitRedemption).toHaveBeenCalledOnce();
     expect(api.trackChannel).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledTimes(2);
+    await expect(settle(scheme, payload)).resolves.toMatchObject({ success: true });
     expect(record).toHaveBeenCalledTimes(2);
   });
 
@@ -371,30 +375,42 @@ describe("batch-settlement seal", () => {
 
   it("refunds an open channel cooperatively with the server-authorized voucher", async () => {
     const open = channel({ closureStartedAt: 0n, status: ChannelStatus.Open });
-    const refund = async (cumulative: bigint) => {
+    const refund = async (
+      cumulative: bigint,
+      onDistributionConfirmed?: ReturnType<typeof vi.fn>,
+    ) => {
       const { closeAuthorization, voucher } = await sealPayload(cumulative);
-      const { api, scheme } = await facilitator({ live: open });
-      const response = await scheme.settle(
-        {
-          accepted: requirements(),
-          payload: { channelConfig, closeAuthorization, type: "refund", voucher },
-          x402Version: 2,
-        } as never,
-        requirements(),
-      );
-      return { api, response };
+      const { api, scheme } = await facilitator({ live: open, onDistributionConfirmed });
+      const payment = {
+        accepted: requirements(),
+        payload: { channelConfig, closeAuthorization, type: "refund", voucher },
+        x402Version: 2,
+      } as never;
+      const response = await scheme.settle(payment, requirements());
+      return { api, payment, response, scheme };
     };
 
-    const above = await refund(3_000n);
+    const record = vi.fn().mockResolvedValue(undefined);
+    const above = await refund(3_000n, record);
     expect(above.response).toMatchObject({
       amount: "7000",
-      extra: { channelState: { channelId, withdrawRequestedAt: 0 } },
+      extra: {
+        channelState: { channelId, withdrawRequestedAt: 0 },
+        paidToReceiver: "2500",
+      },
       success: true,
       transaction: SIGNATURE,
     });
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith({ ...above.response, amount: "2500" }, requirements());
     const [, , instructions, key] = above.api.submitRedemption.mock.calls[0]!;
     expect(instructions).toHaveLength(3);
     expect(key).toBe(`batch:refund:${NETWORK}:${channelId}:3000`);
+    await expect(above.scheme.settle(above.payment, requirements())).resolves.toEqual(
+      above.response,
+    );
+    expect(above.api.submitRedemption).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledOnce();
 
     // At the watermark the channel seals without a voucher precompile.
     const equal = await refund(1_000n);
@@ -416,6 +432,41 @@ describe("batch-settlement seal", () => {
         requirements(),
       ),
     ).resolves.toMatchObject({ errorReason: BatchError.CLOSE_STATE, success: false });
+  });
+
+  it("recovers refund recording with the receiver amount without rebroadcasting", async () => {
+    const record = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ledger unavailable"))
+      .mockResolvedValue(undefined);
+    const { api, scheme } = await facilitator({
+      live: channel({ closureStartedAt: 0n, status: ChannelStatus.Open }),
+      onDistributionConfirmed: record,
+    });
+    const { closeAuthorization, voucher } = await sealPayload(3_000n);
+    const payment = {
+      accepted: requirements(),
+      payload: { channelConfig, closeAuthorization, type: "refund", voucher },
+      x402Version: 2,
+    } as never;
+
+    await expect(scheme.settle(payment, requirements())).resolves.toMatchObject({
+      errorReason: "settlement_pending",
+      success: false,
+      transaction: SIGNATURE,
+    });
+    const recovered = await scheme.settle(payment, requirements());
+    expect(recovered).toMatchObject({
+      amount: "7000",
+      extra: { paidToReceiver: "2500" },
+      success: true,
+      transaction: SIGNATURE,
+    });
+    expect(record).toHaveBeenLastCalledWith({ ...recovered, amount: "2500" }, requirements());
+    expect(record).toHaveBeenCalledTimes(2);
+    expect(api.submitRedemption).toHaveBeenCalledOnce();
+    await expect(scheme.settle(payment, requirements())).resolves.toEqual(recovered);
+    expect(record).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a claim against a closing channel with the dedicated code", async () => {
