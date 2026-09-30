@@ -19,6 +19,19 @@ export async function assertServerModeRefundProof(
   if (payload.voucher !== undefined) {
     throw new Error(`${BatchError.VOUCHER_SIGNATURE}: invalid payer proof`);
   }
+  await assertServerModeRefundAuthorization(payload, channelId);
+}
+
+/**
+ * Verify the payer authorization on a server-mode refund.
+ *
+ * @param payload - Server-mode refund payload
+ * @param channelId - Derived channel PDA
+ */
+export async function assertServerModeRefundAuthorization(
+  payload: BatchRefundPayload,
+  channelId: string,
+): Promise<void> {
   const authorization = payload.authorization;
   if (!authorization) throw new Error(`${BatchError.VOUCHER_SIGNATURE}: payer proof missing`);
   const authorized = parseU64(authorization.authorizedAmount, "authorizedAmount");

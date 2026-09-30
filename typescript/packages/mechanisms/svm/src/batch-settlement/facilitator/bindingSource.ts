@@ -28,6 +28,19 @@ import { BINDING_HISTORY_PAGE_LIMIT } from "./constants";
 
 /** Optional configuration for the batch-settlement SVM facilitator. */
 export interface BatchSvmFacilitatorConfig {
+  /** Shared per-channel ownership across facilitator replicas and overlapping sweeps. */
+  acquireDistributionLease?:
+    | ((
+        network: string,
+        channels: readonly string[],
+      ) => Promise<
+        | {
+            assertHeld(): Promise<void>;
+            release(): Promise<void>;
+          }
+        | undefined
+      >)
+    | undefined;
   /**
    * Durable record of pending signatures and completed operation outcomes, so
    * retries — including after a restart — reconcile instead of rebroadcasting.
@@ -35,6 +48,13 @@ export interface BatchSvmFacilitatorConfig {
    * shared durable store whose TTL covers their client retry window.
    */
   pendingSettlementStore?: BatchPendingSettlementStore | undefined;
+  /**
+   * Recover deposit operations written by preview releases that keyed both
+   * opens and top-ups by their signed transaction bytes.
+   */
+  recoverLegacyTransactionScopedDeposits?: boolean | undefined;
+  /** Temporary migration support for preview clients whose opens predate receiver-binding memos. */
+  acceptLegacyOpenWithoutBindingMemo?: boolean | undefined;
   /** Called before completing a payout; implementations must deduplicate by transaction. */
   onDistributionConfirmed?: (
     response: SettleResponse,

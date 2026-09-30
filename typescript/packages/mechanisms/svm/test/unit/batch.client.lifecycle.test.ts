@@ -750,6 +750,14 @@ describe("batch client lifecycle", () => {
       type: "refund",
     });
     expect(serverRefund.payload).not.toHaveProperty("voucher");
+    const serverForcedRefund = await client.createRefundPayload(2, requirements(), {
+      withTransaction: true,
+    });
+    expect(serverForcedRefund.payload).toMatchObject({
+      authorization: { authorizedAmount: "0", channelId: RECEIVER },
+      transaction: expect.any(String),
+    });
+    expect(serverForcedRefund.payload).not.toHaveProperty("voucher");
     await expect(
       new BatchSvmScheme(payer, { discoverChannels: false }).createRefundPayload(2, requirements()),
     ).rejects.toThrow(/no batch-settlement channel/);

@@ -19,6 +19,7 @@ export {
   DEFAULT_ABANDON_GRACE_SECS,
   DEFAULT_MAX_CLOSES_PER_RUN,
   DEFAULT_MAX_IDLE_SECS,
+  DEFAULT_MISSING_ACCOUNT_GRACE_SECS,
   DEFAULT_MAX_RECLAIMS_PER_TX,
   DEFAULT_MAX_TXS_PER_RUN,
   DEFAULT_MAX_TXS_PER_SIGNER,
@@ -43,6 +44,8 @@ export interface BatchSvmRentCleanupManagerConfig {
    * cleanup passes that do not override {@link RentCleanupOptions.maxIdleSecs}.
    */
   maxIdleSecs?: number;
+  /** Grace before an absent, newly indexed open is treated as abandoned. */
+  missingAccountGraceSecs?: number;
 }
 
 /**

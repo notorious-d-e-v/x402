@@ -1,4 +1,4 @@
-/* eslint-disable jsdoc/require-jsdoc */
+/* eslint-disable jsdoc/require-jsdoc, jsdoc/require-param, jsdoc/require-returns */
 import {
   getBase64Codec,
   getCompiledTransactionMessageDecoder,
@@ -88,6 +88,86 @@ export async function reserveBroadcast(
     return await next;
   } finally {
     if (pending.get(key) === next) pending.delete(key);
+  }
+}
+
+const DEPOSIT_RESERVATION_PREFIX = "batch:deposit:v1:";
+
+/** Encode a broadcast signature with the immutable deposit target needed for recovery. */
+export function encodeBroadcastReservation(signature: string, expectedDeposit?: bigint): string {
+  if (expectedDeposit === undefined) return signature;
+  return `${DEPOSIT_RESERVATION_PREFIX}${expectedDeposit}:${signature}`;
+}
+
+/** Decode a current reservation while remaining compatible with plain legacy signatures. */
+export function decodeBroadcastReservation(value: string): {
+  signature: string;
+  expectedDeposit?: bigint;
+} {
+  if (!value.startsWith(DEPOSIT_RESERVATION_PREFIX)) return { signature: value };
+  const separator = value.indexOf(":", DEPOSIT_RESERVATION_PREFIX.length);
+  if (separator < 0) return { signature: value };
+  try {
+    const expectedDeposit = BigInt(value.slice(DEPOSIT_RESERVATION_PREFIX.length, separator));
+    if (expectedDeposit < 0n || expectedDeposit > 18_446_744_073_709_551_615n)
+      return { signature: value };
+    return { expectedDeposit, signature: value.slice(separator + 1) };
+  } catch {
+    return { signature: value };
+  }
+}
+
+/** Read the deposit target bound to a pending or completed top-up. */
+export async function recordedExpectedDeposit(
+  store: PendingSettlementStore,
+  key: string,
+  completed: string | undefined,
+  pending: string | undefined,
+): Promise<string | undefined> {
+  if (completed) return store.get(`${key}:expected-deposit`);
+  if (!pending) return undefined;
+  const decoded = decodeBroadcastReservation(pending);
+  if (decoded.expectedDeposit !== undefined) return decoded.expectedDeposit.toString();
+  return store.get(`${key}:expected-deposit`);
+}
+
+/** Persist signed bytes and atomically reserve their operation key. */
+export async function prepareBroadcastReservation(
+  store: BatchPendingSettlementStore,
+  key: string,
+  network: string,
+  signature: string,
+  wire: string,
+  expectedDeposit?: bigint,
+): Promise<{ existing?: string; owned: boolean }> {
+  await store.set(`batch:transaction:${network}:${signature}:wire`, wire);
+  const reservation = encodeBroadcastReservation(signature, expectedDeposit);
+  if (await reserveBroadcast(store, key, reservation)) {
+    if (expectedDeposit !== undefined) {
+      await store.set(`${key}:expected-deposit`, expectedDeposit.toString());
+    }
+    return { owned: true };
+  }
+  const existing = await store.get(key);
+  if (decodeBroadcastReservation(existing ?? "").signature !== signature) {
+    await discardWire(store, network, signature);
+  }
+  return existing ? { existing, owned: false } : { owned: false };
+}
+
+/** Delete the pending record only when it still names this transaction. */
+export async function forgetBroadcastReservation(
+  store: BatchPendingSettlementStore,
+  key: string,
+  signature: string,
+): Promise<void> {
+  try {
+    const recorded = await store.get(key);
+    if (!recorded || decodeBroadcastReservation(recorded).signature !== signature) return;
+    if (store.deleteIfEquals) await store.deleteIfEquals(key, recorded);
+    else if ((await store.get(key)) === recorded) await store.delete(key);
+  } catch {
+    /* confirmed work no longer depends on cleanup */
   }
 }
 

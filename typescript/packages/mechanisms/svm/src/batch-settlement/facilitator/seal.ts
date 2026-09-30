@@ -40,7 +40,11 @@ import {
   type BatchSealPayload,
   type BatchVoucher,
 } from "../types";
-import { requireReceiverAuthorizer, type ChannelBinding } from "./bindingSource";
+import {
+  requireReceiverAuthorizer,
+  type BatchSvmFacilitatorConfig,
+  type ChannelBinding,
+} from "./bindingSource";
 import type { BatchPendingSettlementStore } from "./recovery";
 import {
   CHANNEL_BUSY,
@@ -50,6 +54,7 @@ import {
   settlementPending,
 } from "./responses";
 import type { BatchDelegatedSettleContext, BatchTerms } from "./types";
+import { assertServerModeRefundAuthorization } from "./voucherMode";
 
 /** Terms `seal` needs: everything {@link BatchTerms} carries except who signs vouchers. */
 export type SealTerms = Omit<BatchTerms, "voucherSigner">;
@@ -63,7 +68,7 @@ export interface RefundLimits {
   maxPriorityFeeMicroLamports?: number | undefined;
 }
 
-/** A validated refund; `requestClose` is set only on the sponsored fallback path. */
+/** A validated refund; `requestClose` is set only on the payer-forced path. */
 export interface PreparedRefund {
   channelId: string;
   terms: SealTerms;
@@ -72,6 +77,7 @@ export interface PreparedRefund {
 
 /** Scheme internals the seal path borrows, so it can live outside the scheme file. */
 export interface SealDependencies {
+  onDistributionConfirmed?: BatchSvmFacilitatorConfig["onDistributionConfirmed"];
   pendingStore: BatchPendingSettlementStore;
   settlementCache: SettlementCache;
   resolveTerms(
@@ -117,6 +123,69 @@ export interface SealDependencies {
     payer: string,
   ): Promise<SettleResponse | undefined>;
   nowSeconds(): number;
+}
+
+/**
+ * Notify the operator once for a durable close result.
+ *
+ * @param deps - Scheme internals containing the optional payout callback
+ * @param key - Durable close operation key
+ * @param response - Confirmed close response containing the receiver payout
+ * @param requirements - Payment requirements identifying the payout recipient and asset
+ * @param intent - Close operation kind, used to safely read older seal results
+ */
+async function notifySealDistribution(
+  deps: SealDependencies,
+  key: string,
+  response: SettleResponse,
+  requirements: PaymentRequirements,
+  intent: CloseIntent,
+): Promise<void> {
+  if (!deps.onDistributionConfirmed) return;
+  const recordedKey = `${key}:recorded`;
+  if (await deps.pendingStore.get(recordedKey)) return;
+  const storedPaidToReceiver = response.extra?.paidToReceiver;
+  const paidToReceiver =
+    typeof storedPaidToReceiver === "string"
+      ? storedPaidToReceiver
+      : intent === "seal"
+        ? response.amount
+        : undefined;
+  if (paidToReceiver === undefined) {
+    throw new Error("durable refund response is missing extra.paidToReceiver");
+  }
+  await deps.onDistributionConfirmed({ ...response, amount: paidToReceiver }, requirements);
+  await deps.pendingStore.set(recordedKey, "1");
+}
+
+/**
+ * Finish accounting for a close that is already confirmed onchain.
+ *
+ * @param deps - Scheme internals containing payout persistence
+ * @param key - Durable close operation key
+ * @param response - Confirmed close response returned to the payer
+ * @param requirements - Payment requirements identifying the receiver
+ * @param intent - Close operation kind
+ * @returns The confirmed result, or a retryable pending result if recording failed
+ */
+async function completeSealDistribution(
+  deps: SealDependencies,
+  key: string,
+  response: SettleResponse,
+  requirements: PaymentRequirements,
+  intent: CloseIntent,
+): Promise<SettleResponse> {
+  try {
+    await notifySealDistribution(deps, key, response, requirements, intent);
+    return response;
+  } catch (error) {
+    return settlementPending(
+      response.network,
+      response.payer ?? "",
+      response.transaction,
+      String(error),
+    );
+  }
 }
 
 /**
@@ -181,7 +250,10 @@ export async function settleSeal(
   // Namespace from spec Phase 5: ("close", channelId, maxClaimableAmount).
   const key = `batch:${intent}:${network}:${channelId}:${cumulative}`;
   const previous = await deps.pendingStore.get(`${key}:result`);
-  if (previous) return JSON.parse(previous) as SettleResponse;
+  if (previous) {
+    const response = JSON.parse(previous) as SettleResponse;
+    return completeSealDistribution(deps, key, response, requirements, intent);
+  }
 
   const channel = await deps.fetchChannel(network, channelId);
   const requiredStatus = intent === "seal" ? ChannelStatus.Closing : ChannelStatus.Open;
@@ -253,21 +325,24 @@ export async function settleSeal(
   });
   const response =
     intent === "refund" ? { ...sealed, amount: (channel.deposit - cumulative).toString() } : sealed;
+  // Persist the confirmed response first so a callback failure can retry the
+  // same payout without reading a channel the seal may have deallocated.
   await deps.pendingStore.set(`${key}:result`, JSON.stringify(response));
-  return response;
+  return completeSealDistribution(deps, key, response, requirements, intent);
 }
 
 /**
- * Validate a refund and pick its path: a cooperative close when the
- * channel's receiver binding resolves, otherwise the payer-signed
- * `request_close`, returned as `requestClose` once verified.
+ * Validate a refund and pick its path. An explicit server-mode
+ * `request_close` is payer-forced. Other refunds close cooperatively when the
+ * receiver binding resolves; an unbound client-mode refund requires
+ * `request_close`.
  *
  * @param deps - Scheme internals
  * @param payload - The refund payload
  * @param requirements - The server's requirements for the channel
  * @param limits - Operator ceilings the `request_close` must respect
  * @param context - Facilitator extensions (used by delegated caller identity)
- * @returns Channel, terms, and the verified `request_close` for the fallback path
+ * @returns Channel, terms, and any verified `request_close`
  */
 export async function prepareRefund(
   deps: SealDependencies,
@@ -285,9 +360,14 @@ export async function prepareRefund(
   }
   const terms = await deps.resolveTerms(payload.channelConfig, requirements);
   const channelId = await deps.deriveChannelId(payload.channelConfig, terms.feePayer);
+  const serverMode = (payload.channelConfig.voucherSigner ?? "client") === "server";
+  if (serverMode && payload.transaction !== undefined) {
+    await assertServerModeRefundAuthorization(payload, channelId);
+    await verifyRefundTransaction(payload.transaction, payload, terms, channelId, limits);
+    return { channelId, requestClose: payload.transaction, terms };
+  }
   const voucher = payload.voucher;
   if (!isBatchVoucher(voucher)) {
-    const serverMode = (payload.channelConfig.voucherSigner ?? "client") === "server";
     throw new Error(
       serverMode
         ? `${BatchError.VOUCHER_SIGNATURE}: refund missing operator voucher`
@@ -313,8 +393,28 @@ export async function prepareRefund(
       `${BatchError.RECEIVER_BINDING_UNAVAILABLE}: resend the refund with a payer-signed request_close transaction`,
     );
   }
+  await verifyRefundTransaction(payload.transaction, payload, terms, channelId, limits);
+  return { channelId, requestClose: payload.transaction, terms };
+}
+
+/**
+ * Validate a payer-signed `request_close` transaction.
+ *
+ * @param transaction - Base64 transaction
+ * @param payload - Refund naming the payer and channel
+ * @param terms - Resolved facilitator terms
+ * @param channelId - Derived channel PDA
+ * @param limits - Sponsor compute ceilings
+ */
+async function verifyRefundTransaction(
+  transaction: string,
+  payload: BatchRefundPayload,
+  terms: SealTerms,
+  channelId: string,
+  limits: RefundLimits,
+): Promise<void> {
   try {
-    await verifyRequestCloseTransaction(payload.transaction, {
+    await verifyRequestCloseTransaction(transaction, {
       channelId,
       feePayer: terms.feePayer,
       maxComputeUnits: limits.maxComputeUnits,
@@ -326,7 +426,6 @@ export async function prepareRefund(
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${BatchError.REFUND_TRANSACTION}: ${detail}`);
   }
-  return { channelId, requestClose: payload.transaction, terms };
 }
 
 /**

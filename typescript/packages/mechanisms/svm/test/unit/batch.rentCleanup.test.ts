@@ -50,6 +50,7 @@ const CURRENT_SLOT_TOO_EARLY = OPEN_SLOT + OPEN_SLOT_WINDOW;
 const FAR_FUTURE = 4_102_444_800;
 
 const fetchMaybeChannelMock = vi.hoisted(() => vi.fn());
+const fetchAllMaybeChannelMock = vi.hoisted(() => vi.fn());
 const submitChannelMock = vi.hoisted(() => vi.fn());
 const buildDistributeMock = vi.hoisted(() => vi.fn());
 const getSlotMock = vi.hoisted(() => vi.fn());
@@ -71,6 +72,7 @@ vi.mock("../../src/payment-channels/generated/accounts/channel", async () => {
   >("../../src/payment-channels/generated/accounts/channel");
   return {
     ...actual,
+    fetchAllMaybeChannel: fetchAllMaybeChannelMock,
     fetchMaybeChannel: fetchMaybeChannelMock,
   };
 });
@@ -213,6 +215,7 @@ describe("BatchSvmRentCleanupManager — cleanup", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    fetchAllMaybeChannelMock.mockReset().mockRejectedValue(new Error("batch read unavailable"));
     feePayer = await generateKeyPairSigner();
     payer = await generateKeyPairSigner();
     payTo = await generateKeyPairSigner();
@@ -351,6 +354,24 @@ describe("BatchSvmRentCleanupManager — cleanup", () => {
       await manager.cleanup({ onClose });
       expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ action: "abandon_close" }));
     });
+  });
+
+  it("scans 1,000 recent Open channels in bounded account-read batches", async () => {
+    await Promise.all(
+      Array.from({ length: 1_000 }, () =>
+        seed({ expiresAt: 0, firstSeenAt: Date.now(), lastActivityAt: Date.now() }),
+      ),
+    );
+    fetchAllMaybeChannelMock.mockImplementation(
+      async (_rpc: unknown, addresses: readonly string[]) =>
+        addresses.map(() => channelAccount({ status: ChannelStatus.Open })),
+    );
+
+    await manager.cleanup({ accountReadBatchSize: 100 });
+
+    expect(fetchAllMaybeChannelMock).toHaveBeenCalledTimes(10);
+    expect(fetchMaybeChannelMock).not.toHaveBeenCalled();
+    expect(submitChannelMock).not.toHaveBeenCalled();
   });
 
   it("does not abandon-close Open channels before expiry plus grace", async () => {

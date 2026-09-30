@@ -3,7 +3,7 @@ import type { Network } from "@x402/core/types";
 
 import type { FacilitatorSigningCapabilities, FacilitatorSvmSigner } from "../signer";
 import { createRpcClient } from "../utils";
-import { fetchMaybeChannel } from "./generated/accounts/channel";
+import { fetchAllMaybeChannel, fetchMaybeChannel } from "./generated/accounts/channel";
 
 /** One signature touching an account, newest-first as returned by RPC. */
 export type ChannelAccountSignature = {
@@ -74,7 +74,7 @@ export function assertPaymentChannelFacilitatorSigner(
 export function accountFetchRpc(
   signer: PaymentChannelFacilitatorSigner,
   network: string,
-): Parameters<typeof fetchMaybeChannel>[0] {
+): Parameters<typeof fetchMaybeChannel>[0] & Parameters<typeof fetchAllMaybeChannel>[0] {
   return {
     getAccountInfo: (
       accountAddress: Address,
@@ -88,7 +88,27 @@ export function accountFetchRpc(
         }),
       }),
     }),
-  } as Parameters<typeof fetchMaybeChannel>[0];
+    ...(signer.getMultipleAccounts
+      ? {
+          getMultipleAccounts: (
+            accountAddresses: Address[],
+            config?: { commitment?: string; encoding?: string },
+          ) => ({
+            send: async () => ({
+              context: { slot: 0n },
+              value: await signer.getMultipleAccounts!(
+                accountAddresses.map(value => value.toString()),
+                network,
+                {
+                  commitment: config?.commitment,
+                  encoding: config?.encoding,
+                },
+              ),
+            }),
+          }),
+        }
+      : {}),
+  } as Parameters<typeof fetchMaybeChannel>[0] & Parameters<typeof fetchAllMaybeChannel>[0];
 }
 
 /** RPC that can page account signatures and return base64 transaction bytes. */

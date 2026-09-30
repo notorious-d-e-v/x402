@@ -16,6 +16,7 @@ import type { PaymentChannelStorage } from "../../payment-channels/storage";
 export {
   DEFAULT_ABANDON_GRACE_SECS,
   DEFAULT_MAX_CLOSES_PER_RUN,
+  DEFAULT_MISSING_ACCOUNT_GRACE_SECS,
   DEFAULT_MAX_RECLAIMS_PER_TX,
   DEFAULT_MAX_TXS_PER_RUN,
   DEFAULT_MAX_TXS_PER_SIGNER,
@@ -49,6 +50,8 @@ export interface UptoSvmRentCleanupManagerConfig {
    * (`reclaimComputeUnitLimit`) and are mint-independent.
    */
   settleComputeUnitLimit?: number;
+  /** Grace before an absent, newly indexed open is treated as abandoned. */
+  missingAccountGraceSecs?: number;
 }
 
 /**

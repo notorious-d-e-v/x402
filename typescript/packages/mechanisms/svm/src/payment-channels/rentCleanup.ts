@@ -30,7 +30,11 @@ import {
   reclaimComputeUnitLimit,
   submitChannelTransactionWithSigner,
 } from "./facilitator";
-import { fetchMaybeChannel, type Channel } from "./generated/accounts/channel";
+import {
+  fetchAllMaybeChannel,
+  fetchMaybeChannel,
+  type Channel,
+} from "./generated/accounts/channel";
 import {
   buildDistributeInstruction,
   buildReclaimInstruction,
@@ -56,6 +60,9 @@ import type { PaymentChannelRecord, PaymentChannelStorage } from "./storage";
  *   is already due. `upto`.
  */
 export type OpenAbandonPolicy = "expiry" | "idle";
+
+/** Solana `getMultipleAccounts` accepts at most 100 addresses. */
+export const MAX_ACCOUNT_READ_BATCH_SIZE = 100;
 
 /**
  * How long a missing account keeps its index row. Longer than a blockhash
@@ -210,16 +217,26 @@ export const DEFAULT_ABANDON_GRACE_SECS = 120;
 export const DEFAULT_MAX_IDLE_SECS = 7 * 24 * 60 * 60;
 
 /**
+ * Minimum age of a lifecycle row before an absent channel account releases it.
+ * Opens write lifecycle state before sending so admission ownership is durable;
+ * cleanup can otherwise race that send and delete both the row and an external
+ * capacity reservation while the account is still propagating.
+ */
+export const DEFAULT_MISSING_ACCOUNT_GRACE_SECS = 5 * 60;
+
+/**
  * Resolve an idle window: `undefined` or invalid means the default; `0`
  * disables idle abandon-close entirely.
  *
  * @param value - Configured idle window in seconds
  * @returns The idle window to enforce
  */
+function resolveNonNegativeSecs(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
 function resolveMaxIdleSecs(value: number | undefined): number {
-  return value !== undefined && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : DEFAULT_MAX_IDLE_SECS;
+  return resolveNonNegativeSecs(value, DEFAULT_MAX_IDLE_SECS);
 }
 
 /**
@@ -301,6 +318,14 @@ export interface RentCleanupOptions {
   maxTxsPerSigner?: number;
   /** Max abandon-close / Sealed-distribute transactions per call. */
   maxClosesPerRun?: number;
+  /** Accounts per `getMultipleAccounts` scan read. Defaults to 100; `1` disables batching. */
+  accountReadBatchSize?: number;
+  /**
+   * Seconds a newly indexed channel may remain absent before cleanup deletes
+   * its lifecycle row. Defaults to {@link DEFAULT_MISSING_ACCOUNT_GRACE_SECS};
+   * `0` restores immediate deletion.
+   */
+  missingAccountGraceSecs?: number;
   /**
    * Cancels the pass at its next scan / discovery / reclaim checkpoint. The
    * pass then rejects with an `AbortError`, matching the Go SDK's
@@ -368,6 +393,8 @@ export interface PaymentChannelRentCleanupManagerConfig {
    * the `idle` abandon policy.
    */
   maxIdleSecs?: number;
+  /** Default grace for a lifecycle row written just before its open broadcast. */
+  missingAccountGraceSecs?: number;
   /**
    * Open-channel abandon rule. Defaults to `idle` (batch settlement). `upto`
    * passes `expiry`.
@@ -399,6 +426,7 @@ export class PaymentChannelRentCleanupManager {
   private readonly computeUnitPriceMicroLamports: number | undefined;
   private readonly settleComputeUnitLimit: number | undefined;
   private readonly maxIdleSecs: number | undefined;
+  private readonly missingAccountGraceSecs: number | undefined;
   private readonly abandonPolicy: OpenAbandonPolicy;
   private readonly sealClosingChannels: boolean;
   private readonly label: string;
@@ -448,6 +476,7 @@ export class PaymentChannelRentCleanupManager {
     this.computeUnitPriceMicroLamports = config.computeUnitPriceMicroLamports;
     this.settleComputeUnitLimit = config.settleComputeUnitLimit;
     this.maxIdleSecs = config.maxIdleSecs;
+    this.missingAccountGraceSecs = config.missingAccountGraceSecs;
     this.abandonPolicy = config.abandonPolicy ?? "idle";
     this.sealClosingChannels = config.sealClosingChannels ?? true;
     this.label = label;
@@ -558,6 +587,10 @@ export class PaymentChannelRentCleanupManager {
   private async runPass(opts: RentCleanupOptions): Promise<void> {
     const abandonGraceSecs = resolveCleanupCount(opts.abandonGraceSecs, DEFAULT_ABANDON_GRACE_SECS);
     const maxIdleSecs = resolveMaxIdleSecs(opts.maxIdleSecs ?? this.maxIdleSecs);
+    const missingAccountGraceSecs = resolveNonNegativeSecs(
+      opts.missingAccountGraceSecs ?? this.missingAccountGraceSecs,
+      DEFAULT_MISSING_ACCOUNT_GRACE_SECS,
+    );
     const maxReclaimsPerTx = resolveCleanupCount(
       opts.maxReclaimsPerTx,
       DEFAULT_MAX_RECLAIMS_PER_TX,
@@ -566,12 +599,39 @@ export class PaymentChannelRentCleanupManager {
     const maxTxsPerRun = resolveCleanupCount(opts.maxTxsPerRun, DEFAULT_MAX_TXS_PER_RUN);
     const maxTxsPerSigner = resolveCleanupCount(opts.maxTxsPerSigner, DEFAULT_MAX_TXS_PER_SIGNER);
     const maxClosesPerRun = resolveCleanupCount(opts.maxClosesPerRun, DEFAULT_MAX_CLOSES_PER_RUN);
+    const accountReadBatchSize = resolveCleanupCount(
+      opts.accountReadBatchSize,
+      MAX_ACCOUNT_READ_BATCH_SIZE,
+      MAX_ACCOUNT_READ_BATCH_SIZE,
+    );
     const abort = passAbort(this.abortController?.signal, opts.signal);
 
     const rpc = accountFetchRpc(this.signer, this.network);
     const records = orderForScan(await this.storage.list(this.network), this.scanCursor);
     this.scanCursor = "";
     const nowSecs = Math.floor(Date.now() / 1_000);
+    const openSnapshots = new Map<string, Channel>();
+    if (accountReadBatchSize > 1 && this.signer.getMultipleAccounts) {
+      for (let offset = 0; offset < records.length; offset += accountReadBatchSize) {
+        abort.throwIfAborted();
+        const page = records.slice(offset, offset + accountReadBatchSize);
+        try {
+          const accounts = await fetchAllMaybeChannel(
+            rpc,
+            page.map(record => address(record.channelId)),
+            { commitment: STATE_COMMITMENT },
+          );
+          for (let index = 0; index < page.length; index += 1) {
+            const account = accounts[index];
+            const record = page[index];
+            if (account?.exists && record) openSnapshots.set(record.channelId, account.data);
+          }
+        } catch (error) {
+          // Fall back to the per-record read below for this page.
+          void error;
+        }
+      }
+    }
     let currentSlot: bigint | undefined;
     let txsUsed = 0;
     let closesUsed = 0;
@@ -593,11 +653,18 @@ export class PaymentChannelRentCleanupManager {
       if (record.network !== this.network) continue;
 
       try {
+        const snapshot = openSnapshots.get(record.channelId);
+        if (
+          snapshot?.status === ChannelStatus.Open &&
+          !openChannelDue(this.abandonPolicy, record, nowSecs, abandonGraceSecs, maxIdleSecs)
+        ) {
+          continue;
+        }
         const maybe = await fetchMaybeChannel(rpc, address(record.channelId), {
           commitment: STATE_COMMITMENT,
         });
         if (!maybe.exists) {
-          await this.deleteIfPastOpenGrace(record);
+          await this.deleteIfPastOpenGrace(record, missingAccountGraceSecs);
           continue;
         }
 
@@ -854,9 +921,13 @@ export class PaymentChannelRentCleanupManager {
    * elapsed. A pending open is kept so a later confirmation still has its row.
    *
    * @param record - Stored channel whose account was absent
+   * @param graceSecs - Seconds to retain the row while the open propagates
    */
-  private async deleteIfPastOpenGrace(record: PaymentChannelRecord): Promise<void> {
-    if (Date.now() < record.lastActivityAt + OPEN_INDEX_GRACE_SECS * 1_000) return;
+  private async deleteIfPastOpenGrace(
+    record: PaymentChannelRecord,
+    graceSecs = OPEN_INDEX_GRACE_SECS,
+  ): Promise<void> {
+    if (Date.now() < record.lastActivityAt + graceSecs * 1_000) return;
     await this.storage.delete(record.network, record.channelId);
   }
 
