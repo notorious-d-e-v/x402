@@ -28,7 +28,9 @@ jobs:
 
       - name: Install and Test
         working-directory: ./typescript
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
-          pnpm exec turbo run test --concurrency=50%
+          pnpm exec turbo run test --concurrency=1
           pnpm verify:exports
