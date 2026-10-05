@@ -1477,9 +1477,11 @@ resource, a client that holds such trust SHOULD prefer the server-mode accept
 and every other client MUST fall back to the client-mode accept.
 The client MUST keep at most one server-mode request in flight per channel so
 the returned cumulative voucher can be evaluated against one exact local
-watermark. A transport retry is a new x402 request and MUST use a new
-`requestId`; applications requiring response recovery SHOULD use the payment
-identifier extension. No onchain transaction is required in the request path.
+watermark. A retry intended to run the request again is a new x402 request and
+MUST use a new `requestId`. Applications requiring response recovery SHOULD use
+the payment identifier extension: the client resends the unanswered payload
+unchanged, with the same `requestId` and payment identifier (see Phase 5). No
+onchain transaction is required in the request path.
 The server verifies the authorization under Phase 3, reserves up to
 `PaymentRequirements.amount`, then after the handler measures the actual charge
 and stores an operator-signed voucher for that amount.
@@ -1646,7 +1648,15 @@ duplicate request from executing but is not an HTTP response-recovery protocol:
   replay defense. Reuse of a running or completed `(channelId, requestId)` MUST
   return `duplicate_settlement`; it MUST NOT replay a settlement response or
   execute the handler. Applications that need to recover a resource body after
-  a lost response SHOULD use the payment identifier extension.
+  a lost response SHOULD use the
+  [payment identifier extension](../../extensions/payment_identifier.md). A
+  resource server that offers it for server-mode requests MUST look up the
+  identifier before Phase 3, so a resend of a completed request gets the stored
+  response instead of reaching the operation record. The stored response MUST
+  include the original `PAYMENT-RESPONSE`, because the client advances its
+  watermark only from that receipt's voucher. Without a stored response, the
+  resend goes through Phase 3 like any other request; a rejection, such as
+  `duplicate_settlement`, does not show that the original was left uncharged.
 - **Client-mode paid requests.** The per-channel lock and charged watermark are
   the authoritative replay defense. The same authorization MUST NOT execute the
   resource handler more than once.
