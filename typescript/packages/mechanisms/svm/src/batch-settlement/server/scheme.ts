@@ -781,11 +781,12 @@ export class BatchSvmScheme implements SchemeNetworkServer {
       }
     } catch (error) {
       if (operationReserved && request.requestId) {
-        // An unreleased record still retires the request id; a throw here
-        // would turn this abort into a passed verify.
-        await this.operationStore
-          .release(request.channelId, request.requestId)
-          .catch(() => undefined);
+        try {
+          await this.operationStore.release(request.channelId, request.requestId);
+        } catch {
+          // An unreleased record still retires the request id; rethrowing
+          // would turn this abort into a passed verify.
+        }
       }
       this.requestContexts.delete(ctx.paymentPayload);
       return this.abort(

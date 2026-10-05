@@ -540,61 +540,76 @@ describe("batch server voucher signer boundaries", () => {
 
   it("fails verify closed when the store fails before the request is fenced", async () => {
     const channelId = serverDeposit.authorization!.channelId;
-    const store = new MemoryChannelStore();
-    const operationStore = new MemoryBatchOperationStore();
-    const resourceServer = new x402ResourceServer({
-      getSupported: async () => ({ kinds: [] }),
-      settle: async () => {
-        throw new Error("settle must not run");
-      },
-      verify: async () => ({
-        extra: { balance: "10000", channelId, totalClaimed: "0", withdrawRequestedAt: 0 },
-        isValid: true,
-        payer: payer.address,
-      }),
-    } as never);
-    resourceServer.register(
-      SOLANA_DEVNET_CAIP2,
-      new BatchServerScheme({ operator, operationStore, receiverAuthorizer, store }),
-    );
-    const verify = async (requestId: string) =>
-      resourceServer.verifyPayment(
-        {
-          accepted: requirements(),
-          payload: {
-            authorization: await authorizationFor(requestId),
-            channelConfig: serverDeposit.channelConfig,
-            type: "authorization",
-          },
-          x402Version: 2,
+    const setup = () => {
+      const store = new MemoryChannelStore();
+      const operationStore = new MemoryBatchOperationStore();
+      const resourceServer = new x402ResourceServer({
+        getSupported: async () => ({ kinds: [] }),
+        settle: async () => {
+          throw new Error("settle must not run");
         },
-        requirements(),
+        verify: async () => ({
+          extra: { balance: "10000", channelId, totalClaimed: "0", withdrawRequestedAt: 0 },
+          isValid: true,
+          payer: payer.address,
+        }),
+      } as never);
+      resourceServer.register(
+        SOLANA_DEVNET_CAIP2,
+        new BatchServerScheme({ operator, operationStore, receiverAuthorizer, store }),
       );
-    const update = store.update.bind(store);
+      const verify = async () =>
+        resourceServer.verifyPayment(
+          {
+            accepted: requirements(),
+            payload: {
+              authorization: await authorizationFor("request"),
+              channelConfig: serverDeposit.channelConfig,
+              type: "authorization",
+            },
+            x402Version: 2,
+          },
+          requirements(),
+        );
+      return { operationStore, store, verify };
+    };
 
     // The snapshot write fails before anything is reserved.
-    vi.spyOn(store, "update").mockRejectedValueOnce(new Error("store unavailable"));
-    await expect(verify("snapshot-write")).resolves.toMatchObject({
+    const snapshot = setup();
+    vi.spyOn(snapshot.store, "update").mockRejectedValueOnce(new Error("store unavailable"));
+    await expect(snapshot.verify()).resolves.toMatchObject({
       invalidMessage: "store unavailable",
       invalidReason: "transaction_failed",
       isValid: false,
     });
-    expect(await store.get(channelId)).toBeUndefined();
-    expect(await operationStore.get(channelId, "snapshot-write")).toBeUndefined();
+    expect(await snapshot.store.get(channelId)).toBeUndefined();
+    expect(await snapshot.operationStore.get(channelId, "request")).toBeUndefined();
 
-    // The reservation write fails after the operation is recorded, and so does its release.
-    vi.spyOn(store, "update")
-      .mockImplementationOnce(update)
-      .mockRejectedValueOnce(new Error("store unavailable"));
-    vi.spyOn(operationStore, "release").mockRejectedValueOnce(new Error("release unavailable"));
-    await expect(verify("reservation-write")).resolves.toMatchObject({
-      invalidReason: "transaction_failed",
-      isValid: false,
-    });
-    expect((await store.get(channelId))?.reservations ?? {}).toEqual({});
-    await expect(operationStore.get(channelId, "reservation-write")).resolves.toMatchObject({
-      status: "reserved",
-    });
+    // The reservation write fails after the operation is recorded, and its
+    // release then rejects or throws synchronously.
+    const releaseFailures = [
+      () => Promise.reject(new Error("release unavailable")),
+      () => {
+        throw new Error("release unavailable");
+      },
+    ];
+    for (const failRelease of releaseFailures) {
+      const { operationStore, store, verify } = setup();
+      const update = store.update.bind(store);
+      vi.spyOn(store, "update")
+        .mockImplementationOnce(update)
+        .mockRejectedValueOnce(new Error("store unavailable"));
+      const release = vi.spyOn(operationStore, "release").mockImplementationOnce(failRelease);
+      await expect(verify()).resolves.toMatchObject({
+        invalidReason: "transaction_failed",
+        isValid: false,
+      });
+      expect(release).toHaveBeenCalledWith(channelId, "request");
+      expect((await store.get(channelId))?.reservations ?? {}).toEqual({});
+      await expect(operationStore.get(channelId, "request")).resolves.toMatchObject({
+        status: "reserved",
+      });
+    }
   });
 
   it("reserves concurrent ceilings, completes out of order, and rejects reused ids", async () => {
