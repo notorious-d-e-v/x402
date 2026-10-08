@@ -30,10 +30,6 @@ uv run python main.py
 ### Facilitator
 - **[facilitator/](./facilitator/)** - Payment facilitator service
 
-### Full Stack
-
-- **[fullstack/svm-batch-settlement/](./fullstack/svm-batch-settlement/)** - Local Python merchant/client with a bounded Solana batch lifecycle and remote facilitator
-
 ## Legacy SDK
 
 - **[legacy/](./legacy/)** - V1 SDK examples (for backward compatibility)
