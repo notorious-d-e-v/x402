@@ -107,12 +107,14 @@ available for custom transports. Automatic HTTP refunds use `httpx`.
 from x402 import x402ResourceServerSync
 from x402.mechanisms.svm.batch_settlement import BatchSvmServerScheme, BatchSvmServerConfig
 
-scheme = BatchSvmServerScheme(BatchSvmServerConfig(
-    receiver_authorizer=receiver_signer,
-    # operator=operator_signer,  # Enables metered server-signed routes.
-    store=channel_store,
-    operation_store=operation_store,
-))
+scheme = BatchSvmServerScheme(
+    BatchSvmServerConfig(
+        receiver_authorizer=receiver_signer,
+        # operator=operator_signer,  # Enables metered server-signed routes.
+        store=channel_store,
+        operation_store=operation_store,
+    )
+)
 server = x402ResourceServerSync(facilitator_client).register("solana:*", scheme)
 server.initialize()
 ```
@@ -147,8 +149,10 @@ period. Use a synchronous facilitator client for this worker.
 
 ```python
 from x402.mechanisms.svm.batch_settlement import (
-    BatchFacilitatorKeypairSigner, BatchSvmFacilitatorConfig,
-    BatchSvmFacilitatorScheme, BatchSvmRentCleanupManager,
+    BatchFacilitatorKeypairSigner,
+    BatchSvmFacilitatorConfig,
+    BatchSvmFacilitatorScheme,
+    BatchSvmRentCleanupManager,
 )
 
 scheme = BatchSvmFacilitatorScheme(
