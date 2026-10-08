@@ -13,3 +13,6 @@ operator public key. This grants authority over the escrow, capped at $1 in this
 example. Each request is capped at $0.10. The example uses memory storage; see
 [the SDK guide](../../../../python/x402/mechanisms/svm/batch_settlement/README.md)
 for persistent adapters, refunds, and server/facilitator setup.
+
+For a local Python merchant/client lifecycle against a remote facilitator, see
+the [SVM batch smoke test](../../fullstack/svm-batch-settlement/README.md).
