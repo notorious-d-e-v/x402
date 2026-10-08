@@ -277,10 +277,6 @@ def create_payment_wrapper(
                         proceed = hooks.on_before_execution(hook_ctx)
                         if inspect.isawaitable(proceed):
                             proceed = await proceed
-                        if proceed:
-                            settlement_requirements = metered_payment_requirements(
-                                payment_requirements, hook_ctx.payment_requirements.amount
-                            )
                     except Exception as error:
                         await cancel_verified(
                             VerifiedPaymentCancelOptions(
@@ -296,6 +292,22 @@ def create_payment_wrapper(
                             )
                         )
                         return await payment_required_result("Execution blocked by hook", payload)
+
+                    try:
+                        settlement_requirements = metered_payment_requirements(
+                            payment_requirements, hook_ctx.payment_requirements.amount
+                        )
+                    except ValueError as error:
+                        await cancel_verified(
+                            VerifiedPaymentCancelOptions(reason="after_verify_aborted", error=error)
+                        )
+                        return _create_settlement_failed_result(
+                            accepts,
+                            tool_resource,
+                            "Payment metering failed",
+                            extensions,
+                            network=payment_requirements.network,
+                        )
 
                 # Execute the original handler
                 try:

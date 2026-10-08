@@ -343,6 +343,7 @@ async def _process_paid_tool_call_async(
             ext_map,
             transport_context,
             skip_result,
+            verified_requirements=payment_requirements,
         )
 
     before_handler_settlement = None
@@ -425,16 +426,48 @@ async def _process_paid_tool_call_async(
             cancel_settlement, before_handler_settlement, payment_payload
         )
 
+    async def cancel_failed_execution(
+        result: MCPToolResult, metering_error: Exception | None = None
+    ) -> MCPToolResult:
+        cancel_settlement = None
+        cancellation_completed = False
+        try:
+            if dispatcher is not None:
+                cancel_settlement = dispatcher.cancel(
+                    VerifiedPaymentCancelOptions(
+                        reason="after_verify_aborted"
+                        if metering_error is not None
+                        else "handler_failed",
+                        error=metering_error,
+                    )
+                )
+                if hasattr(cancel_settlement, "__await__"):
+                    cancel_settlement = await cancel_settlement
+                cancellation_completed = True
+        except Exception:
+            cancel_settlement = None
+            if before_handler_settlement is None:
+                raise
+            # Upfront payment is still a known fact even if cancellation failed.
+            # Surface its original receipt without claiming a completed refund.
+            result.content.append({"type": "text", "text": "Payment cancellation outcome unknown"})
+        failure_receipt = resolve_failure_path_settlement(
+            cancel_settlement, before_handler_settlement, payment_payload
+        )
+        if failure_receipt is None:
+            if metering_error is not None and cancellation_completed:
+                return await _create_settlement_failed_result_async(
+                    resource_server, tool_name, config, "Payment metering failed"
+                )
+            return result
+        return attach_failure_path_receipt(result, failure_receipt)
+
     settlement_requirements = payment_requirements.model_copy(deep=True)
     if config.hooks and config.hooks.on_before_execution:
         try:
             proceed = config.hooks.on_before_execution(hook_context)
             if hasattr(proceed, "__await__"):
                 proceed = await proceed
-            if proceed:
-                settlement_requirements = metered_payment_requirements(
-                    payment_requirements, hook_context.payment_requirements.amount
-                )
         except Exception as error:
             receipt = await cancel_before_execution(error)
             if receipt is None:
@@ -461,6 +494,18 @@ async def _process_paid_tool_call_async(
                 config,
                 "Execution blocked by hook",
                 transport_context=transport_context,
+            )
+
+        try:
+            settlement_requirements = metered_payment_requirements(
+                payment_requirements, hook_context.payment_requirements.amount
+            )
+        except ValueError as error:
+            return await cancel_failed_execution(
+                MCPToolResult(
+                    content=[{"type": "text", "text": "Payment metering failed"}], is_error=True
+                ),
+                error,
             )
 
     try:
@@ -522,51 +567,20 @@ async def _process_paid_tool_call_async(
         )
 
     if result.is_error:
-        cancel_settlement = None
-        cancellation_completed = False
-        try:
-            if dispatcher is not None:
-                cancel_settlement = dispatcher.cancel(
-                    VerifiedPaymentCancelOptions(
-                        reason="after_verify_aborted"
-                        if metering_error is not None
-                        else "handler_failed",
-                        error=metering_error,
-                    )
-                )
-                if hasattr(cancel_settlement, "__await__"):
-                    cancel_settlement = await cancel_settlement
-                cancellation_completed = True
-        except Exception:
-            cancel_settlement = None
-            if before_handler_settlement is None:
-                raise
-            # Upfront payment is still a known fact even if cancellation failed.
-            # Surface its original receipt without claiming a completed refund.
-            result.content.append({"type": "text", "text": "Payment cancellation outcome unknown"})
-        failure_receipt = resolve_failure_path_settlement(
-            cancel_settlement, before_handler_settlement, payment_payload
-        )
-        if failure_receipt is None:
-            if metering_error is not None and cancellation_completed:
-                return await _create_settlement_failed_result_async(
-                    resource_server, tool_name, config, "Payment metering failed"
-                )
-            return result
-        return attach_failure_path_receipt(result, failure_receipt)
+        return await cancel_failed_execution(result, metering_error)
 
-    payment_requirements = settlement_requirements
     return await _settle_payment_result_async(
         resource_server,
         tool_name,
         config,
         hook_context,
         payment_payload,
-        payment_requirements,
+        settlement_requirements,
         ext_map,
         transport_context,
         result,
         before_handler_settlement,
+        verified_requirements=payment_requirements,
     )
 
 
@@ -628,6 +642,8 @@ async def _settle_payment_result_async(
     transport_context: Any,
     result: MCPToolResult,
     before_handler_settlement: CompletedSettlement | None = None,
+    *,
+    verified_requirements: PaymentRequirements,
 ) -> MCPToolResult:
     try:
         if before_handler_settlement is not None:
@@ -686,7 +702,7 @@ async def _settle_payment_result_async(
             canceled = await _cancel_aborted_settlement_async(
                 resource_server,
                 payment_payload,
-                payment_requirements,
+                verified_requirements,
                 ext_map,
                 transport_context,
                 e,
