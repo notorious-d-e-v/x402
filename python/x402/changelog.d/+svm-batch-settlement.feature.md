@@ -1,0 +1,1 @@
+Add SVM batch-settlement clients, servers, and facilitators with cumulative vouchers, opt-in operator-signed metering, sponsored channel transactions, refunds, and durable recovery storage interfaces.
