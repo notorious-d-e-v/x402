@@ -168,19 +168,37 @@ class MCPToolCallResult:
         is_error: bool = False,
         payment_response: SettleResponse | None = None,
         payment_made: bool = False,
+        raw_result: MCPToolResult | None = None,
     ):
         """Initialize tool call result.
 
         Args:
             content: Content items
             is_error: Whether this is an error result
-            payment_response: Optional settlement response
-            payment_made: Whether payment was made
+            payment_response: Successful settlement response, if available
+            payment_made: Payment submitted without an explicit settlement failure;
+                this alone does not confirm settlement
+            raw_result: Original tool result, including failed settlement details
         """
         self.content = content
         self.is_error = is_error
         self.payment_response = payment_response
         self.payment_made = payment_made
+        self.raw_result = raw_result
+
+
+class PaymentResponseError(Exception):
+    """Payment response validation failed after a tool returned.
+
+    ``result`` preserves the tool output for inspection without treating its
+    receipt as validated. The validation error is available as ``__cause__``.
+    Retrying automatically is unsafe because payment may already have settled.
+    """
+
+    def __init__(self, message: str, result: Any):
+        """Initialize an error carrying the tool result."""
+        super().__init__(message)
+        self.result = result
 
 
 class SyncPaymentWrapperConfig:
