@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -39,6 +40,8 @@ class BatchChannelManager:
         read_payout_watermark: Callable[[str], int | None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
     ):
+        if inspect.iscoroutinefunction(getattr(facilitator, "settle", None)):
+            raise TypeError("BatchChannelManager requires a synchronous facilitator client")
         if type(max_channels_per_batch) is not int or not 1 <= max_channels_per_batch <= 4:
             raise ValueError("max_channels_per_batch must be between 1 and 4")
         if not (requirements.extra or {}).get("feePayer"):
@@ -226,7 +229,8 @@ class BatchChannelManager:
             channels = [
                 s
                 for s in self._eligible()
-                if s.highest_voucher and s.signed_max_claimable > s.settled
+                if s.highest_voucher
+                and (s.status == "closing" or s.signed_max_claimable > s.settled)
             ]
             open_channels = [s for s in channels if s.status == "open"]
             for index in range(0, len(open_channels), self.batch_size):

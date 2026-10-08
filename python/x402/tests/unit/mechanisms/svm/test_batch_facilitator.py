@@ -1,9 +1,10 @@
 """Facilitator lifecycle, sponsor, and crash-recovery tests with real signatures."""
 
 import base64
+import json
 import struct
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest.mock import Mock
 
 import pytest
@@ -35,6 +36,7 @@ from x402.mechanisms.svm.payment_channels import (
     ChannelStatus,
     build_open_transaction,
     build_request_close_transaction,
+    build_top_up_transaction,
     distribution_hash,
     find_ata,
     find_payment_channel_pda,
@@ -398,7 +400,8 @@ def test_expiry_requires_actual_hash_invalid_and_processed_errors_remain_pending
     rpc.hash_valid = False
     assert scheme.settle(payload, req).error_reason == "transaction_expired"
     assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
-    assert len(rpc.sent) == 1
+    assert len(rpc.sent) == 3
+    assert len(set(rpc.sent)) == 1 and len(rpc.signed) == 1
 
 
 def test_cooperative_refund_authenticates_final_watermark_and_returns_unused_escrow(fixture):
@@ -588,3 +591,388 @@ def test_sealed_payout_alias_is_reported_with_confirmed_signature_not_invented_a
     assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
     assert not scheme.config.on_distribution_confirmed.called
     assert scheme.settle(payload, req) == result
+
+
+@pytest.mark.parametrize("observed", ["closing", "missing", "insufficient"])
+def test_confirmed_deposit_postcondition_failure_releases_channel(fixture, observed):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    state = {
+        "closing": replace(
+            channel, status=ChannelStatus.CLOSING, closure_started_at=int(time.time())
+        ),
+        "missing": None,
+        "insufficient": replace(channel, deposit=99),
+    }[observed]
+    rpc.on_send = lambda: setattr(rpc, "channel", state)
+    payload = deposit(req, cfg, cid)
+    result = scheme.settle(payload, req)
+    assert result.error_reason == (
+        BatchError.CHANNEL_CLOSING if observed == "closing" else BatchError.CHANNEL_STATE
+    )
+    assert result.transaction
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+    assert BatchSvmScheme(rpc, scheme.config).settle(payload, req) == result
+    assert len(rpc.sent) == 1
+    if observed == "closing":
+        raw = close_payload("seal", req, cfg, cid, 10)
+        rpc.on_send = lambda: setattr(rpc, "channel", None)
+        sealed = scheme.settle(payment(req, raw), req)
+        assert sealed.success, sealed.error_message
+
+
+def test_confirmed_deposit_rpc_failure_keeps_reservation_until_fresh_read(fixture):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    original_read = scheme.read_channel
+    rpc.on_send = lambda: setattr(
+        scheme, "read_channel", Mock(side_effect=OSError("RPC temporarily unavailable"))
+    )
+    payload = deposit(req, cfg, cid)
+    result = scheme.settle(payload, req)
+    assert result.error_reason == "settlement_pending"
+    assert scheme.pending_store.find_pending(NETWORK, [cid])
+    scheme.read_channel = original_read
+    rpc.channel = channel
+    assert scheme.settle(payload, req).success
+    assert len(rpc.sent) == len(rpc.signed) == 1
+
+
+def test_top_up_identity_ignores_changed_voucher_and_charged_price(fixture):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = channel
+    wire = build_top_up_transaction(
+        payer=PAYER,
+        channel_id=cid,
+        mint=req.asset,
+        token_program=TOKEN_PROGRAM_ADDRESS,
+        fee_payer=req.extra["feePayer"],
+        amount=50,
+        blockhash=str(Hash.default()),
+        memo="order",
+    )
+    raw = {
+        "type": "deposit",
+        "channelConfig": cfg,
+        "voucher": voucher(cid, 10),
+        "deposit": {"amount": "50", "transaction": wire},
+    }
+    rpc.on_send = lambda: setattr(rpc, "channel", replace(channel, deposit=150))
+    result = scheme.settle(payment(req, raw), req)
+    assert result.success and result.extra["channelState"]["balance"] == "150"
+    changed_req = req.model_copy(update={"amount": "20"})
+    retry = {**raw, "voucher": voucher(cid, 30)}
+    assert scheme.settle(payment(changed_req, retry), changed_req) == result
+    assert len(rpc.sent) == len(rpc.signed) == 1
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+    # The fee-payer placeholder does not change the fully signed transaction's identity.
+    decoded = VersionedTransaction.from_bytes(base64.b64decode(wire))
+    changed_signatures = list(decoded.signatures)
+    changed_signatures[0] = AUTH.sign_message(b"untrusted sponsor placeholder")
+    retry["deposit"] = {
+        "amount": "50",
+        "transaction": base64.b64encode(
+            bytes(VersionedTransaction.populate(decoded.message, changed_signatures))
+        ).decode(),
+    }
+    assert scheme.settle(payment(changed_req, retry), changed_req) == result
+    assert len(rpc.sent) == 1
+
+
+def close_payload(kind, req, cfg, cid, amount, *, validity=30):
+    return {
+        "type": kind,
+        "channelId": cid,
+        "channelConfig": cfg,
+        "voucher": voucher(cid, amount),
+        "closeAuthorization": sign_close_authorization(
+            AUTH,
+            network=NETWORK,
+            fee_payer=req.extra["feePayer"],
+            channel_id=cid,
+            max_claimable_amount=amount,
+            valid_before=int(time.time()) + validity,
+        ),
+    }
+
+
+@pytest.mark.parametrize("kind", ["seal", "refund"])
+def test_close_retries_with_refreshed_authorization_recover_same_result(fixture, kind):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = replace(
+        channel,
+        settled=20,
+        payout_watermark=10,
+        status=ChannelStatus.CLOSING if kind == "seal" else ChannelStatus.OPEN,
+        closure_started_at=int(time.time()) if kind == "seal" else 0,
+    )
+    scheme.channel_storage.record(
+        PaymentChannelRecord(
+            NETWORK,
+            cid,
+            req.pay_to,
+            TOKEN_PROGRAM_ADDRESS,
+            receiver_authorizer=cfg["receiverAuthorizer"],
+        )
+    )
+    rpc.status = None
+    rpc.on_send = lambda: setattr(rpc, "channel", None)
+    raw = close_payload(kind, req, cfg, cid, 30)
+    first = scheme.settle(payment(req, raw), req)
+    assert first.error_reason == "settlement_pending"
+    pending = scheme.pending_store.find_pending(NETWORK, [cid])
+    assert (
+        json.loads(json.dumps(asdict(pending)))["metadata"]["before"][0]["distribution_hash"]
+        == channel.distribution_hash.hex()
+    )
+    # Restore through the same JSON representation a durable store would use.
+    stored = json.loads(json.dumps(asdict(pending)))
+    stored["channel_ids"] = tuple(stored["channel_ids"])
+    scheme.pending_store._records[pending.key] = PendingSettlement(**stored)
+    retry = close_payload(kind, req, cfg, cid, 30, validity=50)
+    assert retry["closeAuthorization"] != raw["closeAuthorization"]
+    rpc.status = {"err": None, "confirmation_status": "confirmed", "slot": 1000}
+    restarted = BatchSvmScheme(rpc, scheme.config)
+    final = restarted.settle(payment(req, retry), req)
+    assert final.success and final.transaction == first.transaction
+    assert final.amount == ("20" if kind == "seal" else "70")
+    assert (
+        restarted.settle(payment(req, close_payload(kind, req, cfg, cid, 30, validity=55)), req)
+        == final
+    )
+    assert len(rpc.signed) == len(rpc.sent) == 1
+    forged = {
+        **retry,
+        "closeAuthorization": {**retry["closeAuthorization"], "signature": "invalid"},
+    }
+    assert (
+        restarted.settle(payment(req, forged), req).error_reason == BatchError.CLOSE_AUTHORIZATION
+    )
+    bad_voucher = {**retry, "voucher": {**retry["voucher"], "signature": "invalid"}}
+    assert (
+        restarted.settle(payment(req, bad_voucher), req).error_reason
+        == BatchError.VOUCHER_SIGNATURE
+    )
+    changed_req = req.model_copy(update={"extra": {**req.extra, "withdrawDelay": 901}})
+    changed = {**retry, "channelConfig": {**cfg, "withdrawDelay": 901}}
+    assert (
+        restarted.settle(payment(changed_req, changed), changed_req).error_reason
+        == BatchError.CHANNEL_STATE
+    )
+    assert len(rpc.sent) == 1
+
+
+def test_crash_after_persist_before_send_resends_saved_bytes_without_resigning(fixture):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    reserve = scheme.pending_store.reserve
+
+    def crash(record):
+        assert reserve(record)
+        raise KeyboardInterrupt("process terminated before broadcast")
+
+    scheme.pending_store.reserve = crash
+    rpc.status = None
+    with pytest.raises(KeyboardInterrupt):
+        scheme.settle(deposit(req, cfg, cid), req)
+    record = scheme.pending_store.find_pending(NETWORK, [cid])
+    assert record and not rpc.sent and len(rpc.signed) == 1
+    scheme.pending_store.reserve = reserve
+
+    def landed():
+        rpc.channel = channel
+        rpc.status = {"err": None, "confirmation_status": "confirmed", "slot": 1000}
+
+    rpc.on_send = landed
+    result = BatchSvmScheme(rpc, scheme.config).recover_pending(record)
+    assert result.success and result.transaction == record.signature
+    assert rpc.sent == [record.wire_transaction] and len(rpc.signed) == 1
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+
+
+def test_completed_refund_recovers_as_manager_seal_with_equivalent_route_terms(fixture):
+    from x402.mechanisms.svm.batch_settlement.client import align_refund_requirements
+    from x402.mechanisms.svm.constants import TOKEN_2022_PROGRAM_ADDRESS
+
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = channel
+    scheme.channel_storage.record(
+        PaymentChannelRecord(
+            NETWORK,
+            cid,
+            req.pay_to,
+            TOKEN_PROGRAM_ADDRESS,
+            receiver_authorizer=cfg["receiverAuthorizer"],
+        )
+    )
+    refund_req = align_refund_requirements(req, cfg)
+    assert refund_req.extra["voucherSigner"] == "client"
+    assert "voucherSigner" not in req.extra
+    raw = close_payload("refund", refund_req, cfg, cid, 30)
+    rpc.on_send = lambda: setattr(rpc, "channel", None)
+    result = scheme.settle(payment(refund_req, raw), refund_req)
+    assert result.success, result.error_message
+    manager_req = req.model_copy(
+        update={
+            "amount": "15",
+            "max_timeout_seconds": 55,
+            "extra": {**req.extra, "minDeposit": "200", "recentSlot": 456},
+        }
+    )
+    seal = close_payload("seal", manager_req, cfg, cid, 30, validity=40)
+    restarted = BatchSvmScheme(rpc, scheme.config)
+    assert restarted.settle(payment(manager_req, seal), manager_req) == result
+    # A different token program is an immutable binding, even after deallocation.
+    changed_req = manager_req.model_copy(
+        update={
+            "extra": {**manager_req.extra, "tokenProgram": TOKEN_2022_PROGRAM_ADDRESS},
+        }
+    )
+    assert (
+        restarted.settle(payment(changed_req, seal), changed_req).error_reason
+        == BatchError.CHANNEL_STATE
+    )
+    assert len(rpc.signed) == len(rpc.sent) == 1
+
+
+def test_failed_rebroadcast_preserves_unknown_outcome(fixture):
+    scheme, rpc, req, cfg, cid, _ = fixture
+    rpc.status = None
+    result = scheme.settle(deposit(req, cfg, cid), req)
+    record = scheme.pending_store.find_pending(NETWORK, [cid])
+    rpc.send_transaction = Mock(side_effect=OSError("RPC disconnected"))
+    recovered = BatchSvmScheme(rpc, scheme.config).recover_pending(record)
+    assert recovered.error_reason == "settlement_pending"
+    assert recovered.transaction == result.transaction
+    rpc.send_transaction.assert_called_once_with(record.wire_transaction, NETWORK)
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) == record
+    assert len(rpc.signed) == 1
+
+
+@pytest.mark.parametrize("slot", [None, 123, "123", 122, "122", True, " 123", 2**53])
+def test_open_checks_only_optional_challenged_slot(fixture, slot):
+    scheme, rpc, req, cfg, cid, _ = fixture
+    if slot is not None:
+        req = req.model_copy(update={"extra": {**req.extra, "recentSlot": slot}})
+    rpc.get_slot = Mock(side_effect=AssertionError("do not compare against a different RPC slot"))
+    result = scheme.verify(deposit(req, cfg, cid), req)
+    assert result.is_valid is (slot is None or slot in (123, "123"))
+    rpc.get_slot.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["deposit", "claim", "request_close"])
+def test_simulation_failures_have_stable_error_code(fixture, operation):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.simulate_transaction = Mock(side_effect=RuntimeError("simulation rejected"))
+    if operation == "deposit":
+        payload = deposit(req, cfg, cid)
+        assert scheme.verify(payload, req).invalid_reason == BatchError.SETTLEMENT_SIMULATION
+    elif operation == "claim":
+        rpc.channel = channel
+        payload = payment(
+            req,
+            {
+                "type": "claim",
+                "claims": [
+                    {
+                        "channelId": cid,
+                        "channelConfig": cfg,
+                        "voucher": voucher(cid, 10),
+                    }
+                ],
+            },
+        )
+    else:
+        rpc.channel = channel
+        payload = payment(
+            req,
+            {
+                "type": "refund",
+                "channelConfig": cfg,
+                "voucher": voucher(cid, 0),
+                "transaction": build_request_close_transaction(
+                    payer=PAYER,
+                    channel_id=cid,
+                    fee_payer=req.extra["feePayer"],
+                    blockhash=str(Hash.default()),
+                    memo="order",
+                ),
+            },
+        )
+    assert scheme.settle(payload, req).error_reason == BatchError.SETTLEMENT_SIMULATION
+    assert not rpc.sent and scheme.pending_store.find_pending(NETWORK, [cid]) is None
+
+
+@pytest.mark.parametrize("kind", ["voucher", "deposit", "claim"])
+def test_voucher_above_deposit_has_distinct_error_code(fixture, kind):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    if kind == "deposit":
+        payload = deposit(req, cfg, cid)
+        payload.payload["voucher"] = voucher(cid, 101)
+        result = scheme.verify(payload, req)
+    elif kind == "claim":
+        rpc.channel = channel
+        result = scheme.settle(
+            payment(
+                req,
+                {
+                    "type": "claim",
+                    "claims": [
+                        {
+                            "channelId": cid,
+                            "channelConfig": cfg,
+                            "voucher": voucher(cid, 101),
+                        }
+                    ],
+                },
+            ),
+            req,
+        )
+        assert result.error_reason == BatchError.CUMULATIVE_EXCEEDS_DEPOSIT
+        return
+    else:
+        rpc.channel = channel
+        result = scheme.verify(
+            payment(
+                req,
+                {
+                    "type": "voucher",
+                    "channelConfig": cfg,
+                    "voucher": voucher(cid, 101),
+                },
+            ),
+            req,
+        )
+    assert result.invalid_reason == BatchError.CUMULATIVE_EXCEEDS_DEPOSIT
+
+
+def test_facilitator_requires_actual_blockhash_validity_reader(fixture):
+    scheme, rpc, *_ = fixture
+    rpc.is_blockhash_valid = None
+    with pytest.raises(TypeError, match="is_blockhash_valid"):
+        BatchSvmScheme(rpc, scheme.config)
+
+
+def test_stale_post_confirmation_read_cannot_release_deposit_reservation(fixture, monkeypatch):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    original_read = rpc.get_account_info
+
+    def stale_read(address, network, *, min_context_slot=None):
+        account = original_read(address, network, min_context_slot=min_context_slot)
+        if address == cid and account:
+            account["context_slot"] = 999
+        return account
+
+    def landed():
+        rpc.channel = replace(channel, status=ChannelStatus.CLOSING, closure_started_at=100)
+        rpc.get_account_info = stale_read
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    rpc.on_send = landed
+    payload = deposit(req, cfg, cid)
+    result = scheme.settle(payload, req)
+    assert result.error_reason == "settlement_pending"
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is not None
+    rpc.get_account_info = original_read
+    final = scheme.settle(payload, req)
+    assert final.error_reason == BatchError.CHANNEL_CLOSING
+    assert final.transaction == result.transaction
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+    assert len(rpc.sent) == 1

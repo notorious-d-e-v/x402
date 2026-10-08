@@ -55,7 +55,13 @@ from .facilitator_storage import (
     PendingSettlement,
 )
 from .receiver_binding import read_receiver_binding_from_open
-from .validation import atomic, validate_channel_config, validate_client_payload, validate_voucher
+from .validation import (
+    atomic,
+    integer,
+    validate_channel_config,
+    validate_client_payload,
+    validate_voucher,
+)
 
 
 @dataclass
@@ -88,6 +94,10 @@ def _snapshot(channel_id: str, channel: Channel) -> dict[str, Any]:
     }
 
 
+def _channel_metadata(channel: Channel) -> dict[str, Any]:
+    return {**asdict(channel), "distribution_hash": channel.distribution_hash.hex()}
+
+
 def _failure(
     network: str, reason: str, payer: str = "", signature: str = "", message: str | None = None
 ) -> SettleResponse:
@@ -114,6 +124,7 @@ class BatchSvmScheme:
             "get_latest_blockhash",
             "get_slot",
             "get_block_height",
+            "is_blockhash_valid",
             "get_signature_status",
             "get_transaction",
             "sign_transaction",
@@ -350,10 +361,10 @@ class BatchSvmScheme:
                 raise BatchError(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT)
         else:
             amount = atomic(raw["voucher"]["maxClaimableAmount"])
-            if (
-                amount > total
-                or (before is None and amount != charge)
-                or (before and (amount <= before.settled or amount < before.settled + charge))
+            if amount > total:
+                raise BatchError(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT)
+            if (before is None and amount != charge) or (
+                before and (amount <= before.settled or amount < before.settled + charge)
             ):
                 raise BatchError(BatchError.CUMULATIVE_AMOUNT_MISMATCH)
         try:
@@ -369,16 +380,22 @@ class BatchSvmScheme:
                     raw["deposit"]["transaction"], channel_id=channel_id, amount=deposit, **kwargs
                 )
             else:
+                recent_slot = extra.get("recentSlot")
+                if recent_slot is not None:
+                    recent_slot = integer(
+                        atomic(recent_slot, "recentSlot")
+                        if isinstance(recent_slot, str)
+                        else recent_slot,
+                        "recentSlot",
+                    )
                 transaction = verify_open_transaction(
                     raw["deposit"]["transaction"],
                     deposit=deposit,
-                    current_slot=self.signer.get_slot(requirements.network),
+                    current_slot=recent_slot,
                     **kwargs,
                 )
             self._check_accounts(config, requirements, deposit)
-            self.signer.simulate_transaction(
-                raw["deposit"]["transaction"], requirements.network, sig_verify=False
-            )
+            self._simulate(raw["deposit"]["transaction"], requirements.network, sig_verify=False)
         except BatchError:
             raise
         except Exception as error:
@@ -435,10 +452,10 @@ class BatchSvmScheme:
                     )
             elif raw["type"] == "voucher":
                 amount = atomic(raw["voucher"]["maxClaimableAmount"])
-                if (
-                    amount > channel.deposit
-                    or amount <= channel.settled
-                    or amount < channel.settled + atomic(requirements.amount)
+                if amount > channel.deposit:
+                    raise BatchError(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT)
+                if amount <= channel.settled or amount < channel.settled + atomic(
+                    requirements.amount
                 ):
                     raise BatchError(BatchError.CUMULATIVE_AMOUNT_MISMATCH)
             elif atomic(requirements.amount) > channel.deposit - channel.settled:
@@ -481,6 +498,21 @@ class BatchSvmScheme:
 
     @staticmethod
     def _key(raw: dict[str, Any], requirements: PaymentRequirements) -> str:
+        kind = raw["type"]
+        if kind == "deposit" or (
+            kind == "refund" and raw.get("transaction") and not raw.get("closeAuthorization")
+        ):
+            wire = raw["deposit"]["transaction"] if kind == "deposit" else raw["transaction"]
+            transaction = VersionedTransaction.from_bytes(base64.b64decode(wire, validate=True))
+            transaction.sanitize()
+            # The sponsor signature may still be a placeholder. Signing the same
+            # message produces the same transaction regardless of refreshed proofs.
+            identity = hashlib.sha256(to_bytes_versioned(transaction.message)).hexdigest()
+            return f"batch:{kind}:{requirements.network}:{identity}"
+        if kind in ("seal", "refund"):
+            voucher = raw.get("voucher") or {}
+            target = atomic(voucher.get("maxClaimableAmount"), "maxClaimableAmount")
+            return f"batch:close:{requirements.network}:{voucher.get('channelId')}:{target}"
         content = {
             "payload": raw,
             "requirements": requirements.model_dump(mode="json", by_alias=True),
@@ -491,6 +523,58 @@ class BatchSvmScheme:
                 json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
         )
+
+    def _check_cached_request(
+        self,
+        record: PendingSettlement,
+        raw: dict[str, Any],
+        requirements: PaymentRequirements,
+        context: Any,
+    ) -> None:
+        if raw["type"] not in ("deposit", "seal", "refund"):
+            return
+        config = raw.get("channelConfig")
+        channel_requirements = requirements
+        if raw["type"] == "seal" and isinstance(config, dict):
+            extra = {
+                **(requirements.extra or {}),
+                "voucherSigner": config.get("voucherSigner", "client"),
+            }
+            if extra["voucherSigner"] == "server":
+                extra["operator"] = config["payerAuthorizer"]
+            else:
+                extra.pop("operator", None)
+            channel_requirements = requirements.model_copy(update={"extra": extra})
+        channel_id = validate_channel_config(config, channel_requirements)
+        if record.channel_ids != (channel_id,) or record.metadata.get("configs") != [config]:
+            raise BatchError(BatchError.CHANNEL_STATE, "cached transaction channel terms differ")
+        original = PaymentRequirements.model_validate(record.metadata["requirements"])
+        # Config equality and validation bind receiver, authorizers, mode, and delay.
+        # Route pricing, timeouts, and construction hints do not identify the transaction.
+        terms = [
+            (
+                value.scheme,
+                value.network,
+                value.asset,
+                value.pay_to,
+                (value.extra or {}).get("feePayer"),
+                (value.extra or {}).get("tokenProgram"),
+            )
+            for value in (original, requirements)
+        ]
+        if terms[0] != terms[1] or (
+            raw["type"] == "deposit"
+            and raw.get("deposit", {}).get("amount") != record.metadata["deposit_amount"]
+        ):
+            raise BatchError(BatchError.CHANNEL_STATE, "cached transaction requirements differ")
+        if record.kind in ("seal", "refund"):
+            self._authenticate_close(
+                raw,
+                requirements,
+                channel_id,
+                self._read_binding(requirements.network, channel_id),
+                context,
+            )
 
     def settle(
         self, payment: PaymentPayload, requirements: PaymentRequirements, context: Any = None
@@ -510,6 +594,7 @@ class BatchSvmScheme:
             key = self._key(raw, requirements)
             _, existing = self._operation_attempt(key)
             if existing:
+                self._check_cached_request(existing, raw, requirements, context)
                 # A completed distribute can be reused only until a newer settled watermark appears.
                 if raw["type"] != "settle" or existing.response is None:
                     return self._reconcile(existing, requirements)
@@ -644,12 +729,13 @@ class BatchSvmScheme:
             fee_payer=extra["feePayer"],
             blockhash=str(message.recent_blockhash),
         )
+        self._simulate(
+            base64.b64encode(bytes(composite)).decode(), requirements.network, sig_verify=False
+        )
+
+    def _simulate(self, wire: str, network: str, *, sig_verify: bool) -> int:
         try:
-            self.signer.simulate_transaction(
-                base64.b64encode(bytes(composite)).decode(),
-                requirements.network,
-                sig_verify=False,
-            )
+            return self.signer.simulate_transaction(wire, network, sig_verify=sig_verify)
         except Exception as error:
             raise BatchError(BatchError.SETTLEMENT_SIMULATION, str(error)) from error
 
@@ -731,6 +817,8 @@ class BatchSvmScheme:
                 target = validate_voucher(
                     entry.get("voucher"), channel_id, config["payerAuthorizer"]
                 )
+                if target > channel.deposit:
+                    raise BatchError(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT)
                 if not channel.settled < target <= channel.deposit:
                     raise BatchError(BatchError.CUMULATIVE_AMOUNT_MISMATCH)
                 voucher = entry["voucher"]
@@ -751,7 +839,7 @@ class BatchSvmScheme:
             targets.append(target)
             swept_ids.append(channel_id)
             swept_configs.append(config)
-            before.append(asdict(channel))
+            before.append(_channel_metadata(channel))
         if not instructions:
             if previous and previous.response:
                 return previous.response
@@ -867,7 +955,7 @@ class BatchSvmScheme:
                     amount="",
                     extra={"channelState": _snapshot(channel_id, channel)},
                 )
-            self.signer.simulate_transaction(transaction, requirements.network, sig_verify=False)
+            self._simulate(transaction, requirements.network, sig_verify=False)
             self._record_activity(channel_id, config, requirements)
             return self.submit_operation(
                 key=key,
@@ -880,27 +968,7 @@ class BatchSvmScheme:
                 requirements=requirements,
                 wire_transaction=transaction,
             )
-        if not bound:
-            raise BatchError(BatchError.RECEIVER_BINDING_UNAVAILABLE)
-        target = validate_voucher(raw.get("voucher"), channel_id, config["payerAuthorizer"])
-        delegated = self.config.delegated_receiver_auth
-        if delegated and bound == delegated.receiver_authorizer:
-            identity = self._identity(
-                channel_id, config["payer"], requirements.network, raw["type"], context
-            )
-            if not binding or not binding.caller_identity or identity != binding.caller_identity:
-                raise BatchError(BatchError.DELEGATED_UNAUTHENTICATED)
-        elif not verify_close_authorization(
-            raw.get("closeAuthorization"),
-            receiver_authorizer=bound,
-            max_timeout_seconds=requirements.max_timeout_seconds,
-            network=requirements.network,
-            fee_payer=requirements.extra["feePayer"],
-            channel_id=channel_id,
-            max_claimable_amount=target,
-            voucher_expires_at=0,
-        ):
-            raise BatchError(BatchError.CLOSE_AUTHORIZATION)
+        target = self._authenticate_close(raw, requirements, channel_id, binding, context)
         if raw["type"] == "refund" and channel.status == ChannelStatus.CLOSING:
             return SettleResponse(
                 success=True,
@@ -937,10 +1005,49 @@ class BatchSvmScheme:
             kind=raw["type"],
             payer=config["payer"],
             fee_payer=requirements.extra["feePayer"],
-            metadata={"configs": [config], "targets": [target], "before": [asdict(channel)]},
+            metadata={
+                "configs": [config],
+                "targets": [target],
+                "before": [_channel_metadata(channel)],
+            },
             requirements=requirements,
             instructions=instructions,
         )
+
+    def _authenticate_close(
+        self,
+        raw: dict[str, Any],
+        requirements: PaymentRequirements,
+        channel_id: str,
+        binding: PaymentChannelRecord | None,
+        context: Any,
+    ) -> int:
+        config = raw["channelConfig"]
+        if not binding or not binding.receiver_authorizer:
+            raise BatchError(BatchError.RECEIVER_BINDING_UNAVAILABLE)
+        bound = binding.receiver_authorizer
+        if bound != config["receiverAuthorizer"]:
+            raise BatchError(BatchError.RECEIVER_AUTHORIZER_MISMATCH)
+        target = validate_voucher(raw.get("voucher"), channel_id, config["payerAuthorizer"])
+        delegated = self.config.delegated_receiver_auth
+        if delegated and bound == delegated.receiver_authorizer:
+            identity = self._identity(
+                channel_id, config["payer"], requirements.network, raw["type"], context
+            )
+            if not binding.caller_identity or identity != binding.caller_identity:
+                raise BatchError(BatchError.DELEGATED_UNAUTHENTICATED)
+        elif not verify_close_authorization(
+            raw.get("closeAuthorization"),
+            receiver_authorizer=bound,
+            max_timeout_seconds=requirements.max_timeout_seconds,
+            network=requirements.network,
+            fee_payer=requirements.extra["feePayer"],
+            channel_id=channel_id,
+            max_claimable_amount=target,
+            voucher_expires_at=0,
+        ):
+            raise BatchError(BatchError.CLOSE_AUTHORIZATION)
+        return target
 
     def submit_operation(
         self,
@@ -997,7 +1104,7 @@ class BatchSvmScheme:
             raise ValueError(
                 "facilitator signer changed the message or returned invalid signatures"
             )
-        simulation_slot = self.signer.simulate_transaction(signed, network, sig_verify=True)
+        simulation_slot = self._simulate(signed, network, sig_verify=True)
         metadata["blockhash"] = str(transaction.message.recent_blockhash)
         metadata["simulation_slot"] = simulation_slot
         signature = str(transaction.signatures[0])
@@ -1037,7 +1144,7 @@ class BatchSvmScheme:
         except Exception:
             # A transport exception after send does not prove the transaction failed.
             pass
-        return self._reconcile(record, requirements)
+        return self._reconcile(record, requirements, resend=False)
 
     def _operation_attempt(self, key: str) -> tuple[str, PendingSettlement | None]:
         """Retry proven failures under new immutable keys; never replace a pending attempt."""
@@ -1062,7 +1169,7 @@ class BatchSvmScheme:
         return self._reconcile(record, requirements)
 
     def _reconcile(
-        self, record: PendingSettlement, requirements: PaymentRequirements
+        self, record: PendingSettlement, requirements: PaymentRequirements, *, resend: bool = True
     ) -> SettleResponse:
         if record.response is not None:
             return record.response
@@ -1070,6 +1177,20 @@ class BatchSvmScheme:
             requirements = PaymentRequirements.model_validate(record.metadata["requirements"])
         try:
             status = self.signer.get_signature_status(record.signature, record.network)
+            if (
+                resend
+                and record.wire_transaction
+                and (
+                    not status
+                    or status.get("confirmation_status") not in ("confirmed", "finalized")
+                )
+            ):
+                try:
+                    self.signer.send_transaction(record.wire_transaction, record.network)
+                except Exception:
+                    # Broadcast failures never establish non-inclusion; poll the saved identity.
+                    pass
+                status = self.signer.get_signature_status(record.signature, record.network)
             if (
                 status
                 and status.get("confirmation_status") in ("confirmed", "finalized")
@@ -1133,7 +1254,14 @@ class BatchSvmScheme:
         configs = record.metadata.get("configs", [])
         for channel, config in zip(channels, configs, strict=False):
             if channel:
-                self.assert_channel(channel, config, requirements, tuple(ChannelStatus))
+                try:
+                    self.assert_channel(channel, config, requirements, tuple(ChannelStatus))
+                except BatchError as error:
+                    if record.kind != "deposit":
+                        raise
+                    return _failure(
+                        record.network, error.reason, record.payer, record.signature, str(error)
+                    )
         response = SettleResponse(
             success=True,
             network=record.network,
@@ -1148,7 +1276,15 @@ class BatchSvmScheme:
                 or channel.status != ChannelStatus.OPEN
                 or channel.deposit < record.metadata["expected_deposit"]
             ):
-                raise RuntimeError("confirmed deposit state is not visible yet")
+                return _failure(
+                    record.network,
+                    BatchError.CHANNEL_CLOSING
+                    if channel and channel.status == ChannelStatus.CLOSING
+                    else BatchError.CHANNEL_STATE,
+                    record.payer,
+                    record.signature,
+                    "confirmed deposit no longer satisfies the required open-channel state",
+                )
             response.amount = record.metadata["deposit_amount"]
             response.extra = {"channelState": _snapshot(record.channel_ids[0], channel)}
         elif record.kind == "claim":

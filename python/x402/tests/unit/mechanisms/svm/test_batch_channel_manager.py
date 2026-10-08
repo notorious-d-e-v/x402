@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 
+import pytest
+
 from x402.mechanisms.svm.batch_settlement.channel_manager import BatchChannelManager
 from x402.mechanisms.svm.batch_settlement.errors import BatchError
 from x402.mechanisms.svm.batch_settlement.types import ChannelState
@@ -97,6 +99,36 @@ def test_claim_batches_four_and_never_infers_payout_from_response_amount():
     assert all(store.get(s.channel_id).settled == 10 for s in states)
 
 
+def test_async_facilitator_is_rejected_before_starting_worker():
+    store, req, _ = make_channels()
+
+    class AsyncFacilitator:
+        async def settle(self, *_):
+            raise AssertionError("Must be rejected at construction")
+
+    with pytest.raises(TypeError, match="synchronous facilitator"):
+        BatchChannelManager(store, AsyncFacilitator(), req)
+
+
+def test_each_voucher_mode_has_its_own_worker_over_shared_store():
+    from .test_batch_server import OPERATOR
+
+    store, client_req, states = make_channels()
+    _, server_req, _, server_id = setup(True, store=store)
+    state = store.get(server_id)
+    state.charged_cumulative_amount = state.signed_max_claimable = 10
+    state.highest_voucher = {
+        "channelId": server_id,
+        "maxClaimableAmount": "10",
+        "expiresAt": 0,
+        "signature": sign_voucher(OPERATOR, server_id, 10),
+    }
+    store.put(state)
+    for req, expected in ((client_req, states[0].channel_id), (server_req, server_id)):
+        manager = BatchChannelManager(store, Settler(req), req, read_payout_watermark=lambda _: 10)
+        assert manager.redeem()["claimed"] == [expected]
+
+
 def test_spec_minimal_claim_response_uses_confirmed_chain_reader():
     store, req, states = make_channels()
     facilitator = Settler(req)
@@ -127,6 +159,27 @@ def test_claim_detects_closing_channel_and_seals_final_voucher():
     assert result["sealed"] == [states[0].channel_id]
     assert [c["type"] for c in facilitator.calls] == ["claim", "seal"]
     assert store.get(states[0].channel_id).status == "distributed"
+
+
+@pytest.mark.parametrize("charged", [0, 10])
+def test_closing_channel_is_sealed_even_when_all_charges_are_already_claimed(charged):
+    store, req, states = make_channels()
+    state = states[0]
+    state.status = "closing"
+    state.charged_cumulative_amount = state.signed_max_claimable = state.settled = charged
+    state.highest_voucher = {
+        "channelId": state.channel_id,
+        "maxClaimableAmount": str(charged),
+        "expiresAt": 0,
+        "signature": sign_voucher(PAYER, state.channel_id, charged),
+    }
+    store.put(state)
+    facilitator = Settler(req)
+    result = BatchChannelManager(store, facilitator, req).redeem()
+    assert result["sealed"] == [state.channel_id]
+    assert [call["type"] for call in facilitator.calls] == ["seal"]
+    assert store.get(state.channel_id).status == "distributed"
+    assert store.get(state.channel_id).payout_watermark == charged
 
 
 def test_redemption_ignores_channels_from_other_networks_or_receivers():

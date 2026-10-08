@@ -298,7 +298,9 @@ def test_server_recovery_requires_confirmed_baseline_and_trusted_receipt(
         with pytest.raises(ValueError):
             recovered.client.handle_payment_response(context)
         assert next(iter(recovered.batch_scheme._channels.values())).cumulative == settled
-        assert len(recovered.batch_scheme._pending) == 1
+        assert not recovered.batch_scheme._pending
+        refund = recovered.batch_scheme.create_refund_payload(req)
+        assert refund["authorization"]["authorizedAmount"] == "0"
 
 
 @pytest.mark.asyncio

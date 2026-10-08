@@ -38,8 +38,6 @@ from .trust import (
     UntrustedOperatorError,
 )
 
-BatchSvmScheme = BatchSvmClientScheme
-
 __all__ = [
     "BatchChannelManager",
     "BatchClientChannelStorage",
@@ -54,7 +52,6 @@ __all__ = [
     "BatchSvmFacilitatorConfig",
     "BatchSvmFacilitatorScheme",
     "BatchSvmRentCleanupManager",
-    "BatchSvmScheme",
     "BatchSvmServerConfig",
     "BatchSvmServerScheme",
     "ChannelStore",

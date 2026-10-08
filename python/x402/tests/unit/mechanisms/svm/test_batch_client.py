@@ -370,7 +370,7 @@ def test_corrective_requires_valid_signature_and_never_inflates_escrow():
     assert next(iter(scheme._channels.values())).cumulative == 10
 
 
-def encoded_channel(channel_id, receiver=RECEIVER, *, deposit=30, settled=7):
+def encoded_channel(channel_id, receiver=RECEIVER, *, deposit=30, settled=7, authorizer=PAYER):
     data = bytearray(256)
     data[:4] = bytes([1, 1, 0, 0])
     struct.pack_into("<QQQQqqI", data, 4, 0, deposit, settled, 0, 0, 0, 900)
@@ -379,7 +379,7 @@ def encoded_channel(channel_id, receiver=RECEIVER, *, deposit=30, settled=7):
         [
             PAYER.pubkey(),
             SPONSOR.pubkey(),
-            PAYER.pubkey(),
+            authorizer.pubkey(),
             Pubkey.from_string(USDC_DEVNET_ADDRESS),
             SPONSOR.pubkey(),
         ]
@@ -676,3 +676,188 @@ def test_canceled_large_setup_does_not_leave_credit_after_smaller_confirmed_setu
     server.after_settle(SettleResultContext(small, req, result=response))
     state = server.store.get(cid)
     assert state.deposit == state.charged_cumulative_amount == 10
+
+
+@pytest.mark.parametrize("slot", [42, "42", "00042"])
+def test_open_uses_integer_and_decimal_string_slot_hints(slot):
+    scheme, rpc = client()
+    payment = scheme.create_payment_payload(requirements(recentSlot=slot))
+    assert payment["channelConfig"]["openSlot"] == 42
+    rpc.get_slot.assert_not_called()
+
+
+@pytest.mark.parametrize("slot", [None, True, -1, 1.5, "-1", " 42", "٤٢", str(2**64), 2**53])
+def test_missing_or_invalid_open_slot_uses_finalized_rpc(slot):
+    from x402.mechanisms.svm.payment_channels.verification import verify_open_transaction
+
+    scheme, rpc = client()
+    rpc.get_slot.side_effect = lambda *, commitment: SimpleNamespace(
+        value=42 if commitment == "finalized" else 74
+    )
+    req = requirements(recentSlot=slot)
+    if slot is None:
+        req.extra.pop("recentSlot")
+    payment = scheme.create_payment_payload(req)
+    assert payment["channelConfig"]["openSlot"] == 42
+    rpc.get_slot.assert_called_once_with(commitment="finalized")
+    verify_open_transaction(
+        payment["deposit"]["transaction"],
+        channel_config=payment["channelConfig"],
+        fee_payer=req.extra["feePayer"],
+        token_program=req.extra["tokenProgram"],
+        deposit=30,
+        current_slot=42,
+    )
+
+
+def _valid_receipt(req, payment, cumulative):
+    receipt = success(req, payment, cumulative=cumulative)
+    if req.extra.get("voucherSigner") == "server":
+        receipt.extra["voucher"] = sign_batch_voucher(
+            OPERATOR, payment["authorization"]["channelId"], cumulative
+        )
+    return receipt
+
+
+@pytest.mark.parametrize(
+    "server_mode,malformed",
+    [
+        (False, "amount"),
+        (False, "commitment"),
+        (False, "state"),
+        (False, "cumulative"),
+        (True, "signature"),
+        (True, "ceiling"),
+        (True, "commitment"),
+        (True, "state"),
+        (True, "cumulative"),
+    ],
+)
+def test_invalid_offchain_receipt_restores_persisted_confirmation_and_allows_refund(
+    server_mode, malformed
+):
+    from x402.http.utils import decode_payment_signature_header, encode_payment_response_header
+
+    storage = InMemoryBatchClientChannelStorage()
+    config = BatchSvmClientConfig(
+        discover_channels=False,
+        channel_storage=storage,
+        deposit_amount=30,
+        server_signed_channels_policy=BatchServerSignedChannelsPolicy(
+            allowed_operators=[str(OPERATOR.pubkey())]
+        )
+        if server_mode
+        else None,
+    )
+    scheme, _ = client(config)
+    req = requirements(server=server_mode)
+    opened = scheme.create_payment_payload(req)
+    scheme.on_payment_response(context(req, opened, _valid_receipt(req, opened, 10)))
+    pending = scheme.create_payment_payload(req)
+    assert pending["type"] == ("authorization" if server_mode else "voucher")
+    receipt = _valid_receipt(req, pending, 20)
+    if malformed == "amount":
+        receipt.extra["chargedAmount"] = "11"
+    elif malformed == "commitment":
+        receipt.extra["commitmentId"] = ""
+    elif malformed == "state":
+        receipt.extra["channelState"] = []
+    elif malformed == "cumulative":
+        receipt.extra["channelState"]["chargedCumulativeAmount"] = "9000"
+    elif malformed == "signature":
+        receipt.extra["voucher"]["signature"] = str(Signature.default())
+    elif malformed == "ceiling":
+        receipt.extra["voucher"] = sign_batch_voucher(
+            OPERATOR, pending["authorization"]["channelId"], 21
+        )
+    # A late response after restart must clear the persisted allocation too.
+    restarted, _ = client(config)
+    with pytest.raises(ValueError, match="PAYMENT-RESPONSE"):
+        restarted.on_payment_response(context(req, pending, receipt))
+    assert not restarted._pending
+    assert next(iter(restarted._channels.values())).cumulative == 10
+    assert all("pending" not in record for record in storage._records.values())
+    refunded, _ = client(config)
+
+    def fetch(_url, headers):
+        payment = decode_payment_signature_header(headers["PAYMENT-SIGNATURE"])
+        assert payment.payload["type"] == "refund"
+        if server_mode:
+            assert payment.payload["authorization"]["authorizedAmount"] == "0"
+        else:
+            assert payment.payload["voucher"]["maxClaimableAmount"] == "10"
+        return SimpleNamespace(
+            status_code=200,
+            headers={
+                "PAYMENT-RESPONSE": encode_payment_response_header(
+                    SettleResponse(
+                        success=True,
+                        transaction="closed",
+                        network=req.network,
+                    )
+                ),
+            },
+        )
+
+    assert refunded.refund("https://resource.invalid/route", requirements=req, fetch=fetch).success
+    assert not storage._records
+
+
+@pytest.mark.parametrize("server_mode", [False, True])
+@pytest.mark.parametrize("top_up", [False, True])
+def test_invalid_funding_receipt_preserves_exact_pending_transaction_after_restart(
+    server_mode, top_up
+):
+    storage = InMemoryBatchClientChannelStorage()
+    config = BatchSvmClientConfig(
+        discover_channels=False,
+        channel_storage=storage,
+        deposit_amount=30,
+        server_signed_channels_policy=BatchServerSignedChannelsPolicy(
+            allowed_operators=[str(OPERATOR.pubkey())]
+        )
+        if server_mode
+        else None,
+    )
+    scheme, rpc = client(config)
+    req = requirements(server=server_mode)
+    payment = scheme.create_payment_payload(req)
+    prior = 0
+    if top_up:
+        scheme.on_payment_response(context(req, payment, _valid_receipt(req, payment, 10)))
+        prior = 10
+        req = req.model_copy(update={"amount": "21"})
+        payment = scheme.create_payment_payload(req)
+    assert payment["type"] == "deposit"
+    channel_id = (payment.get("voucher") or payment["authorization"])["channelId"]
+    # Escrow being present does not independently establish the offchain charge.
+    rpc.get_account_info.return_value = SimpleNamespace(
+        value=encoded_channel(
+            channel_id,
+            deposit=60 if top_up else 30,
+            settled=0,
+            authorizer=OPERATOR if server_mode else PAYER,
+        ).account
+    )
+    receipt = _valid_receipt(req, payment, prior + int(req.amount))
+    receipt.extra["commitmentId"] = ""
+    with pytest.raises(ValueError, match="PAYMENT-RESPONSE"):
+        scheme.on_payment_response(context(req, payment, receipt))
+    restarted, _ = client(config)
+    if server_mode:
+        with pytest.raises(ValueError, match="pending request"):
+            restarted.create_payment_payload(req)
+    else:
+        assert restarted.create_payment_payload(req) == payment
+    pending = next(iter(restarted._pending.values()))
+    assert pending.payload == payment
+    assert (pending.confirmed.cumulative if pending.confirmed else 0) == prior
+    with pytest.raises(ValueError, match="pending payment"):
+        restarted.create_refund_payload(req)
+    # The valid receipt for that exact allocation still resolves uncertainty.
+    restarted.on_payment_response(
+        context(req, payment, _valid_receipt(req, payment, prior + int(req.amount)))
+    )
+    assert not restarted._pending
+    assert next(iter(restarted._channels.values())).deposit == (60 if top_up else 30)
+    assert restarted.create_refund_payload(req)["type"] == "refund"

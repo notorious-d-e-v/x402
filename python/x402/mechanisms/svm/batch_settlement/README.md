@@ -44,6 +44,9 @@ The registration helper installs the scheme's payment-selection policy. When
 registering manually, also call `client.register_policy(scheme.payment_policy)`.
 The same scheme works with `x402Client` and the existing async HTTP transport;
 its RPC/signing methods follow the SDK's synchronous SVM mechanism interface.
+Those calls can block the event loop, and one scheme serializes channel state
+changes under a lock. Applications needing concurrent RPC work should run the
+synchronous client in worker threads; this scheme does not provide async RPC.
 
 ### Operator-signed metering
 
@@ -84,6 +87,9 @@ Discovery can reconstruct channel escrow
 from the chain, but cannot reconstruct an unclaimed offchain voucher. Corrective
 402 responses require a valid signed voucher or a fresh onchain read before the
 client changes its cumulative balance.
+Invalid successful offchain receipts restore the last confirmed allocation.
+Invalid funding receipts remain pending because confirming escrow alone cannot
+prove whether the accompanying request was charged.
 
 Keep the scheme instance to refund a channel:
 
@@ -125,11 +131,19 @@ route supplies its actual amount to settlement, bounded by the verified ceiling.
 A route can pin `extra.voucherSigner="client"` even when an operator is configured.
 Without a local receiver signer, startup requires the facilitator to advertise a
 receiver authorizer for authenticated delegated closes.
+Set `extra.minDeposit` as a string: `"5000000"` means atomic token units, while
+`"$5"` means five dollars of the default asset. Numeric values are rejected.
 
 `ChannelStore.update` must be an atomic read-modify-write across workers.
 `BatchOperationStore` must retain consumed request IDs even after cancellation.
 The memory implementations are single-process references. Production stores must
 retain accepted vouchers, charges, reservations, and replay state across restarts.
+If bookkeeping fails after an onchain settlement succeeds, the server logs the
+transaction and blocks further charges on that channel. Deposit and close
+reservations remain exclusive across their deadline until explicitly resolved.
+Reconcile the durable accounting state before restarting; restarting alone does
+not recover an unrecorded charge. Missing optional close snapshots stop new
+payments while the channel manager reconciles the final watermark.
 
 Redeem regularly using the enhanced requirements for those channels:
 
@@ -144,6 +158,10 @@ Alternatively call `manager.redeem()` from a worker. It claims up to four channe
 per batch, distributes earned funds, and reconciles confirmed payout watermarks.
 It seals closing channels with their latest accepted voucher during the grace
 period. Use a synchronous facilitator client for this worker.
+Create one manager for each distinct set of channel requirements, including a
+separate manager for client-signed and server-signed routes. They may share a
+store: each manager filters channels by network, asset, receiver, fee payer,
+receiver authorizer, token program, and voucher signer/operator.
 
 ## Facilitator
 

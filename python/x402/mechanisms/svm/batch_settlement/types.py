@@ -46,7 +46,7 @@ class CloseAuthorization(TypedDict):
 class ChannelReservation:
     ceiling: int
     expires_at: float
-    kind: Literal["client", "server", "close"]
+    kind: Literal["client", "server", "deposit", "close"]
     request_id: str | None = None
 
 

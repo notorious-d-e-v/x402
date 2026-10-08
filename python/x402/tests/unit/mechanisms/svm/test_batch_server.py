@@ -311,7 +311,8 @@ def test_metered_charge_cannot_exceed_reserved_ceiling():
     assert server.store.get(cid).charged_cumulative_amount == 0
 
 
-def test_topup_confirmed_balance_becomes_available_once():
+@pytest.mark.parametrize("snapshot_kind", ["complete", "missing", "malformed", "closing"])
+def test_topup_confirmed_balance_becomes_available_once(snapshot_kind):
     server, req, cfg, cid = setup(balance=5)
     p = payment(req, cfg, cid)
     p.payload.update(
@@ -341,11 +342,143 @@ def test_topup_confirmed_balance_becomes_available_once():
         },
     )
     ctx = SettleResultContext(p, req, result=response)
+    if snapshot_kind == "missing":
+        response.extra = {"channelId": cid}
+    elif snapshot_kind == "malformed":
+        response.extra["channelState"]["balance"] = "invalid"
+    elif snapshot_kind == "closing":
+        response.extra["channelState"]["withdrawRequestedAt"] = int(time.time())
+    # Confirmation may arrive after the handler's reservation deadline.
+    state = server.store.get(cid)
+    next(iter(state.reservations.values())).expires_at = time.time() - 1
+    server.store.put(state)
     server.after_settle(ctx)
     server.after_settle(ctx)
     assert server.store.get(cid).deposit == 105
     assert server.store.get(cid).charged_cumulative_amount == 10
     assert server.enrich_settlement_response(ctx)["chargedAmount"] == "10"
+    assert not server.store.get(cid).reservations
+    assert server.store.get(cid).status == ("closing" if snapshot_kind == "closing" else "open")
+    if snapshot_kind in ("missing", "malformed"):
+        assert server.store.get(cid).onchain_synced_at == 0
+
+
+@pytest.mark.parametrize("snapshot", [None, {"balance": "bad", "totalClaimed": "0"}])
+@pytest.mark.parametrize("with_operator", [False, True])
+def test_confirmed_refund_without_usable_snapshot_stops_accepting_payments(snapshot, with_operator):
+    server, req, cfg, cid = setup()
+    if with_operator:
+        server.config.operator = OPERATOR
+        req.extra["voucherSigner"] = "client"
+    p = payment(req, cfg, cid, amount=0)
+    p.payload["type"] = "refund"
+    assert not isinstance(reserve(server, p, req), AbortResult)
+    result = SettleResponse(
+        success=True,
+        transaction="closed",
+        network=req.network,
+        extra={"channelId": cid, "channelState": snapshot},
+    )
+    server.after_settle(SettleResultContext(p, req, result=result))
+    state = server.store.get(cid)
+    assert state.status == "closing"
+    assert state.onchain_synced_at == 0
+    assert not state.reservations
+    assert state.highest_voucher == p.payload["voucher"]
+    assert not server._requests
+    assert reserve(server, payment(req, cfg, cid), req).reason == BatchError.CHANNEL_CLOSING
+
+
+@pytest.mark.parametrize("next_deposit", [20, 200])
+def test_consecutive_topups_without_snapshots_preserve_confirmed_escrow(next_deposit):
+    server, req, cfg, cid = setup(balance=5)
+    for index, amount in enumerate((100, next_deposit), start=1):
+        p = payment(req, cfg, cid, amount=index * 10)
+        p.payload.update(
+            type="deposit", deposit={"amount": str(amount), "transaction": f"validated-{index}"}
+        )
+        assert reserve(server, p, req) is None
+        response = SettleResponse(
+            success=True, transaction=f"confirmed-{index}", network=req.network
+        )
+        server.after_settle(SettleResultContext(p, req, result=response))
+        assert server.store.get(cid).onchain_synced_at == 0
+    state = server.store.get(cid)
+    assert state.deposit == 105 + next_deposit
+    assert state.charged_cumulative_amount == 20
+    assert state.signed_max_claimable == 20
+    assert not state.reservations
+
+
+def test_inflight_deposit_reservation_survives_deadline_and_another_server_worker():
+    server, req, cfg, cid = setup(True, balance=5)
+    p = payment(req, cfg, cid)
+    p.payload.update(type="deposit", deposit={"amount": "100", "transaction": "validated"})
+    assert reserve(server, p, req) is None
+    state = server.store.get(cid)
+    next(iter(state.reservations.values())).expires_at = time.time() - 1
+    server.store.put(state)
+    other = BatchSvmScheme(
+        BatchSvmServerConfig(receiver_authorizer=AUTH, operator=OPERATOR, store=server.store)
+    )
+    for index, worker in enumerate((server, other)):
+        next_payment = payment(req, cfg, cid, request_id=f"later-{index}")
+        assert reserve(worker, next_payment, req).reason == BatchError.CHANNEL_BUSY
+    response = SettleResponse(success=True, transaction="confirmed", network=req.network)
+    server.after_settle(SettleResultContext(p, req, result=response))
+    state = server.store.get(cid)
+    assert state.deposit == 105
+    assert state.charged_cumulative_amount == 10
+    assert not state.reservations
+    assert cid not in server._bookkeeping_failures
+
+
+def test_confirmed_settlement_storage_failure_is_logged_and_blocks_new_charges(monkeypatch, caplog):
+    server, req, cfg, cid = setup()
+    p = payment(req, cfg, cid)
+    p.payload.update(type="deposit", deposit={"amount": "100", "transaction": "validated"})
+    assert reserve(server, p, req) is None
+
+    def unavailable(*_):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(server.store, "update", unavailable)
+    result = SettleResponse(success=True, transaction="confirmed", network=req.network)
+    server.after_settle(SettleResultContext(p, req, result=result))
+    assert result.success
+    assert not server._requests
+    assert "Accounting recovery required for confirmed transaction confirmed" in caplog.text
+    rejected = server.before_verify(VerifyContext(payment(req, cfg, cid), req))
+    assert rejected.reason == BatchError.CHANNEL_STATE
+    assert "accounting recovery" in rejected.message
+    monkeypatch.undo()
+    state = server.store.get(cid)
+    next(iter(state.reservations.values())).expires_at = time.time() - 1
+    server.store.put(state)
+    restarted = BatchSvmScheme(BatchSvmServerConfig(receiver_authorizer=AUTH, store=server.store))
+    assert reserve(restarted, payment(req, cfg, cid), req).reason == BatchError.CHANNEL_BUSY
+
+
+@pytest.mark.parametrize("minimum", [5_000_000, 5.0, True])
+def test_min_deposit_rejects_ambiguous_numeric_amounts(minimum):
+    from x402.mechanisms.svm.default_assets import DEFAULT_ASSETS
+
+    server, req, _, _ = setup()
+    req = req.model_copy(
+        update={"asset": DEFAULT_ASSETS[req.network][0]["asset"], "extra": {"minDeposit": minimum}}
+    )
+    with pytest.raises(ValueError, match="atomic amount string or a money string"):
+        server.resolve_min_deposit_hint(req)
+
+
+def test_min_deposit_strings_distinguish_atomic_units_and_money():
+    from x402.mechanisms.svm.default_assets import DEFAULT_ASSETS
+
+    server, req, _, _ = setup()
+    req = req.model_copy(update={"asset": DEFAULT_ASSETS[req.network][0]["asset"]})
+    for minimum in ("5000000", "$5"):
+        req.extra["minDeposit"] = minimum
+        assert server.resolve_min_deposit_hint(req) == "5000000"
 
 
 def test_delegated_server_requires_advertised_receiver_authorizer():
@@ -424,7 +557,8 @@ def test_core_dispatches_batch_hooks_and_metered_settlement(asynchronous):
     assert scheme.store.get(cid).charged_cumulative_amount == 4
 
 
-def test_initial_deposit_full_core_flow_keeps_request_identity_and_enriches_receipt():
+@pytest.mark.parametrize("with_snapshot", [False, True])
+def test_initial_deposit_full_core_flow_keeps_request_identity_and_enriches_receipt(with_snapshot):
     from solders.hash import Hash
 
     from x402 import x402ResourceServerSync
@@ -481,7 +615,9 @@ def test_initial_deposit_full_core_flow_keeps_request_identity_and_enriches_rece
                         "totalClaimed": "0",
                         "withdrawRequestedAt": 0,
                     }
-                },
+                }
+                if with_snapshot
+                else {"channelId": cid},
             )
 
     core = x402ResourceServerSync(Facilitator()).register(req.network, scheme)
@@ -517,3 +653,93 @@ def test_known_token_2022_asset_uses_registry_program():
         server.enhance_payment_requirements(req, supported, []).extra["tokenProgram"]
         == TOKEN_2022_PROGRAM_ADDRESS
     )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_http_corrective_402_after_refresh_contains_signed_voucher_state(asynchronous):
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from x402 import x402ResourceServer, x402ResourceServerSync
+    from x402.http.types import HTTPRequestContext, PaymentOption, RouteConfig
+    from x402.http.utils import decode_payment_required_header, encode_payment_signature_header
+    from x402.http.x402_http_server import x402HTTPResourceServer, x402HTTPResourceServerSync
+    from x402.schemas import SupportedResponse
+
+    scheme, req, cfg, cid = setup(fresh=False)
+    state = scheme.store.get(cid)
+    state.charged_cumulative_amount = state.signed_max_claimable = 30
+    state.highest_voucher = payment(req, cfg, cid, amount=30).payload["voucher"]
+    scheme.store.put(state)
+
+    class Facilitator:
+        verify_calls = 0
+
+        def get_supported(self):
+            return SupportedResponse(
+                kinds=[
+                    SupportedKind(
+                        x402_version=2, scheme=req.scheme, network=req.network, extra=req.extra
+                    )
+                ]
+            )
+
+        def verify(self, *_):
+            self.verify_calls += 1
+            return VerifyResponse(
+                is_valid=True,
+                extra={"channelId": cid, "balance": "100", "totalClaimed": "0"},
+            )
+
+    class AsyncFacilitator(Facilitator):
+        async def verify(self, *args):
+            return super().verify(*args)
+
+    facilitator = AsyncFacilitator() if asynchronous else Facilitator()
+    core = (x402ResourceServer if asynchronous else x402ResourceServerSync)(facilitator)
+    core.register(req.network, scheme).initialize()
+    http = (x402HTTPResourceServer if asynchronous else x402HTTPResourceServerSync)(
+        core,
+        {
+            "GET /paid": RouteConfig(
+                accepts=PaymentOption(
+                    scheme=req.scheme,
+                    network=req.network,
+                    pay_to=req.pay_to,
+                    price={"asset": req.asset, "amount": req.amount},
+                    extra=req.extra,
+                    max_timeout_seconds=60,
+                )
+            )
+        },
+    )
+    adapter = MagicMock()
+    adapter.get_header.return_value = None
+    adapter.get_url.return_value = "https://merchant.example/paid"
+    adapter.get_accept_header.return_value = "application/json"
+    adapter.get_user_agent.return_value = "batch-test"
+    context = HTTPRequestContext(adapter=adapter, path="/paid", method="GET")
+
+    def process():
+        result = http.process_http_request(context)
+        return asyncio.run(result) if asynchronous else result
+
+    offered = process()
+    offered_req = decode_payment_required_header(offered.response.headers["PAYMENT-REQUIRED"])
+    payload = payment(offered_req.accepts[0], cfg, cid, amount=20)
+    adapter.get_header.side_effect = lambda name: (
+        encode_payment_signature_header(payload) if name.lower() == "payment-signature" else None
+    )
+    result = process()
+    assert facilitator.verify_calls == 1  # Mismatch arises in after_verify, after the refresh.
+    assert result.type == "payment-error"
+    assert result.response.status == 402
+    corrected = decode_payment_required_header(result.response.headers["PAYMENT-REQUIRED"])
+    assert corrected.error == BatchError.CUMULATIVE_AMOUNT_MISMATCH
+    assert corrected.accepts[0].extra["channelState"]["chargedCumulativeAmount"] == "30"
+    assert corrected.accepts[0].extra["voucherState"] == {
+        "signedMaxClaimable": "30",
+        "expiresAt": 0,
+        "signature": state.highest_voucher["signature"],
+    }
+    assert not scheme.store.get(cid).reservations

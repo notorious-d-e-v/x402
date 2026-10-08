@@ -298,10 +298,12 @@ class BatchSvmScheme:
                 deposit = self._deposit_amount(requirements, charge, 0, context, trust)
                 rpc = self._get_client(str(requirements.network))
                 blockhash = resolve_blockhash(rpc, terms.get("recentBlockhash"))
-                slot = terms.get("recentSlot")
-                if type(slot) is not int or not 0 <= slot <= 2**53 - 1:
-                    slot = rpc.get_slot(commitment="confirmed").value
-                _u64(slot, "openSlot")
+                try:
+                    slot = _u64(terms.get("recentSlot"), "recentSlot")
+                    if slot > 2**53 - 1:
+                        raise ValueError("recentSlot exceeds the wire safe-integer range")
+                except ValueError:
+                    slot = _u64(rpc.get_slot(commitment="finalized").value, "openSlot")
                 authorizer = terms.get("operator", self._payer)
                 channel_id = find_payment_channel_pda(
                     payer=self._payer,
@@ -516,33 +518,40 @@ class BatchSvmScheme:
                     return RecoveredResponseResult()
                 self._restore(key, pending)
                 return None
-            extra = response.extra or {}
-            prior = pending.confirmed.cumulative if pending.confirmed else 0
-            if pending.channel.channel_config.get("voucherSigner") == "server":
-                voucher = extra.get("voucher")
-                cumulative = self._verified_voucher(voucher, pending.channel)
-                if cumulative is None:
-                    raise ValueError("PAYMENT-RESPONSE has an invalid server voucher")
-                if not prior <= cumulative <= prior + pending.amount:
-                    raise ValueError(
-                        "PAYMENT-RESPONSE server charge exceeds the authorized ceiling"
+            try:
+                extra = response.extra or {}
+                prior = pending.confirmed.cumulative if pending.confirmed else 0
+                if pending.channel.channel_config.get("voucherSigner") == "server":
+                    voucher = extra.get("voucher")
+                    cumulative = self._verified_voucher(voucher, pending.channel)
+                    if cumulative is None:
+                        raise ValueError("PAYMENT-RESPONSE has an invalid server voucher")
+                    if not prior <= cumulative <= prior + pending.amount:
+                        raise ValueError(
+                            "PAYMENT-RESPONSE server charge exceeds the authorized ceiling"
+                        )
+                else:
+                    if extra.get("chargedAmount") != str(pending.amount):
+                        raise ValueError("PAYMENT-RESPONSE charged an unexpected amount")
+                    cumulative = prior + pending.amount
+                state = extra.get("channelState", {})
+                if (
+                    not isinstance(extra.get("commitmentId"), str)
+                    or not extra["commitmentId"]
+                    or not isinstance(state, dict)
+                    or (
+                        "chargedCumulativeAmount" in state
+                        and state["chargedCumulativeAmount"] != str(cumulative)
                     )
-            else:
-                if extra.get("chargedAmount") != str(pending.amount):
-                    raise ValueError("PAYMENT-RESPONSE charged an unexpected amount")
-                cumulative = prior + pending.amount
-            state = extra.get("channelState") or {}
-            if (
-                not isinstance(extra.get("commitmentId"), str)
-                or not extra["commitmentId"]
-                or not isinstance(state, dict)
-                or (
-                    "chargedCumulativeAmount" in state
-                    and state["chargedCumulativeAmount"] != str(cumulative)
-                )
-                or cumulative > pending.channel.deposit
-            ):
-                raise ValueError("PAYMENT-RESPONSE contains inconsistent channel accounting")
+                    or cumulative > pending.channel.deposit
+                ):
+                    raise ValueError("PAYMENT-RESPONSE contains inconsistent channel accounting")
+            except ValueError:
+                # Funding may have landed without a trustworthy charge receipt.
+                # Retain its exact transaction; only offchain allocations roll back.
+                if pending.payload["type"] != "deposit":
+                    self._restore(key, pending)
+                raise
             self._save_confirmed(key, replace(pending.channel, cumulative=cumulative))
             return None
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from copy import deepcopy
@@ -95,6 +96,7 @@ class BatchSvmScheme(ExactSvmScheme):
         self.operation_store = self.config.operation_store or MemoryBatchOperationStore()
         self._requests: dict[int, _Request] = {}
         self._extras: dict[int, tuple[PaymentPayload, dict[str, Any]]] = {}
+        self._bookkeeping_failures: set[str] = set()
         self._lock = RLock()
 
     def get_channel_store(self) -> ChannelStore:
@@ -128,7 +130,9 @@ class BatchSvmScheme(ExactSvmScheme):
         override = (requirements.extra or {}).get("minDeposit")
         if override is None:
             minimum = amount * (3 if self.is_server_signed(requirements) else 10)
-        elif isinstance(override, str) and override.isascii() and override.isdecimal():
+        elif not isinstance(override, str):
+            raise ValueError("minDeposit must be an atomic amount string or a money string")
+        elif override.isascii() and override.isdecimal():
             minimum = atomic(override, "minDeposit")
         else:
             asset = find_default_asset(requirements.asset, requirements.network)
@@ -239,6 +243,10 @@ class BatchSvmScheme(ExactSvmScheme):
         try:
             raw = ctx.payment_payload.payload
             channel_id = self._validate(ctx.payment_payload, ctx.requirements)
+            if channel_id in self._bookkeeping_failures:
+                raise BatchError(
+                    BatchError.CHANNEL_STATE, "Confirmed settlement requires accounting recovery"
+                )
             state = self.store.get(channel_id)
             if raw["type"] == "deposit" and state is None:
                 from ..payment_channels.verification import verify_open_transaction
@@ -262,7 +270,7 @@ class BatchSvmScheme(ExactSvmScheme):
                 and (state is None or not self._fresh(state)),
                 top_up=raw["type"] == "deposit"
                 and state is not None
-                and state.onchain_synced_at > 0,
+                and (state.onchain_synced_at > 0 or bool(state.open_signature)),
                 request_id=(raw.get("authorization") or {}).get("requestId"),
             )
             if raw["type"] == "refund" and state is None:
@@ -379,16 +387,20 @@ class BatchSvmScheme(ExactSvmScheme):
                     else:
                         raise BatchError(BatchError.CHANNEL_STATE)
                 self._assert_state(current, raw, ctx.requirements)
-                if raw["type"] == "deposit" and not current.onchain_synced_at:
+                if raw["type"] == "deposit" and not request.top_up:
                     current.deposit = atomic(raw["deposit"]["amount"])
                 now = time.time()
                 current.reservations = {
-                    k: v for k, v in current.reservations.items() if v.expires_at > now
+                    k: v
+                    for k, v in current.reservations.items()
+                    if v.kind in ("deposit", "close") or v.expires_at > now
                 }
                 # Deposit/close operations are exclusive; only offchain server requests run concurrently.
                 kind = (
                     "close"
                     if raw["type"] == "refund"
+                    else "deposit"
+                    if raw["type"] == "deposit"
                     else "server"
                     if raw["type"] == "authorization"
                     else "client"
@@ -446,7 +458,9 @@ class BatchSvmScheme(ExactSvmScheme):
             if current is None or request.pending_id not in current.reservations:
                 raise BatchError(BatchError.CHANNEL_BUSY)
             reservation = current.reservations[request.pending_id]
-            if reservation.expires_at <= time.time() or actual > reservation.ceiling:
+            if actual > reservation.ceiling or (
+                result is None and reservation.expires_at <= time.time()
+            ):
                 raise BatchError(BatchError.CHANNEL_BUSY)
             cumulative = current.charged_cumulative_amount + actual
             if "voucher" in raw:
@@ -463,18 +477,25 @@ class BatchSvmScheme(ExactSvmScheme):
                     ),
                 }
             if result is not None:
-                extra = result.extra or {}
-                snapshot = self._snapshot(extra.get("channelState"), request.channel_id)
-                if snapshot is None or snapshot["closing"]:
-                    raise BatchError(BatchError.CHANNEL_STATE)
-                current.deposit = (
-                    max(current.deposit, snapshot["balance"])
-                    if current.onchain_synced_at
-                    else snapshot["balance"]
-                )
-                current.settled = max(current.settled, snapshot["settled"])
+                snapshot = self._settled_snapshot(result, request.channel_id)
+                if snapshot is None:
+                    # The successful settlement confirms this exact deposit. A
+                    # missing optional snapshot must not undo its accepted charge.
+                    deposit = atomic(raw["deposit"]["amount"])
+                    current.deposit = (
+                        current.deposit + deposit
+                        if request.top_up
+                        else max(current.deposit, deposit)
+                    )
+                    current.onchain_synced_at = 0
+                else:
+                    current.deposit = max(current.deposit, snapshot["balance"])
+                    current.settled = max(current.settled, snapshot["settled"])
+                    current.onchain_synced_at = time.time()
+                    if snapshot["closing"]:
+                        current.status = "closing"
+                        current.close_requested_at = snapshot["closing"]
                 current.open_signature = result.transaction
-                current.onchain_synced_at = time.time()
             if cumulative > current.deposit:
                 raise BatchError(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT)
             if request.request_id:
@@ -495,6 +516,15 @@ class BatchSvmScheme(ExactSvmScheme):
             return current
 
         return self.store.update(request.channel_id, commit)
+
+    def _settled_snapshot(self, result: SettleResponse, channel_id: str) -> dict[str, int] | None:
+        try:
+            return self._snapshot((result.extra or {}).get("channelState"), channel_id)
+        except (ValueError, TypeError, AttributeError):
+            logging.getLogger(__name__).warning(
+                "Ignoring invalid optional settlement snapshot for channel %s", channel_id
+            )
+            return None
 
     @staticmethod
     def _settlement_extra(state: ChannelState, amount: str) -> dict[str, Any]:
@@ -543,37 +573,67 @@ class BatchSvmScheme(ExactSvmScheme):
         request = self._requests.get(id(ctx.payment_payload))
         if not ctx.result.success or request is None:
             return
-        raw = ctx.payment_payload.payload
-        if raw["type"] == "deposit":
-            state = self._commit(request, atomic(ctx.requirements.amount), ctx.result)
+        try:
+            raw = ctx.payment_payload.payload
+            if raw["type"] == "deposit":
+                state = self._commit(request, atomic(ctx.requirements.amount), ctx.result)
+                with self._lock:
+                    self._extras[id(ctx.payment_payload)] = (
+                        ctx.payment_payload,
+                        self._settlement_extra(state, ctx.requirements.amount),
+                    )
+            elif raw["type"] == "refund":
+                snapshot = self._settled_snapshot(ctx.result, request.channel_id)
+
+                def close(current: ChannelState | None) -> ChannelState:
+                    if current is None:
+                        raise BatchError(BatchError.CHANNEL_STATE)
+                    current.reservations.pop(request.pending_id, None)
+                    current.close_signature = ctx.result.transaction
+                    if current.highest_voucher is None:
+                        current.highest_voucher = deepcopy(raw.get("voucher"))
+                        if (
+                            current.highest_voucher is None
+                            and self.config.operator
+                            and current.channel_config.get("voucherSigner") == "server"
+                            and current.signed_max_claimable == 0
+                        ):
+                            current.highest_voucher = {
+                                "channelId": request.channel_id,
+                                "maxClaimableAmount": "0",
+                                "expiresAt": 0,
+                                "signature": sign_voucher(
+                                    self.config.operator, request.channel_id, 0, 0
+                                ),
+                            }
+                    # Minimal receipts confirm the close but not its watermark.
+                    # Stop accepting payments and let the manager reconcile it.
+                    current.status = "closing"
+                    current.onchain_synced_at = 0
+                    if snapshot is not None:
+                        current.close_requested_at = snapshot["closing"]
+                        current.onchain_synced_at = time.time()
+                        current.settled = max(current.settled, snapshot["settled"])
+                        current.status = "closing" if snapshot["closing"] else "distributed"
+                        if current.status == "distributed":
+                            current.payout_watermark = current.settled
+                    return current
+
+                self.store.update(request.channel_id, close)
+        except Exception:
+            # A confirmed transfer cannot be reversed by a bookkeeping failure.
+            # Preserve its success response, but block further charges until an
+            # operator restores the durable accounting state.
             with self._lock:
-                self._extras[id(ctx.payment_payload)] = (
-                    ctx.payment_payload,
-                    self._settlement_extra(state, ctx.requirements.amount),
-                )
-        elif raw["type"] == "refund":
-            snapshot = self._snapshot(
-                (ctx.result.extra or {}).get("channelState"), request.channel_id
+                self._bookkeeping_failures.add(request.channel_id)
+            logging.getLogger(__name__).exception(
+                "Accounting recovery required for confirmed transaction %s on channel %s",
+                ctx.result.transaction,
+                request.channel_id,
             )
-            if snapshot is None:
-                raise BatchError(BatchError.CHANNEL_STATE)
-
-            def close(current: ChannelState | None) -> ChannelState:
-                if current is None or request.pending_id not in current.reservations:
-                    raise BatchError(BatchError.CHANNEL_BUSY)
-                current.reservations.pop(request.pending_id)
-                current.close_signature = ctx.result.transaction
-                current.close_requested_at = snapshot["closing"]
-                current.onchain_synced_at = time.time()
-                current.settled = max(current.settled, snapshot["settled"])
-                current.status = "closing" if snapshot["closing"] else "distributed"
-                if current.status == "distributed":
-                    current.payout_watermark = current.settled
-                return current
-
-            self.store.update(request.channel_id, close)
-        with self._lock:
-            self._requests.pop(id(ctx.payment_payload), None)
+        finally:
+            with self._lock:
+                self._requests.pop(id(ctx.payment_payload), None)
 
     def enrich_settlement_response(self, ctx: SettleResultContext) -> dict[str, Any] | None:
         with self._lock:
