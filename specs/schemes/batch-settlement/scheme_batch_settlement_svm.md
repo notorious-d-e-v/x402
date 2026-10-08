@@ -68,7 +68,7 @@ claim promptly.
 |---|---|
 | One-time escrow deposit | Payment-channels `open` deposits escrow, records `withdrawDelay`, fixes `payee`, `authorized_signer`, `rent_payer`, and commits `distribution_hash`. |
 | Per-request authorization | Client mode: an Ed25519 voucher signed by `payerAuthorizer`. Server mode: an expiring payer proof plus a single-use request identifier; the advertised amount is a ceiling and the operator signs the actual cumulative charge after serving. |
-| Monotonic amount | Server-owned offchain watermark plus onchain `settled < maxClaimableAmount <= deposit` at redemption. |
+| Monotonic amount | Server-owned offchain watermark plus onchain `settled < maxClaimableAmount <= deposit` at redemption. For client-signed `voucher` verify and for the client-signed voucher on a top-up `deposit`, the facilitator MUST require `maxClaimableAmount >= Channel.settled + PaymentRequirements.amount` and `maxClaimableAmount > Channel.settled`, so a zero-price route cannot be satisfied by a voucher equal to `Channel.settled`. |
 | Batched redemption | One `settle` per channel, packed transaction-size permitting; `distribute` pays settled deltas. |
 | Recipient binding | `distribution_hash` fixed at `open` sends funds to `payTo`; program re-checks it at `distribute`. |
 | Recovery of unused deposit | Section 3. |
@@ -169,9 +169,12 @@ back into the store. Deposit broadcast depends on which sources are configured:
   different key, MUST NOT send the open. The first writer wins; a different
   key MUST be rejected with
   `invalid_batch_settlement_svm_receiver_authorizer_mismatch`.
-- Store and history: the facilitator attempts the bind. A failed write MUST
-  NOT abort the open; the deposit is still broadcast, and history remains the
-  fallback at close.
+- Store and history: the facilitator MUST bind the open's key and read that row
+  back before broadcasting. A failed write, or a read-back that is missing or a
+  different key, MUST NOT send the open. The first writer wins; a different
+  key MUST be rejected with
+  `invalid_batch_settlement_svm_receiver_authorizer_mismatch`. History remains
+  the fallback at close.
 - History only: the facilitator does not write a store row, because the
   transaction is the record, and the open proceeds.
 
