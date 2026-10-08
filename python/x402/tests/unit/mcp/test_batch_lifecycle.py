@@ -136,6 +136,8 @@ def batch(request):
         channel=channel,
         facilitator=facilitator,
         context=context,
+        payer=payer,
+        channel_config=config,
     )
 
 
@@ -219,6 +221,102 @@ async def test_failed_execution_releases_batch_reservation(batch, failure):
     )(handler)
     result = await wrapped(ctx=batch.context())
     assert result.isError
+    state = batch.scheme.store.get(batch.channel)
+    assert not state.reservations
+    assert state.charged_cumulative_amount == 0
+    batch.facilitator.settle.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metering_cancellation_releases_real_server_signed_client_allocation(batch):
+    from solders.pubkey import Pubkey
+
+    from x402.mcp.server_async import PaymentWrapperConfig
+    from x402.mcp.server_async import create_payment_wrapper as wrap_async
+    from x402.mcp.server_sync import create_payment_wrapper_sync
+    from x402.mcp.types import SyncPaymentWrapperConfig
+    from x402.mcp.utils import (
+        extract_payment_required_from_result,
+        extract_payment_response_from_result,
+    )
+    from x402.mechanisms.svm.batch_settlement.client import BatchSvmScheme
+    from x402.mechanisms.svm.batch_settlement.client_types import BatchSvmClientConfig, OpenChannel
+    from x402.mechanisms.svm.batch_settlement.trust import (
+        BatchServerSignedChannelsPolicy,
+        ServerSignedChannelsAsset,
+    )
+    from x402.mechanisms.svm.constants import TOKEN_PROGRAM_ADDRESS
+    from x402.mechanisms.svm.signers import KeypairSigner
+    from x402.schemas import PaymentResponseContext
+
+    requirements = batch.requirements
+    client = BatchSvmScheme(
+        KeypairSigner(batch.payer),
+        BatchSvmClientConfig(
+            salt=7,
+            discover_channels=False,
+            server_signed_channels_policy=BatchServerSignedChannelsPolicy(
+                allowed_operators=[batch.channel_config["payerAuthorizer"]],
+                allowed_assets=[
+                    ServerSignedChannelsAsset(str(requirements.network), requirements.asset, "100")
+                ],
+            ),
+        ),
+    )
+    rpc = Mock()
+    rpc.get_account_info.return_value = SimpleNamespace(
+        value=SimpleNamespace(
+            owner=Pubkey.from_string(TOKEN_PROGRAM_ADDRESS),
+            data=bytes(44) + bytes([6]) + bytes(37),
+        )
+    )
+    client._clients[str(requirements.network)] = rpc
+    terms, _ = client._terms(requirements)
+    client._save_confirmed(
+        client._key(requirements, terms),
+        OpenChannel(
+            batch.channel,
+            batch.channel_config,
+            100,
+        ),
+    )
+    inner = client.create_payment_payload(requirements)
+    assert inner["type"] == "authorization"
+    payload = PaymentPayload(x402_version=2, accepted=requirements, payload=inner)
+    with pytest.raises(ValueError, match="pending request"):
+        client.create_payment_payload(requirements)
+
+    def meter(_):
+        raise ValueError("meter unavailable")
+
+    hooks = PaymentWrapperHooks(on_after_execution=meter)
+    extra = {
+        "toolName": "paid_tool",
+        "_meta": {MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)},
+    }
+    if isinstance(batch.core, x402ResourceServerSync):
+        wrapped = create_payment_wrapper_sync(
+            batch.core, SyncPaymentWrapperConfig(accepts=[requirements], hooks=hooks)
+        )(lambda *_: "ok")
+        result = wrapped({}, extra)
+    else:
+        wrapped = wrap_async(batch.core, PaymentWrapperConfig(accepts=[requirements], hooks=hooks))(
+            lambda *_: "ok"
+        )
+        result = await wrapped({}, extra)
+    receipt = extract_payment_response_from_result(result)
+    assert result.is_error and receipt is not None and not receipt.success
+    client.on_payment_response(
+        PaymentResponseContext(
+            payment_payload=payload,
+            requirements=requirements,
+            settle_response=receipt,
+            payment_required=extract_payment_required_from_result(result),
+        )
+    )
+    retry = client.create_payment_payload(requirements)
+    assert retry["type"] == "authorization"
+    assert retry["authorization"]["requestId"] != inner["authorization"]["requestId"]
     state = batch.scheme.store.get(batch.channel)
     assert not state.reservations
     assert state.charged_cumulative_amount == 0

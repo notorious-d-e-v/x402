@@ -60,7 +60,7 @@ async def test_fastmcp_wrapper_preserves_call_tool_result_meta():
         payload={"signature": "0x123"},
     )
     resource_server = _matching_resource_server()
-    resource_server.verify_payment = AsyncMock(return_value=Mock(is_valid=True, skip_handler=None))
+    resource_server.verify_payment = AsyncMock(return_value=Mock(is_valid=True))
     resource_server.settle_payment = AsyncMock(
         return_value=SettleResponse(
             success=True,
@@ -115,7 +115,7 @@ async def test_fastmcp_verifies_and_settles_against_matched_accept():
         payload={"signature": "0x123"},
     )
     resource_server = _matching_resource_server(
-        verify_payment=AsyncMock(return_value=Mock(is_valid=True, skip_handler=None)),
+        verify_payment=AsyncMock(return_value=Mock(is_valid=True)),
         settle_payment=AsyncMock(
             return_value=SettleResponse(success=True, transaction="0xtx123", network="tvm:-3")
         ),

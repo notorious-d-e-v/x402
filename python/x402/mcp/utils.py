@@ -8,6 +8,7 @@ from ..schemas import (
     PaymentPayload,
     PaymentRequired,
     PaymentRequiredV1,
+    PaymentRequirements,
     SettleResponse,
     parse_payment_required,
 )
@@ -188,6 +189,47 @@ def extract_payment_response_from_meta(
         return None
     except (TypeError, ValueError, KeyError):
         return None
+
+
+def metered_payment_requirements(
+    requirements: PaymentRequirements, amount: str
+) -> PaymentRequirements:
+    """Apply a request-local amount within the verified payment ceiling."""
+    for value in (amount, requirements.amount):
+        if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+            raise ValueError("Settlement amount must be an ASCII decimal string")
+    if int(amount) > int(requirements.amount):
+        raise ValueError("Settlement amount exceeds the verified ceiling")
+    return requirements.model_copy(update={"amount": amount})
+
+
+def extract_payment_response_from_result(result: MCPToolResult) -> SettleResponse | None:
+    """Read receipts for state reconciliation, including structured failures.
+
+    Successful receipts belong in metadata. Failed settlements belong in the
+    error body; their transaction and scheme fields must still reach client
+    response hooks so an uncertain payment cannot be submitted again blindly.
+    """
+    response = extract_payment_response_from_meta(result)
+    if response is not None or not result.is_error:
+        return response
+    candidates = [result.structured_content]
+    for item in result.content:
+        text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+        if not isinstance(text, str):
+            continue
+        try:
+            candidates.append(json.loads(text))
+        except ValueError:
+            continue
+    for data in candidates:
+        if not isinstance(data, dict):
+            continue
+        response = extract_payment_response_from_meta(MCPToolResult(content=[], meta=data))
+        # An error body is only a failure-recovery envelope, not a success receipt.
+        if response is not None and not response.success:
+            return response
+    return None
 
 
 def attach_payment_response_to_meta(
@@ -433,12 +475,16 @@ def convert_mcp_result(mcp_result: Any) -> "MCPToolResult":
         is_error = getattr(mcp_result, "is_error", False)
 
     # Extract meta
-    meta = getattr(mcp_result, "_meta", {})
+    meta = getattr(mcp_result, "meta", None)
+    if not isinstance(meta, dict):
+        meta = getattr(mcp_result, "_meta", {})
     if not isinstance(meta, dict):
         meta = {}
 
     # Extract structuredContent
     structured_content = getattr(mcp_result, "structuredContent", None)
+    if structured_content is None:
+        structured_content = getattr(mcp_result, "structured_content", None)
 
     return MCPToolResult(
         content=content,

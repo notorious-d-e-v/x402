@@ -569,7 +569,8 @@ async def test_fastmcp_failed_settlement_preserves_pending_receipt():
         ctx=MockFastMCPContext({MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)})
     )
     assert result.isError
-    assert result.meta[
+    assert not result.meta
+    assert result.structuredContent[
         MCP_PAYMENT_RESPONSE_META_KEY
     ] == server.settle_payment.return_value.model_dump(
         by_alias=True,
@@ -590,3 +591,199 @@ async def test_fastmcp_does_not_cancel_uncertain_settlement_exception():
     )
     assert result.isError
     server.create_payment_cancellation_dispatcher.assert_not_called()
+
+
+async def _run_generic_wrapper(kind, server, requirements, handler, hooks=None):
+    payload = PaymentPayload(x402_version=2, accepted=requirements, payload={"signature": "payer"})
+    if kind.startswith("fast"):
+        wrapped = create_fastmcp_payment_wrapper(server, accepts=[requirements], hooks=hooks)(
+            lambda: handler()
+        )
+        return await wrapped(
+            ctx=MockFastMCPContext({MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)})
+        )
+    if kind == "async":
+        wrapped = create_payment_wrapper(
+            server, PaymentWrapperConfig(accepts=[requirements], hooks=hooks)
+        )(lambda *_: handler())
+        return await wrapped({}, _paid_tool_extra(payload))
+    wrapped = create_payment_wrapper_sync(
+        server, SyncPaymentWrapperConfig(accepts=[requirements], hooks=hooks)
+    )(lambda *_: handler())
+    return wrapped({}, _paid_tool_extra(payload))
+
+
+def _generic_server(kind):
+    server = _MismatchAsyncServer() if kind in ("fast-async", "async") else _MismatchSyncServer()
+    server._abort_once = False
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("skip", [False, True])
+async def test_skip_handler_requires_an_explicit_directive(kind, skip):
+    from x402.schemas.hooks import SkipHandlerDirective
+
+    server = _generic_server(kind)
+    server.verify_payment.side_effect = None
+    # A plain Mock fabricates attributes on lookup. It is not a skip directive.
+    verified = Mock(is_valid=True)
+    if skip:
+        verified.skip_handler = SkipHandlerDirective(body={"closed": True})
+    server.verify_payment.return_value = verified
+    handler = Mock(return_value="paid output")
+    result = await _run_generic_wrapper(kind, server, _cash_requirements(), handler)
+    assert not getattr(result, "isError", getattr(result, "is_error", False))
+    assert handler.call_count == (0 if skip else 1)
+    server.settle_payment.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+async def test_metering_failure_cancels_without_charging_ceiling(kind):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    requirements = _cash_requirements()
+    before = requirements.model_dump()
+
+    def meter(context):
+        context.payment_requirements.amount = "200"
+        context.payment_requirements.pay_to = "unrelated-payee"
+        raise ValueError("meter unavailable")
+
+    handler = Mock(return_value="paid output")
+    result = await _run_generic_wrapper(
+        kind, server, requirements, handler, PaymentWrapperHooks(on_after_execution=meter)
+    )
+    assert getattr(result, "isError", getattr(result, "is_error", False))
+    handler.assert_called_once()
+    server.settle_payment.assert_not_called()
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
+    cancel.assert_called_once()
+    assert requirements.model_dump() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+async def test_metering_only_updates_request_local_settlement_amount(kind):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    requirements = _cash_requirements()
+    before = requirements.model_dump()
+
+    def meter(context):
+        context.payment_requirements.amount = "200"
+        context.payment_requirements.pay_to = "unrelated-payee"
+
+    result = await _run_generic_wrapper(
+        kind, server, requirements, lambda: "ok", PaymentWrapperHooks(on_after_execution=meter)
+    )
+    assert not getattr(result, "isError", getattr(result, "is_error", False))
+    settled = server.settle_payment.call_args.args[1]
+    assert settled.amount == "200"
+    assert settled.pay_to == requirements.pay_to
+    assert requirements.model_dump() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+async def test_all_wrappers_preserve_failed_receipt_only_in_error_body(kind):
+    from x402.mcp.utils import convert_mcp_result, extract_payment_response_from_result
+
+    server = _generic_server(kind)
+    receipt = SettleResponse(
+        success=False,
+        transaction="pending-tx",
+        network="x402:cash",
+        error_reason="transaction_pending",
+        extra={"channelId": "channel"},
+    )
+    server.settle_payment.return_value = receipt
+    result = await _run_generic_wrapper(kind, server, _cash_requirements(), lambda: "ok")
+    normalized = convert_mcp_result(result)
+    assert normalized.is_error
+    assert MCP_PAYMENT_RESPONSE_META_KEY not in normalized.meta
+    assert extract_payment_response_from_result(normalized) == receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("amount", [True, 200, "1001", "-1", "1.0", "1e2", "١", "", " 1"])
+async def test_invalid_metering_amount_cancels_before_settlement(kind, amount):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    requirements = _cash_requirements()
+
+    def meter(context):
+        # Hooks are Python callbacks: Pydantic assignment validation is not enabled.
+        context.payment_requirements.amount = amount
+
+    result = await _run_generic_wrapper(
+        kind, server, requirements, lambda: "ok", PaymentWrapperHooks(on_after_execution=meter)
+    )
+    assert getattr(result, "isError", getattr(result, "is_error", False))
+    server.settle_payment.assert_not_called()
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
+    cancel.assert_called_once()
+    assert requirements.amount == "1000"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize(
+    "outcome", ["released", "upfront", "unknown", "upfront-unknown", "no-dispatcher"]
+)
+async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, outcome):
+    from x402.mcp.types import PaymentWrapperHooks
+    from x402.mcp.utils import (
+        convert_mcp_result,
+        extract_payment_required_from_result,
+        extract_payment_response_from_result,
+    )
+
+    server = _generic_server(kind)
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind == "async" else dispatcher.cancel_sync
+    if outcome in ("upfront", "upfront-unknown"):
+        server.get_payment_flow.return_value = "upfront"
+    if outcome in ("unknown", "upfront-unknown"):
+        cancel.side_effect = TimeoutError("cancellation outcome unknown")
+    elif outcome == "no-dispatcher":
+        server.create_payment_cancellation_dispatcher.return_value = None
+
+    def meter(_):
+        raise ValueError("meter unavailable")
+
+    result = convert_mcp_result(
+        await _run_generic_wrapper(
+            kind,
+            server,
+            _cash_requirements(),
+            lambda: "ok",
+            PaymentWrapperHooks(on_after_execution=meter),
+        )
+    )
+    assert result.is_error
+    receipt = extract_payment_response_from_result(result)
+    if outcome == "released":
+        assert receipt is not None and not receipt.success
+        assert receipt.transaction == ""
+        assert receipt.error_reason == "Payment metering failed"
+        assert extract_payment_required_from_result(result) is not None
+        assert MCP_PAYMENT_RESPONSE_META_KEY not in result.meta
+    elif outcome in ("upfront", "upfront-unknown"):
+        assert receipt == server.settle_payment.return_value
+        assert receipt.success
+        server.settle_payment.assert_called_once()
+        assert server.settle_payment.call_args.kwargs["phase"] == "before-handler"
+    else:
+        assert receipt is None
+        assert extract_payment_required_from_result(result) is None
+    if outcome not in ("upfront", "upfront-unknown"):
+        server.settle_payment.assert_not_called()

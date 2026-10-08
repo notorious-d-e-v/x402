@@ -31,12 +31,13 @@ from typing import Any
 from ..client import x402Client, x402ClientSync
 from ..schemas.hooks import PaymentResponseContext
 from ..schemas.responses import SettleResponse
-from .constants import MCP_PAYMENT_META_KEY, MCP_PAYMENT_RESPONSE_META_KEY
+from .constants import MCP_PAYMENT_META_KEY
+from .types import PaymentRequiredContext, PaymentResponseError
 from .utils import (
     _extract_payment_required_from_object,
     convert_mcp_result,
     extract_payment_required_from_result,
-    extract_payment_response_from_meta,
+    extract_payment_response_from_result,
     paid_read_timeout_seconds,
     probe_read_timeout_seconds,
     resolve_max_request_timeout_seconds,
@@ -57,8 +58,9 @@ class MCPToolCallResult:
     Attributes:
         content: List of MCP content items from the tool response.
         is_error: Whether the tool returned an error.
-        payment_response: Settlement response if payment was made, else None.
-        payment_made: Whether a payment was made during this call.
+        payment_response: Successful settlement response, if available.
+        payment_made: Payment submitted without an explicit settlement failure;
+            this alone does not confirm settlement.
         raw_result: The raw MCP CallToolResult for advanced use.
     """
 
@@ -160,16 +162,21 @@ class x402MCPSession:
             hook = getattr(self._x402_client, "handle_payment_response", None)
             recovered = None
             if callable(hook):
-                recovered = await hook(
-                    PaymentResponseContext(
-                        payment_payload=payment_payload,
-                        requirements=accepted,
-                        settle_response=response.payment_response
-                        if isinstance(response.payment_response, SettleResponse)
-                        else None,
-                        payment_required=corrective,
+                try:
+                    recovered = await hook(
+                        PaymentResponseContext(
+                            payment_payload=payment_payload,
+                            requirements=accepted,
+                            settle_response=extract_payment_response_from_result(
+                                convert_mcp_result(result)
+                            ),
+                            payment_required=corrective,
+                        )
                     )
-                )
+                except Exception as error:
+                    response.is_error = True
+                    response.payment_response = None
+                    raise PaymentResponseError(str(error), response) from error
             if (
                 attempt == 0
                 and corrective is not None
@@ -182,21 +189,14 @@ class x402MCPSession:
 
     def _build_result(self, result: Any, payment_made: bool) -> MCPToolCallResult:
         """Convert MCP result to MCPToolCallResult."""
-        payment_response = None
-        if hasattr(result, "meta") and result.meta:
-            meta_dict = dict(result.meta) if not isinstance(result.meta, dict) else result.meta
-            pr = meta_dict.get(MCP_PAYMENT_RESPONSE_META_KEY)
-            if pr:
-                try:
-                    payment_response = SettleResponse.model_validate(pr)
-                except Exception:
-                    payment_response = pr
-
+        payment_response = extract_payment_response_from_result(convert_mcp_result(result))
         return MCPToolCallResult(
             content=list(result.content) if result.content else [],
             is_error=getattr(result, "isError", False),
-            payment_response=payment_response,
-            payment_made=payment_made,
+            payment_response=payment_response
+            if payment_response and payment_response.success
+            else None,
+            payment_made=payment_made and (payment_response is None or payment_response.success),
             raw_result=result,
         )
 
@@ -306,14 +306,13 @@ class x402MCPClientSync:
         if not self._auto_payment:
             return self._build_result(mcp_result, payment_made=False)
 
-        if self._on_payment_requested:
-            approved = self._on_payment_requested(
-                type("Ctx", (), {"payment_required": payment_required})()
-            )
-            if not approved:
-                return self._build_result(mcp_result, payment_made=False)
-
         for attempt in range(2):
+            if self._on_payment_requested:
+                approved = self._on_payment_requested(
+                    PaymentRequiredContext(name, args, payment_required)
+                )
+                if not approved:
+                    return self._build_result(mcp_result, payment_made=False)
             payment_payload = self._payment_client.create_payment_payload(payment_required)
             accepted = payment_payload.accepted
             paid_timeout = paid_read_timeout_seconds(
@@ -335,18 +334,21 @@ class x402MCPClientSync:
                 extract_payment_required_from_result(mcp_result) if mcp_result.is_error else None
             )
             hook = getattr(self._payment_client, "handle_payment_response", None)
-            recovered = (
-                hook(
-                    PaymentResponseContext(
-                        payment_payload=payment_payload,
-                        requirements=accepted,
-                        settle_response=response.payment_response,
-                        payment_required=corrective,
+            recovered = None
+            if callable(hook):
+                try:
+                    recovered = hook(
+                        PaymentResponseContext(
+                            payment_payload=payment_payload,
+                            requirements=accepted,
+                            settle_response=extract_payment_response_from_result(mcp_result),
+                            payment_required=corrective,
+                        )
                     )
-                )
-                if callable(hook)
-                else None
-            )
+                except Exception as error:
+                    response.is_error = True
+                    response.payment_response = None
+                    raise PaymentResponseError(str(error), response) from error
             if (
                 attempt == 0
                 and corrective is not None
@@ -359,12 +361,14 @@ class x402MCPClientSync:
 
     def _build_result(self, mcp_result: Any, payment_made: bool) -> MCPToolCallResult:
         """Build MCPToolCallResult from MCPToolResult."""
-        payment_response = extract_payment_response_from_meta(mcp_result)
+        payment_response = extract_payment_response_from_result(mcp_result)
         return MCPToolCallResult(
             content=mcp_result.content,
             is_error=mcp_result.is_error,
-            payment_response=payment_response,
-            payment_made=payment_made,
+            payment_response=payment_response
+            if payment_response and payment_response.success
+            else None,
+            payment_made=payment_made and (payment_response is None or payment_response.success),
             raw_result=mcp_result,
         )
 

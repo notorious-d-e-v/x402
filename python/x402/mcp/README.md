@@ -91,6 +91,14 @@ x402_mcp = create_x402_mcp_client_from_config(
 )
 ```
 
+Corrective payment retries rerun approval hooks. A tool result's
+`payment_response` contains only a successful receipt; `payment_made` records
+submission without an explicit failure and is not proof of settlement. Failed
+receipt details remain available in `raw_result` for recovery. If receipt
+validation raises, `PaymentResponseError.result` preserves the returned tool
+output and `__cause__` preserves the validation error. Do not retry that payment
+without resolving its outcome.
+
 #### `wrap_mcp_client_with_payment`
 
 Wraps an existing MCP client with x402 payment handling.
@@ -146,6 +154,11 @@ paid = create_payment_wrapper(
 )
 ```
 
+`on_after_execution` may set the request's settlement amount within its verified
+ceiling. Invalid amounts or metering exceptions cancel the payment instead of
+charging the ceiling after execution. Previously completed upfront payments
+remain completed. Advertised accepts are unchanged.
+
 ### Utilities
 
 #### Error Handling
@@ -196,6 +209,7 @@ if is_object(value):
 - `PaymentRequiredContext` - Context provided to payment required hooks
 - `PaymentRequiredHookResult` - Result from payment required hook
 - `PaymentRequiredError` - Error indicating payment is required
+- `PaymentResponseError` - Receipt-processing error carrying the returned tool result
 
 ### Server Types
 

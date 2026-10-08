@@ -34,7 +34,7 @@ from typing import Any
 
 from ..hook_policy import snapshot_payment_requirements_list
 from ..schemas.errors import PaymentAbortedError, VerifyError
-from ..schemas.hooks import VerifiedPaymentCancelOptions
+from ..schemas.hooks import SkipHandlerDirective, VerifiedPaymentCancelOptions
 from ..schemas.payments import PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo
 from ..schemas.responses import SettleResponse, VerifyResponse
 from .constants import MCP_PAYMENT_META_KEY, MCP_PAYMENT_RESPONSE_META_KEY
@@ -44,7 +44,7 @@ from .types import (
     ServerHookContext,
     SettlementContext,
 )
-from .utils import post_enrichment_accepts
+from .utils import metered_payment_requirements, post_enrichment_accepts
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ def create_payment_wrapper(
         hooks: Optional ``PaymentWrapperHooks`` for on_before_execution,
             on_after_execution, on_after_settlement (matches server_async).
             on_after_execution may set its request-local payment_requirements.amount
-            for metered settlement; the core scheme enforces the verified ceiling.
+            for metered settlement within the verified ceiling.
         extensions: Optional x402 extensions to include in PaymentRequired responses.
             Use this to attach Bazaar discovery metadata so facilitators can index
             the tool. Example: ``declare_mcp_discovery_extension(config)``
@@ -259,6 +259,8 @@ def create_payment_wrapper(
                     await result
 
             skip_handler = getattr(verify_result, "skip_handler", None)
+            if not isinstance(skip_handler, SkipHandlerDirective):
+                skip_handler = None
             if skip_handler is not None:
                 result = getattr(skip_handler, "body", None) or {}
             else:
@@ -343,30 +345,39 @@ def create_payment_wrapper(
             )
 
             # Metering hooks receive a request-local copy. Only the amount is
-            # applied to settlement; the core scheme still enforces its ceiling.
+            # applied to settlement, bounded by the verified ceiling.
             settlement_requirements = payment_requirements.model_copy(deep=True)
-            if skip_handler is None and hooks and hooks.on_after_execution:
-                after_ctx = AfterExecutionContext(
-                    tool_name=tool_name,
-                    arguments=kwargs,
-                    payment_requirements=settlement_requirements,
-                    payment_payload=payload,
-                    result=mcp_result,
-                )
-                try:
+            try:
+                if skip_handler is None and hooks and hooks.on_after_execution:
+                    after_ctx = AfterExecutionContext(
+                        tool_name=tool_name,
+                        arguments=kwargs,
+                        payment_requirements=settlement_requirements,
+                        payment_payload=payload,
+                        result=mcp_result,
+                    )
                     coro = hooks.on_after_execution(after_ctx)
-                    if asyncio.iscoroutine(coro):
+                    if inspect.isawaitable(coro):
                         await coro
-                except Exception:
-                    pass
+                settlement_requirements = metered_payment_requirements(
+                    payment_requirements, settlement_requirements.amount
+                )
+            except Exception as error:
+                await cancel_verified(
+                    VerifiedPaymentCancelOptions(reason="after_verify_aborted", error=error)
+                )
+                return _create_settlement_failed_result(
+                    accepts,
+                    tool_resource,
+                    "Payment metering failed",
+                    extensions,
+                    network=payment_requirements.network,
+                )
 
             if is_handler_error:
                 await cancel_verified(VerifiedPaymentCancelOptions(reason="handler_failed"))
                 return result
 
-            settlement_requirements = payment_requirements.model_copy(
-                update={"amount": settlement_requirements.amount}
-            )
             try:
                 if asyncio.iscoroutinefunction(resource_server.settle_payment):
                     settle_result = await resource_server.settle_payment(
@@ -559,5 +570,4 @@ def _create_settlement_failed_result(
         content=[TextContent(type="text", text=json.dumps(error_data))],
         structuredContent=error_data,
         isError=True,
-        _meta={MCP_PAYMENT_RESPONSE_META_KEY: error_data[MCP_PAYMENT_RESPONSE_META_KEY]},
     )
