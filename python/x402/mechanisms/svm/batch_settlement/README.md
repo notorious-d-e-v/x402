@@ -200,11 +200,12 @@ simulates setup plus close/distribution readiness. It persists signed bytes and
 channel reservations before broadcast. Unknown outcomes remain pending until
 confirmed or proven expired; retries reconcile the recorded transaction.
 
-Custom signers should expose `get_account_info_with_context`, returning
-`{"context_slot": slot, "account": account_or_none}` and honoring
-`min_context_slot`. The bundled signer does this even for absent accounts.
-A bare `None` from a legacy signer cannot prove absence after confirmation;
-the facilitator keeps that outcome pending until it receives a fresh read.
+Custom signers must implement
+`get_account_info_with_context(address, network, *, min_context_slot=None)`,
+returning `{"context_slot": slot, "account": account_or_none}` and honoring
+`min_context_slot`, including for absent accounts. Construction rejects signers
+without this method; the bundled signer already implements it. Missing or stale
+context after confirmation keeps the outcome pending until a fresh read arrives.
 
 Configure an explicit binding store or history reader. `MemoryPaymentChannelStorage`
 and `MemoryBatchPendingSettlementStore` are suitable for development; replace

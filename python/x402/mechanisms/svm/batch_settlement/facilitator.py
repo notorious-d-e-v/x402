@@ -121,6 +121,7 @@ class BatchSvmScheme:
         for method in (
             "get_addresses",
             "get_account_info",
+            "get_account_info_with_context",
             "get_latest_blockhash",
             "get_slot",
             "get_block_height",
@@ -171,15 +172,10 @@ class BatchSvmScheme:
         floor = self._confirmation_slots.get(network)
         for attempt in range(5):
             try:
-                contextual_read = getattr(self.signer, "get_account_info_with_context", None)
-                if callable(contextual_read):
-                    result = contextual_read(channel_id, network, min_context_slot=floor)
-                    account, context_slot = result["account"], result["context_slot"]
-                else:
-                    account = self.signer.get_account_info(
-                        channel_id, network, min_context_slot=floor
-                    )
-                    context_slot = account.get("context_slot") if account is not None else None
+                result = self.signer.get_account_info_with_context(
+                    channel_id, network, min_context_slot=floor
+                )
+                account, context_slot = result["account"], result["context_slot"]
                 if floor is not None and (type(context_slot) is not int or context_slot < floor):
                     raise RuntimeError("account read precedes confirmed transaction slot")
                 if account is None:

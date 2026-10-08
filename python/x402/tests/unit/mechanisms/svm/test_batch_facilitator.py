@@ -255,8 +255,8 @@ def deposit(req, cfg, channel_id):
         authorized_signer=cfg["payerAuthorizer"],
         token_program=TOKEN_PROGRAM_ADDRESS,
         deposit=100,
-        salt=7,
-        open_slot=123,
+        salt=int(cfg["salt"]),
+        open_slot=cfg["openSlot"],
         grace_period=900,
         blockhash=str(Hash.default()),
         memo="order",
@@ -956,6 +956,47 @@ def test_facilitator_requires_actual_blockhash_validity_reader(fixture):
         BatchSvmScheme(rpc, scheme.config)
 
 
+@pytest.mark.parametrize("missing", [True, False])
+def test_facilitator_rejects_signer_without_callable_contextual_read(fixture, monkeypatch, missing):
+    scheme, rpc, *_ = fixture
+    if missing:
+        monkeypatch.delattr(Transport, "get_account_info_with_context")
+    else:
+        rpc.get_account_info_with_context = None
+    rpc.get_account_info = Mock(side_effect=AssertionError("startup must not query RPC"))
+    with pytest.raises(TypeError, match="must implement get_account_info_with_context"):
+        BatchSvmScheme(rpc, scheme.config)
+    rpc.get_account_info.assert_not_called()
+    assert not rpc.sent and not rpc.signed
+
+
+def test_contextual_signer_accepts_new_open_after_another_channel_confirms(fixture):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.on_send = lambda: setattr(rpc, "channel", channel)
+    assert scheme.settle(deposit(req, cfg, cid), req).success
+    assert scheme._confirmation_slots[NETWORK] == 1000
+
+    cfg = {**cfg, "salt": "8"}
+    cid = find_payment_channel_pda(
+        payer=cfg["payer"],
+        payee=req.extra["feePayer"],
+        mint=req.asset,
+        authorized_signer=cfg["payerAuthorizer"],
+        salt=8,
+        open_slot=cfg["openSlot"],
+    )
+    rpc.channel_id, rpc.channel = cid, None
+    rpc.get_account_info_with_context = Mock(wraps=rpc.get_account_info_with_context)
+    rpc.on_send = lambda: setattr(rpc, "channel", replace(channel, salt=8))
+    payload = deposit(req, cfg, cid)
+    assert scheme.verify(payload, req).is_valid
+    rpc.get_account_info_with_context.assert_called_with(cid, NETWORK, min_context_slot=1000)
+    result = scheme.settle(payload, req)
+    assert result.success and result.extra["channelState"]["channelId"] == cid
+    assert len(rpc.sent) == len(rpc.signed) == 2
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+
+
 def test_stale_post_confirmation_read_cannot_release_deposit_reservation(fixture, monkeypatch):
     scheme, rpc, req, cfg, cid, channel = fixture
     original_read = rpc.get_account_info
@@ -1086,14 +1127,10 @@ def test_malformed_settlement_payload_preserves_validation_error(fixture, kind, 
 @pytest.mark.parametrize("context", [None, 999])
 def test_unproven_absence_retains_confirmed_deposit_until_fresh_read(fixture, monkeypatch, context):
     scheme, rpc, req, cfg, cid, _ = fixture
-    if context is None:
-        # Legacy custom signers may ignore min_context_slot and return an ambiguous None.
-        rpc.get_account_info_with_context = None
-    else:
-        rpc.get_account_info_with_context = lambda *args, **kwargs: {
-            "account": None,
-            "context_slot": context,
-        }
+    rpc.get_account_info_with_context = lambda *args, **kwargs: {
+        "account": None,
+        "context_slot": context,
+    }
     monkeypatch.setattr(time, "sleep", lambda _: None)
     payload = deposit(req, cfg, cid)
     result = scheme.settle(payload, req)
