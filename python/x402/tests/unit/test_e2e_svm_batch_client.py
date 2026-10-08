@@ -338,6 +338,78 @@ async def test_existing_phase_runners_dispatch_svm_refund(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initial", "full"])
+@pytest.mark.parametrize("sync", [True, False])
+async def test_failed_deposit_stops_before_voucher_or_refund(e2e, monkeypatch, capsys, phase, sync):
+    monkeypatch.setenv("BATCH_SETTLEMENT_PHASE", phase)
+    ctx = e2e.create_e2e_client(sync=sync)
+    failed = {
+        "success": False,
+        "status_code": 402,
+        "error": "deposit rejected",
+        "payment_response": {"success": False, "error_reason": "deposit rejected"},
+    }
+    issue = MagicMock(return_value=failed) if sync else AsyncMock(return_value=failed)
+    refund = MagicMock() if sync else AsyncMock()
+    with pytest.raises(SystemExit):
+        if sync:
+            e2e.run_client_scenario_sync(ctx, issue, refund)
+        else:
+            await e2e.run_client_scenario(ctx, issue, refund)
+    result = json.loads(capsys.readouterr().out)
+    assert result["success"] is False
+    assert result["status_code"] == 402
+    assert result["error"] == "deposit rejected"
+    assert result["payment_response"] == failed["payment_response"]
+    assert result["data"]["batchSettlement"]["requests"] == [failed]
+    issue.assert_called_once()
+    refund.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["full", "recovery-refund"])
+@pytest.mark.parametrize("sync", [True, False])
+@pytest.mark.parametrize("refund_raises", [True, False])
+async def test_failed_voucher_survives_refund_cleanup(
+    e2e, monkeypatch, capsys, phase, sync, refund_raises
+):
+    monkeypatch.setenv("BATCH_SETTLEMENT_PHASE", phase)
+    ctx = e2e.create_e2e_client(sync=sync)
+    deposit = {"success": True, "status_code": 200, "payment_response": {"transaction": "open"}}
+    failed = {
+        "success": False,
+        "status_code": 402,
+        "error": "voucher rejected",
+        "payment_response": {"success": False, "error_reason": "voucher rejected"},
+    }
+    requests = [deposit, failed] if phase == "full" else [failed]
+    issue = MagicMock(side_effect=requests) if sync else AsyncMock(side_effect=requests)
+    refund = MagicMock() if sync else AsyncMock()
+    if refund_raises:
+        refund.side_effect = RuntimeError("refund unavailable")
+    else:
+        refund.return_value = SettleResponse(
+            success=True, network=SOLANA_DEVNET_CAIP2, transaction="refund"
+        )
+    with pytest.raises(SystemExit):
+        if sync:
+            e2e.run_client_scenario_sync(ctx, issue, refund)
+        else:
+            await e2e.run_client_scenario(ctx, issue, refund)
+    result = json.loads(capsys.readouterr().out)
+    assert result["success"] is False
+    assert result["status_code"] == 402
+    assert result["error"] == "voucher rejected"
+    assert result["payment_response"] == failed["payment_response"]
+    details = result["data"]["batchSettlement"]
+    assert details["requests"][:-1] == requests
+    assert details["refund"]["success"] is not refund_raises
+    if refund_raises:
+        assert details["refund"]["error"] == "refund unavailable"
+    refund.assert_called_once_with(ctx.base_url + ctx.endpoint_path)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["httpx", "requests"])
 async def test_http_entrypoints_report_non_2xx_as_failure(e2e, monkeypatch, capsys, transport):
     monkeypatch.setitem(sys.modules, "client", e2e)

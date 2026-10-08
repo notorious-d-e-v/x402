@@ -186,9 +186,11 @@ def create_e2e_client(*, sync: bool = False) -> ClientContext:
 
 
 def aggregate_batch_result(phase: str, results: list[dict], details: dict) -> dict:
-    last = results[-1]
+    failed = next((result for result in results if not result["success"]), None)
+    last = failed or results[-1]
     return {
         "success": all(r["success"] for r in results),
+        **({"error": last["error"]} if last.get("error") else {}),
         "data": {
             "batchSettlement": {
                 "phase": phase,
@@ -204,6 +206,24 @@ def aggregate_batch_result(phase: str, results: list[dict], details: dict) -> di
 def _emit_and_exit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload))
     raise SystemExit(0)
+
+
+def _refund_failure(error: Exception) -> dict[str, Any]:
+    return {"success": False, "status_code": 500, "error": str(error)}
+
+
+def _refund_result(settle: Any) -> dict[str, Any]:
+    return {
+        "success": settle.success,
+        "data": {"refund": True},
+        "status_code": 200,
+        "payment_response": settle.model_dump(),
+    }
+
+
+def _stop_failed_deposit(phase: str, deposit: dict[str, Any]) -> None:
+    if not deposit["success"]:
+        _emit_and_exit(aggregate_batch_result(phase, [deposit], {"deposit": deposit}))
 
 
 def run_client_scenario_sync(
@@ -227,6 +247,7 @@ def run_client_scenario_sync(
 
     if ctx.batch_settlement_phase == "initial":
         deposit = issue_request()
+        _stop_failed_deposit("initial", deposit)
         voucher = issue_request()
         _emit_and_exit(
             aggregate_batch_result(
@@ -238,13 +259,10 @@ def run_client_scenario_sync(
 
     if ctx.batch_settlement_phase == "recovery-refund":
         recovery_voucher = issue_request()
-        refund_settle = refund(url)
-        refund_result = {
-            "success": refund_settle.success,
-            "data": {"refund": True},
-            "status_code": 200,
-            "payment_response": refund_settle.model_dump(),
-        }
+        try:
+            refund_result = _refund_result(refund(url))
+        except Exception as error:
+            refund_result = _refund_failure(error)
         _emit_and_exit(
             aggregate_batch_result(
                 "recovery-refund",
@@ -255,14 +273,12 @@ def run_client_scenario_sync(
 
     if ctx.batch_settlement_phase == "full":
         deposit = issue_request()
+        _stop_failed_deposit("full", deposit)
         voucher = issue_request()
-        refund_settle = refund(url)
-        refund_result = {
-            "success": refund_settle.success,
-            "data": {"refund": True},
-            "status_code": 200,
-            "payment_response": refund_settle.model_dump(),
-        }
+        try:
+            refund_result = _refund_result(refund(url))
+        except Exception as error:
+            refund_result = _refund_failure(error)
         _emit_and_exit(
             aggregate_batch_result(
                 "full",
@@ -299,6 +315,7 @@ async def run_client_scenario(
 
     if ctx.batch_settlement_phase == "initial":
         deposit = await issue_request()
+        _stop_failed_deposit("initial", deposit)
         voucher = await issue_request()
         _emit_and_exit(
             aggregate_batch_result(
@@ -310,13 +327,10 @@ async def run_client_scenario(
 
     if ctx.batch_settlement_phase == "recovery-refund":
         recovery_voucher = await issue_request()
-        refund_settle = await refund(url)
-        refund_result = {
-            "success": refund_settle.success,
-            "data": {"refund": True},
-            "status_code": 200,
-            "payment_response": refund_settle.model_dump(),
-        }
+        try:
+            refund_result = _refund_result(await refund(url))
+        except Exception as error:
+            refund_result = _refund_failure(error)
         _emit_and_exit(
             aggregate_batch_result(
                 "recovery-refund",
@@ -327,14 +341,12 @@ async def run_client_scenario(
 
     if ctx.batch_settlement_phase == "full":
         deposit = await issue_request()
+        _stop_failed_deposit("full", deposit)
         voucher = await issue_request()
-        refund_settle = await refund(url)
-        refund_result = {
-            "success": refund_settle.success,
-            "data": {"refund": True},
-            "status_code": 200,
-            "payment_response": refund_settle.model_dump(),
-        }
+        try:
+            refund_result = _refund_result(await refund(url))
+        except Exception as error:
+            refund_result = _refund_failure(error)
         _emit_and_exit(
             aggregate_batch_result(
                 "full",
