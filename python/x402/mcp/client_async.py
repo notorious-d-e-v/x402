@@ -6,7 +6,7 @@ import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..schemas import PaymentPayload, PaymentRequired
+from ..schemas import PaymentPayload, PaymentRequired, PaymentResponseContext
 from .types import (
     AfterPaymentContext,
     MCPToolCallResult,
@@ -200,8 +200,8 @@ class x402MCPClient:
                 if hook_result.abort:
                     raise PaymentRequiredError("Payment aborted by hook", payment_required)
                 if hook_result.payment:
-                    return await self.call_tool_with_payment(
-                        name, args, hook_result.payment, **kwargs
+                    return await self._call_tool_with_payment(
+                        name, args, hook_result.payment, payment_required, **kwargs
                     )
 
         # No hook handled it, proceed with normal flow
@@ -234,7 +234,9 @@ class x402MCPClient:
             payment_payload = await payment_payload
 
         # Retry with payment
-        return await self.call_tool_with_payment(name, args, payment_payload, **kwargs)
+        return await self._call_tool_with_payment(
+            name, args, payment_payload, payment_required, **kwargs
+        )
 
     async def call_tool_with_payment(
         self,
@@ -254,35 +256,79 @@ class x402MCPClient:
         Returns:
             Tool call result with payment metadata
         """
-        # Build call params with payment in _meta
-        call_params = attach_payment_to_meta({"name": name, "arguments": args}, payload)
+        return await self._call_tool_with_payment(name, args, payload, None, **kwargs)
 
-        accepted = payload.accepted
-        max_timeout_seconds = accepted.max_timeout_seconds if accepted is not None else None
-        paid_timeout = paid_read_timeout_seconds(
-            kwargs.get("read_timeout_seconds"),
-            max_timeout_seconds,
-            self._max_request_timeout_seconds,
-        )
-        paid_kwargs = {**kwargs, "read_timeout_seconds": paid_timeout}
+    async def _call_tool_with_payment(
+        self,
+        name: str,
+        args: dict[str, Any],
+        payload: PaymentPayload,
+        payment_required: PaymentRequired | None,
+        **kwargs: Any,
+    ) -> MCPToolCallResult:
+        for attempt in range(2):
+            # Build call params with payment in _meta
+            call_params = attach_payment_to_meta({"name": name, "arguments": args}, payload)
 
-        # Call with payment
-        result = await self._call_mcp_tool(call_params, **paid_kwargs)
+            accepted = payload.accepted
+            max_timeout_seconds = accepted.max_timeout_seconds if accepted is not None else None
+            paid_timeout = paid_read_timeout_seconds(
+                kwargs.get("read_timeout_seconds"),
+                max_timeout_seconds,
+                self._max_request_timeout_seconds,
+            )
+            paid_kwargs = {**kwargs, "read_timeout_seconds": paid_timeout}
 
-        # Extract payment response
-        settle_response = extract_payment_response_from_meta(result)
+            # Call with payment
+            result = await self._call_mcp_tool(call_params, **paid_kwargs)
 
-        # Run after payment hooks
-        after_context = AfterPaymentContext(
-            tool_name=name,
-            payment_payload=payload,
-            result=result,
-            settle_response=settle_response,
-        )
-        for hook in self._after_payment_hooks:
-            result_or_coro = hook(after_context)
-            if hasattr(result_or_coro, "__await__"):
-                await result_or_coro
+            # Extract payment response
+            settle_response = extract_payment_response_from_meta(result)
+
+            corrective = extract_payment_required_from_result(result) if result.is_error else None
+            response_hook = getattr(self._payment_client, "handle_payment_response", None)
+            recovered = None
+            if callable(response_hook):
+                recovered = response_hook(
+                    PaymentResponseContext(
+                        payment_payload=payload,
+                        requirements=payload.accepted,
+                        settle_response=settle_response,
+                        payment_required=corrective,
+                    )
+                )
+                if hasattr(recovered, "__await__"):
+                    recovered = await recovered
+
+            # Run after payment hooks
+            after_context = AfterPaymentContext(
+                tool_name=name,
+                payment_payload=payload,
+                result=result,
+                settle_response=settle_response,
+            )
+            for hook in self._after_payment_hooks:
+                result_or_coro = hook(after_context)
+                if hasattr(result_or_coro, "__await__"):
+                    await result_or_coro
+
+            if (
+                attempt == 0
+                and corrective is not None
+                and getattr(recovered, "recovered", False) is True
+            ):
+                original = payment_required or PaymentRequired(
+                    x402_version=payload.x402_version,
+                    accepts=[payload.accepted],
+                    resource=payload.resource,
+                    extensions=payload.extensions,
+                )
+                payload = self._payment_client.create_payment_payload(original)
+                if hasattr(payload, "__await__"):
+                    payload = await payload
+                continue
+
+            break
 
         return MCPToolCallResult(
             content=result.content,

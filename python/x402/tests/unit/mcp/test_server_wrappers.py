@@ -531,3 +531,62 @@ async def test_payment_wrapper_facilitator_verify_error_uses_invalid_reason() ->
 
     assert result.isError is True
     assert result.structuredContent["error"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_type", [_MismatchSyncServer, _MismatchAsyncServer])
+async def test_fastmcp_corrective_response_enriches_a_request_local_copy(server_type):
+    server = server_type()
+    requirements = _cash_requirements()
+    payload = PaymentPayload(x402_version=2, accepted=requirements, payload={"signature": "payer"})
+    wrapped = create_fastmcp_payment_wrapper(server, accepts=[requirements])(lambda: "ok")
+    context = MockFastMCPContext({MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)})
+    first = await wrapped(ctx=context)
+    assert first.isError
+    assert first.structuredContent["accepts"][0]["extra"]["channelState"] == {
+        "chargedCumulativeAmount": "2000"
+    }
+    assert requirements.extra == {}
+    assert (await wrapped(ctx=context)).isError is False
+    assert server.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fastmcp_failed_settlement_preserves_pending_receipt():
+    server = _MismatchAsyncServer()
+    server._abort_once = False
+    server.settle_payment.return_value = SettleResponse(
+        success=False,
+        transaction="submitted-tx",
+        network="x402:cash",
+        error_reason="transaction_pending",
+        extra={"channelId": "channel"},
+    )
+    requirements = _cash_requirements()
+    payload = PaymentPayload(x402_version=2, accepted=requirements, payload={"signature": "payer"})
+    wrapped = create_fastmcp_payment_wrapper(server, accepts=[requirements])(lambda: "ok")
+    result = await wrapped(
+        ctx=MockFastMCPContext({MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)})
+    )
+    assert result.isError
+    assert result.meta[
+        MCP_PAYMENT_RESPONSE_META_KEY
+    ] == server.settle_payment.return_value.model_dump(
+        by_alias=True,
+        exclude_none=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fastmcp_does_not_cancel_uncertain_settlement_exception():
+    server = _MismatchAsyncServer()
+    server._abort_once = False
+    server.settle_payment.side_effect = TimeoutError("submission outcome unknown")
+    requirements = _cash_requirements()
+    payload = PaymentPayload(x402_version=2, accepted=requirements, payload={"signature": "payer"})
+    wrapped = create_fastmcp_payment_wrapper(server, accepts=[requirements])(lambda: "ok")
+    result = await wrapped(
+        ctx=MockFastMCPContext({MCP_PAYMENT_META_KEY: payload.model_dump(by_alias=True)})
+    )
+    assert result.isError
+    server.create_payment_cancellation_dispatcher.assert_not_called()

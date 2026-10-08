@@ -320,3 +320,106 @@ def test_sync_client_paid_timeout_clamps_huge_accept() -> None:
 
     _, paid_call = mock_mcp.call_tool.call_args_list
     assert paid_call.kwargs["read_timeout_seconds"] == timedelta(seconds=600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["session", "async", "sync"])
+@pytest.mark.parametrize("settled", [False, True])
+async def test_paid_response_dispatches_core_hooks(client_kind, settled):
+    """Both successful and pending/failed settlements reach scheme state hooks."""
+    result_type = _SessionResult if client_kind == "session" else _McpResult
+    receipt = {"success": settled, "network": "eip155:84532", "transaction": "pending-tx"}
+    if not settled:
+        receipt["errorReason"] = "transaction_pending"
+    results = [
+        result_type(is_error=True, text=_payment_required_text()),
+        result_type(is_error=not settled, text="response", meta={"x402/payment-response": receipt}),
+    ]
+    mock_type = Mock if client_kind == "sync" else AsyncMock
+    transport = SimpleNamespace(call_tool=mock_type(side_effect=results))
+    payment = SimpleNamespace(
+        create_payment_payload=mock_type(return_value=_payload()),
+        handle_payment_response=mock_type(return_value=None),
+    )
+    wrapper = {"session": x402MCPSession, "async": x402MCPClient, "sync": x402MCPClientSync}[
+        client_kind
+    ]
+    result = wrapper(transport, payment).call_tool("paid_tool", {})
+    if client_kind != "sync":
+        result = await result
+    assert result.payment_response.success is settled
+    context = payment.handle_payment_response.call_args.args[0]
+    assert context.payment_payload is payment.create_payment_payload.return_value
+    assert context.requirements == context.payment_payload.accepted
+    assert context.settle_response.transaction == "pending-tx"
+    assert context.settle_response.success is settled
+    assert payment.handle_payment_response.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["session", "async", "sync"])
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_corrective_recovery_requires_hook_and_retries_once(client_kind, recovered):
+    from x402.schemas.hooks import RecoveredResponseResult
+
+    result_type = _SessionResult if client_kind == "session" else _McpResult
+    mock_type = Mock if client_kind == "sync" else AsyncMock
+    transport = SimpleNamespace(
+        call_tool=mock_type(
+            side_effect=[
+                result_type(is_error=True, text=_payment_required_text()) for _ in range(3)
+            ]
+        )
+    )
+    first = _payload()
+    second = first.model_copy(update={"payload": {"signature": "fresh"}})
+    payment = SimpleNamespace(
+        create_payment_payload=mock_type(side_effect=[first, second]),
+        handle_payment_response=mock_type(
+            return_value=RecoveredResponseResult() if recovered else None
+        ),
+    )
+    wrapper = {"session": x402MCPSession, "async": x402MCPClient, "sync": x402MCPClientSync}[
+        client_kind
+    ]
+    result = wrapper(transport, payment).call_tool("paid_tool", {})
+    if client_kind != "sync":
+        result = await result
+    attempts = 2 if recovered else 1
+    assert result.is_error
+    assert transport.call_tool.call_count == attempts + 1
+    assert payment.create_payment_payload.call_count == attempts
+    assert payment.handle_payment_response.call_count == attempts
+    assert payment.handle_payment_response.call_args.args[0].payment_required is not None
+    if recovered:
+        assert payment.handle_payment_response.call_args.args[0].payment_payload is second
+        original, retry = [call.args[0] for call in payment.create_payment_payload.call_args_list]
+        assert retry.accepts == original.accepts
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_reuses_original_server_extensions():
+    import json
+
+    from x402.schemas.hooks import RecoveredResponseResult
+
+    advertised = json.loads(_payment_required_text())
+    advertised["extensions"] = {"server": {"nonce": "original"}}
+    payload = _payload().model_copy(update={"extensions": {"server": {"nonce": "client-enriched"}}})
+    transport = SimpleNamespace(
+        call_tool=AsyncMock(
+            side_effect=[
+                _McpResult(is_error=True, text=json.dumps(advertised)),
+                _McpResult(is_error=True, text=_payment_required_text()),
+                _McpResult(is_error=False, text="ok"),
+            ]
+        )
+    )
+    payment = SimpleNamespace(
+        create_payment_payload=AsyncMock(return_value=payload),
+        handle_payment_response=AsyncMock(return_value=RecoveredResponseResult()),
+    )
+    assert not (await x402MCPClient(transport, payment).call_tool("paid_tool", {})).is_error
+    original, retry = [call.args[0] for call in payment.create_payment_payload.call_args_list]
+    assert retry is original
+    assert retry.extensions == advertised["extensions"]

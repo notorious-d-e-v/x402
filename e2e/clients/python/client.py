@@ -4,21 +4,30 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
+from catalog_network import network_caip2_pattern, resolve_network_caip2
 from eth_account import Account
 
 from x402 import x402Client, x402ClientSync
 from x402.mechanisms.evm import EthAccountSignerWithRPC
-from x402.mechanisms.evm.exact import register_exact_evm_client
-from x402.mechanisms.evm.upto import UptoEvmClientScheme
 from x402.mechanisms.evm.batch_settlement.client import (
     BatchSettlementEvmScheme as BatchSettlementClientScheme,
+)
+from x402.mechanisms.evm.batch_settlement.client import (
     BatchSettlementEvmSchemeOptions,
     InMemoryClientChannelStorage,
 )
+from x402.mechanisms.evm.exact import register_exact_evm_client
+from x402.mechanisms.evm.upto import UptoEvmClientScheme
 from x402.mechanisms.svm import KeypairSigner
+from x402.mechanisms.svm.batch_settlement import (
+    BatchServerSignedChannelsPolicy,
+    BatchSvmClientConfig,
+    BatchSvmClientScheme,
+)
 from x402.mechanisms.svm.exact import register_exact_svm_client
 from x402.mechanisms.tvm import (
     TVM_MAINNET,
@@ -29,7 +38,15 @@ from x402.mechanisms.tvm import (
 )
 from x402.mechanisms.tvm.exact import ExactTvmClientScheme
 
-from catalog_network import network_caip2_pattern, resolve_network_caip2
+BatchSettlementScheme = BatchSettlementClientScheme | BatchSvmClientScheme
+
+
+def svm_channel_salt(channel_salt: str) -> str:
+    """Fold the harness's 32-byte hex salt to the same u64 used by TypeScript."""
+    value = int(channel_salt, 16 if channel_salt.lower().startswith("0x") else 10)
+    if value < 0:
+        raise ValueError("BATCH_SETTLEMENT_CHANNEL must be unsigned")
+    return str(value % (1 << 64))
 
 
 @dataclass
@@ -37,8 +54,8 @@ class ClientContext:
     base_url: str
     endpoint_path: str
     client: x402Client | x402ClientSync
-    batch_scheme: Optional[BatchSettlementClientScheme]
-    batch_settlement_phase: Optional[str]
+    batch_scheme: BatchSettlementScheme | None
+    batch_settlement_phase: str | None
 
 
 def create_e2e_client(*, sync: bool = False) -> ClientContext:
@@ -61,9 +78,11 @@ def create_e2e_client(*, sync: bool = False) -> ClientContext:
     tvm_network = resolve_network_caip2("tvm")
     base_url = os.getenv("RESOURCE_SERVER_URL")
     endpoint_path = os.getenv("ENDPOINT_PATH")
-    channel_salt = os.getenv("EVM_BATCH_SETTLEMENT_CHANNEL")
+    channel_salt = os.getenv("BATCH_SETTLEMENT_CHANNEL", os.getenv("EVM_BATCH_SETTLEMENT_CHANNEL"))
     voucher_signer_key = os.getenv("CLIENT_EVM_BATCH_SETTLEMENT_VOUCHER_SIGNER_PRIVATE_KEY")
-    batch_settlement_phase = os.getenv("EVM_BATCH_SETTLEMENT_PHASE")
+    batch_settlement_phase = os.getenv(
+        "BATCH_SETTLEMENT_PHASE", os.getenv("EVM_BATCH_SETTLEMENT_PHASE")
+    )
 
     if not base_url or not endpoint_path:
         print(json.dumps({"success": False, "error": "Missing required environment variables"}))
@@ -81,7 +100,10 @@ def create_e2e_client(*, sync: bool = False) -> ClientContext:
         raise SystemExit(1)
 
     client: x402Client | x402ClientSync = x402ClientSync() if sync else x402Client()
-    batch_scheme: Optional[BatchSettlementClientScheme] = None
+    batch_scheme: BatchSettlementScheme | None = None
+    # Both wallets may be configured; the route determines the lifecycle/refund family.
+    # MCP uses underscore-separated catalog tool names instead of HTTP paths.
+    batch_family = "svm" if "svm" in endpoint_path.replace("/", "_").split("_") else "evm"
 
     if evm_private_key:
         evm_pattern = network_caip2_pattern("evm")
@@ -94,7 +116,7 @@ def create_e2e_client(*, sync: bool = False) -> ClientContext:
         if voucher_signer_key:
             voucher_account = Account.from_key(voucher_signer_key)
             voucher_signer = EthAccountSignerWithRPC(voucher_account, rpc_url=evm_rpc_url)
-        batch_scheme = BatchSettlementClientScheme(
+        evm_batch_scheme = BatchSettlementClientScheme(
             evm_signer,
             BatchSettlementEvmSchemeOptions(
                 storage=InMemoryClientChannelStorage(),
@@ -102,13 +124,40 @@ def create_e2e_client(*, sync: bool = False) -> ClientContext:
                 voucher_signer=voucher_signer,
             ),
         )
-        client.register(evm_pattern, batch_scheme)
+        client.register(evm_pattern, evm_batch_scheme)
+        if batch_family == "evm":
+            batch_scheme = evm_batch_scheme
 
     if svm_private_key:
         svm_signer = KeypairSigner.from_base58(svm_private_key)
-        register_exact_svm_client(
-            client, svm_signer, networks=network_caip2_pattern("svm"), rpc_url=svm_rpc_url
+        svm_pattern = network_caip2_pattern("svm")
+        register_exact_svm_client(client, svm_signer, networks=svm_pattern, rpc_url=svm_rpc_url)
+        operators = [
+            value.strip()
+            for value in os.getenv("CLIENT_SVM_SERVER_SIGNED_OPERATORS", "").split(",")
+            if value.strip()
+        ]
+        max_deposit = os.getenv("CLIENT_SVM_SERVER_SIGNED_MAX_DEPOSIT", "").strip()
+        svm_batch_scheme = BatchSvmClientScheme(
+            svm_signer,
+            BatchSvmClientConfig(
+                rpc_url=svm_rpc_url,
+                salt=svm_channel_salt(channel_salt) if channel_salt else 0,
+                # Recovery runs in a fresh process and must discover the initial channel.
+                discover_channels=True,
+                server_signed_channels_policy=(
+                    BatchServerSignedChannelsPolicy(
+                        allowed_operators=operators, max_deposit=max_deposit or "$1"
+                    )
+                    if operators
+                    else None
+                ),
+            ),
         )
+        client.register(svm_pattern, svm_batch_scheme)
+        if batch_family == "svm":
+            batch_scheme = svm_batch_scheme
+            client.register_policy(svm_batch_scheme.payment_policy)
 
     if tvm_private_key:
         if tvm_network not in {TVM_TESTNET, TVM_MAINNET}:
@@ -168,7 +217,8 @@ def run_client_scenario_sync(
 
     if ctx.batch_scheme is None:
         raise RuntimeError(
-            "batch-settlement scheme not registered (CLIENT_EVM_PRIVATE_KEY required)"
+            "batch-settlement scheme not registered for this endpoint "
+            "(CLIENT_EVM_PRIVATE_KEY or CLIENT_SVM_PRIVATE_KEY required)"
         )
     if refund is None:
         raise RuntimeError("refund callback required for batch-settlement phases")
@@ -225,7 +275,7 @@ def run_client_scenario_sync(
             )
         )
 
-    raise RuntimeError(f"Unknown EVM_BATCH_SETTLEMENT_PHASE: {ctx.batch_settlement_phase}")
+    raise RuntimeError(f"Unknown BATCH_SETTLEMENT_PHASE: {ctx.batch_settlement_phase}")
 
 
 async def run_client_scenario(
@@ -239,7 +289,8 @@ async def run_client_scenario(
 
     if ctx.batch_scheme is None:
         raise RuntimeError(
-            "batch-settlement scheme not registered (CLIENT_EVM_PRIVATE_KEY required)"
+            "batch-settlement scheme not registered for this endpoint "
+            "(CLIENT_EVM_PRIVATE_KEY or CLIENT_SVM_PRIVATE_KEY required)"
         )
     if refund is None:
         raise RuntimeError("refund callback required for batch-settlement phases")
@@ -296,4 +347,4 @@ async def run_client_scenario(
             )
         )
 
-    raise RuntimeError(f"Unknown EVM_BATCH_SETTLEMENT_PHASE: {ctx.batch_settlement_phase}")
+    raise RuntimeError(f"Unknown BATCH_SETTLEMENT_PHASE: {ctx.batch_settlement_phase}")

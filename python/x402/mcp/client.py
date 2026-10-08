@@ -29,6 +29,7 @@ from datetime import timedelta
 from typing import Any
 
 from ..client import x402Client, x402ClientSync
+from ..schemas.hooks import PaymentResponseContext
 from ..schemas.responses import SettleResponse
 from .constants import MCP_PAYMENT_META_KEY, MCP_PAYMENT_RESPONSE_META_KEY
 from .utils import (
@@ -140,29 +141,44 @@ class x402MCPSession:
         if not self._auto_payment:
             return self._build_result(result, payment_made=False)
 
-        # Create payment payload using the x402 client
-        payment_payload = await self._x402_client.create_payment_payload(payment_required)
+        for attempt in range(2):
+            payment_payload = await self._x402_client.create_payment_payload(payment_required)
+            accepted = payment_payload.accepted
+            paid_timeout = paid_read_timeout_seconds(
+                read_timeout_seconds,
+                accepted.max_timeout_seconds if accepted is not None else None,
+                self._max_request_timeout_seconds,
+            )
+            result = await self._session.call_tool(
+                name=name,
+                arguments=arguments or {},
+                meta={MCP_PAYMENT_META_KEY: payment_payload.model_dump(by_alias=True)},
+                read_timeout_seconds=paid_timeout,
+            )
+            response = self._build_result(result, payment_made=True)
+            corrective = self._extract_payment_required(result) if result.isError else None
+            hook = getattr(self._x402_client, "handle_payment_response", None)
+            recovered = None
+            if callable(hook):
+                recovered = await hook(
+                    PaymentResponseContext(
+                        payment_payload=payment_payload,
+                        requirements=accepted,
+                        settle_response=response.payment_response
+                        if isinstance(response.payment_response, SettleResponse)
+                        else None,
+                        payment_required=corrective,
+                    )
+                )
+            if (
+                attempt == 0
+                and corrective is not None
+                and getattr(recovered, "recovered", False) is True
+            ):
+                continue
+            break
 
-        # Serialize for transmission
-        payload_dict = payment_payload.model_dump(by_alias=True)
-
-        accepted = payment_payload.accepted
-        max_timeout_seconds = accepted.max_timeout_seconds if accepted is not None else None
-        paid_timeout = paid_read_timeout_seconds(
-            read_timeout_seconds,
-            max_timeout_seconds,
-            self._max_request_timeout_seconds,
-        )
-
-        # Retry with payment in _meta
-        result = await self._session.call_tool(
-            name=name,
-            arguments=arguments or {},
-            meta={MCP_PAYMENT_META_KEY: payload_dict},
-            read_timeout_seconds=paid_timeout,
-        )
-
-        return self._build_result(result, payment_made=True)
+        return response
 
     def _build_result(self, result: Any, payment_made: bool) -> MCPToolCallResult:
         """Convert MCP result to MCPToolCallResult."""
@@ -297,25 +313,49 @@ class x402MCPClientSync:
             if not approved:
                 return self._build_result(mcp_result, payment_made=False)
 
-        payment_payload = self._payment_client.create_payment_payload(payment_required)
-        payload_dict = payment_payload.model_dump(by_alias=True)
+        for attempt in range(2):
+            payment_payload = self._payment_client.create_payment_payload(payment_required)
+            accepted = payment_payload.accepted
+            paid_timeout = paid_read_timeout_seconds(
+                kwargs.get("read_timeout_seconds"),
+                accepted.max_timeout_seconds if accepted is not None else None,
+                self._max_request_timeout_seconds,
+            )
+            params_with_meta = {
+                "name": name,
+                "arguments": args,
+                "_meta": {MCP_PAYMENT_META_KEY: payment_payload.model_dump(by_alias=True)},
+            }
+            result = self._mcp_client.call_tool(
+                params_with_meta, **{**kwargs, "read_timeout_seconds": paid_timeout}
+            )
+            mcp_result = convert_mcp_result(result)
+            response = self._build_result(mcp_result, payment_made=True)
+            corrective = (
+                extract_payment_required_from_result(mcp_result) if mcp_result.is_error else None
+            )
+            hook = getattr(self._payment_client, "handle_payment_response", None)
+            recovered = (
+                hook(
+                    PaymentResponseContext(
+                        payment_payload=payment_payload,
+                        requirements=accepted,
+                        settle_response=response.payment_response,
+                        payment_required=corrective,
+                    )
+                )
+                if callable(hook)
+                else None
+            )
+            if (
+                attempt == 0
+                and corrective is not None
+                and getattr(recovered, "recovered", False) is True
+            ):
+                continue
+            break
 
-        params_with_meta = {
-            "name": name,
-            "arguments": args,
-            "_meta": {MCP_PAYMENT_META_KEY: payload_dict},
-        }
-        accepted = payment_payload.accepted
-        max_timeout_seconds = accepted.max_timeout_seconds if accepted is not None else None
-        paid_timeout = paid_read_timeout_seconds(
-            kwargs.get("read_timeout_seconds"),
-            max_timeout_seconds,
-            self._max_request_timeout_seconds,
-        )
-        paid_kwargs = {**kwargs, "read_timeout_seconds": paid_timeout}
-        result = self._mcp_client.call_tool(params_with_meta, **paid_kwargs)
-        mcp_result = convert_mcp_result(result)
-        return self._build_result(mcp_result, payment_made=True)
+        return response
 
     def _build_result(self, mcp_result: Any, payment_made: bool) -> MCPToolCallResult:
         """Build MCPToolCallResult from MCPToolResult."""
