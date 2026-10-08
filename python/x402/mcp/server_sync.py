@@ -11,6 +11,7 @@ from ..payment_flow import (
     resolve_failure_path_settlement,
     resolve_payment_flow_phases,
 )
+from ..schemas.errors import PaymentAbortedError
 from ..schemas.hooks import CompletedSettlement, SkipHandlerDirective, VerifiedPaymentCancelOptions
 from ..schemas.responses import SettleResponse
 from ..server import x402ResourceServerSync
@@ -24,6 +25,7 @@ from .types import (
     SyncPaymentWrapperConfig,
 )
 from .utils import (
+    attach_failure_path_receipt,
     build_tool_resource_info,
     extract_payment_from_meta,
     metered_payment_requirements,
@@ -257,7 +259,18 @@ def _process_paid_tool_call_sync(
                 result=before_settle,
                 requirements=payment_requirements,
             )
-        except Exception:
+        except Exception as error:
+            if isinstance(error, PaymentAbortedError):
+                canceled = _cancel_aborted_settlement_sync(
+                    resource_server,
+                    payment_payload,
+                    payment_requirements,
+                    ext_map,
+                    transport_context,
+                    error,
+                )
+                if canceled is not None:
+                    return canceled
             return _create_settlement_failed_result_sync(
                 resource_server, tool_name, config, "Settlement failed"
             )
@@ -275,9 +288,52 @@ def _process_paid_tool_call_sync(
             payment_payload, payment_requirements, ext_map, transport_context
         )
 
+    def cancel_before_execution(error: Exception | None = None) -> SettleResponse | None:
+        cancel_settlement = None
+        options = VerifiedPaymentCancelOptions(reason="after_verify_aborted", error=error)
+        try:
+            if dispatcher is not None:
+                cancel = getattr(dispatcher, "cancel_sync", None) or getattr(
+                    dispatcher, "cancel", None
+                )
+                if callable(cancel):
+                    cancel_settlement = cancel(options)
+        except Exception:
+            if before_handler_settlement is None:
+                raise
+            # A failed cancellation does not undo the completed upfront transfer.
+        return resolve_failure_path_settlement(
+            cancel_settlement, before_handler_settlement, payment_payload
+        )
+
+    settlement_requirements = payment_requirements.model_copy(deep=True)
     if config.hooks and config.hooks.on_before_execution:
-        proceed = config.hooks.on_before_execution(hook_context)
+        try:
+            proceed = config.hooks.on_before_execution(hook_context)
+            if proceed:
+                settlement_requirements = metered_payment_requirements(
+                    payment_requirements, hook_context.payment_requirements.amount
+                )
+        except Exception as error:
+            receipt = cancel_before_execution(error)
+            if receipt is None:
+                raise
+            return attach_failure_path_receipt(
+                MCPToolResult(
+                    content=[{"type": "text", "text": "Execution hook failed"}], is_error=True
+                ),
+                receipt,
+            )
         if not proceed:
+            receipt = cancel_before_execution()
+            if receipt is not None:
+                return attach_failure_path_receipt(
+                    MCPToolResult(
+                        content=[{"type": "text", "text": "Execution blocked by hook"}],
+                        is_error=True,
+                    ),
+                    receipt,
+                )
             return _create_payment_required_result_sync(
                 resource_server,
                 tool_name,
@@ -287,29 +343,35 @@ def _process_paid_tool_call_sync(
 
     try:
         handler_result = handler(args, tool_context)
+        result = _normalize_tool_result_sync(handler_result)
     except Exception as error:
         mark_handler_threw()
         cancel_settlement = None
-        if dispatcher is not None:
-            cancel = getattr(dispatcher, "cancel_sync", None) or getattr(dispatcher, "cancel", None)
-            if callable(cancel):
-                cancel_settlement = cancel(
-                    VerifiedPaymentCancelOptions(reason="handler_threw", error=error)
+        try:
+            if dispatcher is not None:
+                cancel = getattr(dispatcher, "cancel_sync", None) or getattr(
+                    dispatcher, "cancel", None
                 )
+                if callable(cancel):
+                    cancel_settlement = cancel(
+                        VerifiedPaymentCancelOptions(reason="handler_threw", error=error)
+                    )
+        except Exception:
+            cancel_settlement = None
+            if before_handler_settlement is None:
+                raise
         failure_receipt = resolve_failure_path_settlement(
             cancel_settlement, before_handler_settlement, payment_payload
         )
         if failure_receipt is None:
             raise
-        return MCPToolResult(
-            content=[{"type": "text", "text": "Internal Server Error"}],
-            is_error=True,
-            meta={MCP_PAYMENT_RESPONSE_META_KEY: _settle_meta_sync(failure_receipt)},
+        return attach_failure_path_receipt(
+            MCPToolResult(
+                content=[{"type": "text", "text": "Internal Server Error"}], is_error=True
+            ),
+            failure_receipt,
         )
 
-    result = _normalize_tool_result_sync(handler_result)
-
-    settlement_requirements = payment_requirements.model_copy(deep=True)
     after_exec_context = AfterExecutionContext(
         tool_name=tool_name,
         arguments=args,
@@ -317,15 +379,15 @@ def _process_paid_tool_call_sync(
         payment_payload=payment_payload,
         result=result,
     )
-    metering_failed = False
+    metering_error = None
     try:
         if config.hooks and config.hooks.on_after_execution:
             config.hooks.on_after_execution(after_exec_context)
         settlement_requirements = metered_payment_requirements(
             payment_requirements, settlement_requirements.amount
         )
-    except Exception:
-        metering_failed = True
+    except Exception as error:
+        metering_error = error
         # Metering is part of choosing what to charge, not an observer.
         # Reuse cancellation below; never fall back to the signed ceiling.
         result = MCPToolResult(
@@ -343,12 +405,17 @@ def _process_paid_tool_call_sync(
                 )
                 if callable(cancel):
                     cancel_settlement = cancel(
-                        VerifiedPaymentCancelOptions(reason="handler_failed")
+                        VerifiedPaymentCancelOptions(
+                            reason="after_verify_aborted"
+                            if metering_error is not None
+                            else "handler_failed",
+                            error=metering_error,
+                        )
                     )
                     cancellation_completed = True
         except Exception:
             cancel_settlement = None
-            if not metering_failed or before_handler_settlement is None:
+            if before_handler_settlement is None:
                 raise
             # Upfront payment is still a known fact even if cancellation failed.
             # Surface its original receipt without claiming a completed refund.
@@ -357,15 +424,12 @@ def _process_paid_tool_call_sync(
             cancel_settlement, before_handler_settlement, payment_payload
         )
         if failure_receipt is None:
-            if metering_failed and cancellation_completed:
+            if metering_error is not None and cancellation_completed:
                 return _create_settlement_failed_result_sync(
                     resource_server, tool_name, config, "Payment metering failed"
                 )
             return result
-        if result.meta is None:
-            result.meta = {}
-        result.meta[MCP_PAYMENT_RESPONSE_META_KEY] = _settle_meta_sync(failure_receipt)
-        return result
+        return attach_failure_path_receipt(result, failure_receipt)
 
     payment_requirements = settlement_requirements
     return _settle_payment_result_sync(
@@ -379,6 +443,52 @@ def _process_paid_tool_call_sync(
         transport_context,
         result,
         before_handler_settlement,
+    )
+
+
+def _cancel_aborted_settlement_sync(
+    resource_server: x402ResourceServerSync,
+    payment_payload: Any,
+    payment_requirements: Any,
+    ext_map: dict[str, Any],
+    transport_context: Any,
+    error: Exception,
+    before_handler_settlement: CompletedSettlement | None = None,
+) -> MCPToolResult | None:
+    """Release an explicit pre-submission abort, retaining any known deposit."""
+    cancel_settlement = None
+    try:
+        try:
+            dispatcher = resource_server.create_payment_cancellation_dispatcher(
+                payment_payload,
+                payment_requirements,
+                ext_map,
+                transport_context,
+                ["before-handler"] if before_handler_settlement is not None else [],
+            )
+        except TypeError:
+            dispatcher = resource_server.create_payment_cancellation_dispatcher(
+                payment_payload,
+                payment_requirements,
+                ext_map,
+                transport_context,
+            )
+        if dispatcher is not None:
+            cancel = getattr(dispatcher, "cancel_sync", None) or getattr(dispatcher, "cancel", None)
+            if callable(cancel):
+                cancel_settlement = cancel(
+                    VerifiedPaymentCancelOptions(reason="after_verify_aborted", error=error)
+                )
+    except Exception:
+        if before_handler_settlement is None:
+            raise
+    receipt = resolve_failure_path_settlement(
+        cancel_settlement, before_handler_settlement, payment_payload
+    )
+    if receipt is None:
+        return None
+    return attach_failure_path_receipt(
+        MCPToolResult(content=[{"type": "text", "text": str(error)}], is_error=True), receipt
     )
 
 
@@ -443,6 +553,18 @@ def _settle_payment_result_sync(
         except TypeError:
             settle_result = resource_server.settle_payment(payment_payload, payment_requirements)
     except Exception as e:
+        if isinstance(e, PaymentAbortedError):
+            canceled = _cancel_aborted_settlement_sync(
+                resource_server,
+                payment_payload,
+                payment_requirements,
+                ext_map,
+                transport_context,
+                e,
+                before_handler_settlement,
+            )
+            if canceled is not None:
+                return canceled
         return _create_settlement_failed_result_sync(resource_server, tool_name, config, str(e))
 
     if not settle_result.success:

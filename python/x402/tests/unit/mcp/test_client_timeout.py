@@ -348,7 +348,7 @@ async def test_paid_response_dispatches_core_hooks(client_kind, settled):
     if client_kind != "sync":
         result = await result
     assert (result.payment_response is not None) is settled
-    assert result.payment_made is settled
+    assert result.payment_made is True
     context = payment.handle_payment_response.call_args.args[0]
     assert context.payment_payload is payment.create_payment_payload.return_value
     assert context.requirements == context.payment_payload.accepted
@@ -468,7 +468,7 @@ async def test_failed_receipt_in_error_body_reaches_hooks_not_success_field(
         result = await result
     assert result.is_error
     assert result.payment_response is None
-    assert result.payment_made is False
+    assert result.payment_made is True
     assert result.raw_result is not None
     received = payment.handle_payment_response.call_args.args[0].settle_response
     assert received.model_dump(by_alias=True, exclude_none=True) == receipt
@@ -523,6 +523,7 @@ def test_sync_corrective_retry_rechecks_approval():
         "tool", {}
     )
     assert result.is_error
+    assert result.payment_made is True
     assert approval.call_count == 2
     payment.create_payment_payload.assert_called_once()
     assert transport.call_tool.call_count == 2
@@ -565,6 +566,7 @@ async def test_response_validation_error_preserves_paid_output_without_retry(cli
             await outcome
     assert error.value.__cause__ is cause
     result = error.value.result
+    assert result.payment_made is True
     assert result.is_error
     assert result.payment_response is None
     text = result.content[0].text if client_kind == "session" else result.content[0]["text"]
@@ -594,3 +596,158 @@ def test_failed_receipt_parser_searches_past_unrelated_structured_and_text_conte
         ],
     )
     assert extract_payment_response_from_result(result).transaction == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled", [False, True])
+async def test_after_payment_observers_receive_only_validated_success_receipts(settled):
+    receipt = {"success": settled, "network": "eip155:84532", "transaction": "submitted"}
+    transport = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=_McpResult(
+                is_error=not settled, text="paid output", meta={"x402/payment-response": receipt}
+            )
+        )
+    )
+    processed = []
+
+    async def reconcile(context):
+        processed.append(context.settle_response)
+
+    payment = SimpleNamespace(handle_payment_response=reconcile)
+    client = x402MCPClient(transport, payment)
+    observed = []
+
+    def observe(context):
+        assert len(processed) == 1
+        assert processed[0].success is settled
+        observed.append(context)
+
+    client.on_after_payment(observe)
+    result = await client.call_tool_with_payment("paid_tool", {}, _payload())
+    assert result.payment_made is True
+    assert observed[0].settle_response is result.payment_response
+    assert (observed[0].settle_response is not None) is settled
+    assert observed[0].result.content[0]["text"] == "paid output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_observer", [False, True])
+async def test_after_payment_observer_keeps_exception_type_and_paid_result(async_observer):
+    receipt = {"success": True, "network": "eip155:84532", "transaction": "paid"}
+    transport = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=_McpResult(
+                is_error=False, text="paid output", meta={"x402/payment-response": receipt}
+            )
+        )
+    )
+    payment = SimpleNamespace(handle_payment_response=AsyncMock(return_value=None))
+    client = x402MCPClient(transport, payment)
+    cause = KeyError("application observer")
+    observer = (AsyncMock if async_observer else Mock)(side_effect=cause)
+    later_observer = AsyncMock()
+    client.on_after_payment(observer).on_after_payment(later_observer)
+    with pytest.raises(KeyError) as error:
+        await client.call_tool_with_payment("paid_tool", {}, _payload())
+    assert error.value is cause
+    assert error.value.mcp_result.content[0]["text"] == "paid output"
+    assert error.value.mcp_result.payment_made is True
+    assert error.value.mcp_result.payment_response.transaction == "paid"
+    later_observer.assert_awaited_once()
+    transport.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["session", "async", "sync"])
+async def test_corrective_recovery_never_signs_changed_commercial_terms(client_kind):
+    import json
+
+    from x402.schemas.hooks import RecoveredResponseResult
+
+    original = json.loads(_payment_required_text())
+    original["extensions"] = {"service": {"nonce": "approved"}}
+    malicious = json.loads(_payment_required_text())
+    malicious["accepts"][0].update(
+        amount="1000000",
+        payTo="attacker",
+        asset="OTHER",
+        network="eip155:1",
+        scheme="other",
+        maxTimeoutSeconds=9999,
+        extra={"channelState": {"chargedCumulativeAmount": "2000"}},
+    )
+    malicious["extensions"] = {"service": {"nonce": "changed"}}
+    result_type = _SessionResult if client_kind == "session" else _McpResult
+    mock_type = Mock if client_kind == "sync" else AsyncMock
+    transport = SimpleNamespace(
+        call_tool=mock_type(
+            side_effect=[
+                result_type(is_error=True, text=json.dumps(original)),
+                result_type(is_error=True, text=json.dumps(malicious)),
+                result_type(is_error=False, text="paid output"),
+            ]
+        )
+    )
+    payment = SimpleNamespace(
+        create_payment_payload=mock_type(return_value=_payload()),
+        handle_payment_response=mock_type(return_value=RecoveredResponseResult()),
+    )
+    wrapper = {"session": x402MCPSession, "async": x402MCPClient, "sync": x402MCPClientSync}[
+        client_kind
+    ]
+    approval = mock_type(return_value=True)
+    options = {} if client_kind == "session" else {"on_payment_requested": approval}
+    result = wrapper(transport, payment, **options).call_tool("paid_tool", {})
+    if client_kind != "sync":
+        result = await result
+    assert not result.is_error
+    signed = [call.args[0] for call in payment.create_payment_payload.call_args_list]
+    assert len(signed) == 2
+    assert signed[0].model_dump() == signed[1].model_dump()
+    assert signed[1].accepts[0].pay_to == "0xrecipient"
+    assert signed[1].extensions == original["extensions"]
+    reconciled = payment.handle_payment_response.call_args_list[0].args[0]
+    assert reconciled.payment_required.accepts[0].pay_to == "attacker"
+    if client_kind != "session":
+        assert approval.call_count == 2
+        assert all(
+            call.args[0].payment_required.accepts[0].pay_to == "0xrecipient"
+            for call in approval.call_args_list
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["session", "async", "sync"])
+@pytest.mark.parametrize("scheme", ["exact", "upto"])
+async def test_corrective_response_without_core_recovery_never_resubmits(client_kind, scheme):
+    import json
+
+    from x402 import x402Client, x402ClientSync
+
+    required = json.loads(_payment_required_text())
+    required["accepts"][0]["scheme"] = scheme
+    payload = _payload()
+    payload.accepted.scheme = scheme
+    result_type = _SessionResult if client_kind == "session" else _McpResult
+    mock_type = Mock if client_kind == "sync" else AsyncMock
+    transport = SimpleNamespace(
+        call_tool=mock_type(
+            side_effect=[
+                result_type(is_error=True, text=json.dumps(required)),
+                result_type(is_error=True, text=json.dumps(required)),
+            ]
+        )
+    )
+    payment = x402ClientSync() if client_kind == "sync" else x402Client()
+    payment.create_payment_payload = mock_type(return_value=payload)
+    wrapper = {"session": x402MCPSession, "async": x402MCPClient, "sync": x402MCPClientSync}[
+        client_kind
+    ]
+    result = wrapper(transport, payment).call_tool("paid_tool", {})
+    if client_kind != "sync":
+        result = await result
+    assert result.is_error
+    assert result.payment_made is True
+    payment.create_payment_payload.assert_called_once()
+    assert transport.call_tool.call_count == 2

@@ -258,6 +258,7 @@ def create_payment_wrapper(
                 if inspect.isawaitable(result):
                     await result
 
+            settlement_requirements = payment_requirements.model_copy(deep=True)
             skip_handler = getattr(verify_result, "skip_handler", None)
             if not isinstance(skip_handler, SkipHandlerDirective):
                 skip_handler = None
@@ -269,13 +270,17 @@ def create_payment_wrapper(
                     hook_ctx = ServerHookContext(
                         tool_name=tool_name,
                         arguments=kwargs,
-                        payment_requirements=payment_requirements.model_copy(deep=True),
+                        payment_requirements=settlement_requirements,
                         payment_payload=payload,
                     )
                     try:
                         proceed = hooks.on_before_execution(hook_ctx)
                         if inspect.isawaitable(proceed):
                             proceed = await proceed
+                        if proceed:
+                            settlement_requirements = metered_payment_requirements(
+                                payment_requirements, hook_ctx.payment_requirements.amount
+                            )
                     except Exception as error:
                         await cancel_verified(
                             VerifiedPaymentCancelOptions(
@@ -346,7 +351,6 @@ def create_payment_wrapper(
 
             # Metering hooks receive a request-local copy. Only the amount is
             # applied to settlement, bounded by the verified ceiling.
-            settlement_requirements = payment_requirements.model_copy(deep=True)
             try:
                 if skip_handler is None and hooks and hooks.on_after_execution:
                     after_ctx = AfterExecutionContext(

@@ -663,6 +663,8 @@ async def test_metering_failure_cancels_without_charging_ceiling(kind):
     dispatcher = server.create_payment_cancellation_dispatcher.return_value
     cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
     cancel.assert_called_once()
+    assert cancel.call_args.args[0].reason == "after_verify_aborted"
+    assert isinstance(cancel.call_args.args[0].error, ValueError)
     assert requirements.model_dump() == before
 
 
@@ -712,7 +714,9 @@ async def test_all_wrappers_preserve_failed_receipt_only_in_error_body(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
-@pytest.mark.parametrize("amount", [True, 200, "1001", "-1", "1.0", "1e2", "١", "", " 1"])
+@pytest.mark.parametrize(
+    "amount", [True, False, -1, 200.0, 1001, "1001", "-1", "1.0", "1e2", "١", "", " 1"]
+)
 async def test_invalid_metering_amount_cancels_before_settlement(kind, amount):
     from x402.mcp.types import PaymentWrapperHooks
 
@@ -787,3 +791,258 @@ async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, o
         assert extract_payment_required_from_result(result) is None
     if outcome not in ("upfront", "upfront-unknown"):
         server.settle_payment.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("amount", [0, 200, 1000, "200"])
+async def test_before_execution_preserves_amount_and_protects_verified_terms(kind, amount):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    requirements = _cash_requirements()
+    requirements.extra = {"nested": {"immutable": True}}
+    original = requirements.model_dump()
+    observed_amounts = []
+
+    def before(context):
+        context.payment_requirements.amount = amount
+        context.payment_requirements.pay_to = "unrelated-payee"
+        context.payment_requirements.asset = "OTHER"
+        context.payment_requirements.extra["nested"]["immutable"] = False
+        return True
+
+    def after(context):
+        observed_amounts.append(context.payment_requirements.amount)
+        assert context.payment_requirements.pay_to == requirements.pay_to
+        assert context.payment_requirements.asset == original["asset"]
+        assert context.payment_requirements.extra == original["extra"]
+        context.payment_requirements.extra["nested"]["immutable"] = False
+
+    result = await _run_generic_wrapper(
+        kind,
+        server,
+        requirements,
+        lambda: "ok",
+        PaymentWrapperHooks(on_before_execution=before, on_after_execution=after),
+    )
+    assert not getattr(result, "isError", getattr(result, "is_error", False))
+    settled = server.settle_payment.call_args.args[1]
+    assert settled.model_dump() == {**original, "amount": str(amount)}
+    assert observed_amounts == [str(amount)]
+    assert requirements.model_dump() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("amount", [0, 200, 1000])
+async def test_after_execution_accepts_nonnegative_integer_amounts(kind, amount):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    requirements = _cash_requirements()
+
+    def meter(context):
+        context.payment_requirements.amount = amount
+
+    result = await _run_generic_wrapper(
+        kind, server, requirements, lambda: "ok", PaymentWrapperHooks(on_after_execution=meter)
+    )
+    assert not getattr(result, "isError", getattr(result, "is_error", False))
+    assert server.settle_payment.call_args.args[1].amount == str(amount)
+    assert requirements.amount == "1000"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("failure", ["denied", "exception", "invalid-amount"])
+async def test_before_execution_failure_cancels_without_running_handler(kind, failure):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    cause = KeyError("before execution failed")
+
+    def before(context):
+        if failure == "exception":
+            raise cause
+        if failure == "invalid-amount":
+            context.payment_requirements.amount = "1001"
+            return True
+        return False
+
+    handler = Mock(return_value="must not run")
+    try:
+        result = await _run_generic_wrapper(
+            kind,
+            server,
+            _cash_requirements(),
+            handler,
+            PaymentWrapperHooks(on_before_execution=before),
+        )
+    except (KeyError, ValueError):
+        assert kind.startswith("fast") and failure != "denied"
+    else:
+        assert getattr(result, "isError", getattr(result, "is_error", False))
+    handler.assert_not_called()
+    server.settle_payment.assert_not_called()
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
+    cancel.assert_called_once()
+    assert cancel.call_args.args[0].reason == "after_verify_aborted"
+    if failure == "exception":
+        assert cancel.call_args.args[0].error is cause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("outcome", ["aborted", "pending", "exception"])
+async def test_settlement_cancels_only_explicit_presubmission_abort(kind, outcome):
+    from x402.mcp.utils import convert_mcp_result, extract_payment_response_from_result
+    from x402.schemas import PaymentAbortedError
+
+    server = _generic_server(kind)
+    if outcome == "aborted":
+        server.settle_payment.side_effect = PaymentAbortedError("settlement disallowed")
+    elif outcome == "exception":
+        server.settle_payment.side_effect = TimeoutError("submission outcome unknown")
+    else:
+        server.settle_payment.return_value = SettleResponse(
+            success=False,
+            transaction="pending-tx",
+            network="x402:cash",
+            error_reason="settlement_pending",
+        )
+    result = convert_mcp_result(
+        await _run_generic_wrapper(kind, server, _cash_requirements(), lambda: "ok")
+    )
+    assert result.is_error
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
+    if outcome == "aborted":
+        cancel.assert_called_once()
+        assert cancel.call_args.args[0].reason == "after_verify_aborted"
+    else:
+        cancel.assert_not_called()
+    if outcome == "pending":
+        assert extract_payment_response_from_result(result) == server.settle_payment.return_value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("outcome", ["aborted", "pending", "exception"])
+async def test_before_handler_settlement_preserves_uncertain_outcomes(kind, outcome):
+    from x402.mcp.utils import convert_mcp_result, extract_payment_response_from_result
+    from x402.schemas import PaymentAbortedError
+
+    server = _generic_server(kind)
+    server.get_payment_flow.return_value = "upfront"
+    if outcome == "aborted":
+        server.settle_payment.side_effect = PaymentAbortedError("deposit disallowed")
+    elif outcome == "exception":
+        server.settle_payment.side_effect = TimeoutError("deposit outcome unknown")
+    else:
+        server.settle_payment.return_value = SettleResponse(
+            success=False,
+            transaction="pending-deposit",
+            network="x402:cash",
+            error_reason="settlement_pending",
+        )
+    handler = Mock(return_value="must not run")
+    result = convert_mcp_result(
+        await _run_generic_wrapper(kind, server, _cash_requirements(), handler)
+    )
+    assert result.is_error
+    handler.assert_not_called()
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind == "async" else dispatcher.cancel_sync
+    if outcome == "aborted":
+        cancel.assert_called_once()
+        assert cancel.call_args.args[0].reason == "after_verify_aborted"
+    else:
+        cancel.assert_not_called()
+    if outcome == "pending":
+        assert extract_payment_response_from_result(result) == server.settle_payment.return_value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "before-denied",
+        "before-exception",
+        "meter",
+        "settle-abort",
+        "handler-threw",
+        "handler-failed",
+    ],
+)
+@pytest.mark.parametrize("cancellation", ["unknown", "failed", "refunded"])
+async def test_aborted_execution_preserves_deposit_and_cancel_receipts(kind, failure, cancellation):
+    from x402.mcp.types import PaymentWrapperHooks
+    from x402.mcp.utils import convert_mcp_result, extract_payment_response_from_result
+    from x402.schemas import PaymentAbortedError
+
+    server = _generic_server(kind)
+    server.get_payment_flow.return_value = "escrow"
+    deposit = SettleResponse(
+        success=True, transaction="deposit", network="x402:cash", amount="1000"
+    )
+    server.settle_payment.return_value = deposit
+    if failure == "settle-abort":
+        server.settle_payment.side_effect = [deposit, PaymentAbortedError("capture disallowed")]
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind == "async" else dispatcher.cancel_sync
+    if cancellation == "unknown":
+        cancel.side_effect = TimeoutError("refund outcome unknown")
+    else:
+        cancel.return_value = SettleResponse(
+            success=cancellation == "refunded",
+            transaction="refund" if cancellation == "refunded" else "",
+            network="x402:cash",
+            error_reason=None if cancellation == "refunded" else "refund_failed",
+        )
+
+    def before(_):
+        if failure == "before-exception":
+            raise ValueError("execution denied")
+        return failure != "before-denied"
+
+    def meter(_):
+        if failure == "meter":
+            raise ValueError("meter failed")
+
+    def handler():
+        if failure == "handler-threw":
+            raise ValueError("handler failed")
+        return {
+            "content": [{"type": "text", "text": "tool output"}],
+            "isError": failure == "handler-failed",
+        }
+
+    result = convert_mcp_result(
+        await _run_generic_wrapper(
+            kind,
+            server,
+            _cash_requirements(),
+            handler,
+            PaymentWrapperHooks(on_before_execution=before, on_after_execution=meter),
+        )
+    )
+    assert result.is_error
+    receipt = extract_payment_response_from_result(result)
+    assert receipt is not None
+    cancel.assert_called_once()
+    if cancellation == "unknown":
+        assert receipt == deposit
+    elif cancellation == "refunded":
+        assert receipt == cancel.return_value
+    else:
+        assert not receipt.success
+        assert receipt.extra["depositTransaction"] == "deposit"
+        assert receipt.extra["depositAmount"] == "1000"
+        assert MCP_PAYMENT_RESPONSE_META_KEY not in result.meta
+        assert (
+            result.structured_content[MCP_PAYMENT_RESPONSE_META_KEY]["errorReason"]
+            == "refund_failed"
+        )

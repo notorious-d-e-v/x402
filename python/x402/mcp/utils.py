@@ -192,15 +192,17 @@ def extract_payment_response_from_meta(
 
 
 def metered_payment_requirements(
-    requirements: PaymentRequirements, amount: str
+    requirements: PaymentRequirements, amount: str | int
 ) -> PaymentRequirements:
-    """Apply a request-local amount within the verified payment ceiling."""
+    """Normalize an atomic amount within the verified payment ceiling."""
+    if type(amount) is int and amount >= 0:
+        amount = str(amount)
     for value in (amount, requirements.amount):
         if not isinstance(value, str) or not value.isascii() or not value.isdigit():
             raise ValueError("Settlement amount must be an ASCII decimal string")
     if int(amount) > int(requirements.amount):
         raise ValueError("Settlement amount exceeds the verified ceiling")
-    return requirements.model_copy(update={"amount": amount})
+    return requirements.model_copy(deep=True, update={"amount": amount})
 
 
 def extract_payment_response_from_result(result: MCPToolResult) -> SettleResponse | None:
@@ -253,6 +255,26 @@ def attach_payment_response_to_meta(
         is_error=result.is_error,
         meta=new_meta,
         structured_content=result.structured_content,
+    )
+
+
+def attach_failure_path_receipt(result: MCPToolResult, response: SettleResponse) -> MCPToolResult:
+    """Preserve recovery receipts without advertising a failed cancel as paid."""
+    if response.success:
+        return attach_payment_response_to_meta(result, response)
+    error_data = dict(result.structured_content or {})
+    error_data[MCP_PAYMENT_RESPONSE_META_KEY] = response.model_dump(
+        by_alias=True, exclude_none=True
+    )
+    return MCPToolResult(
+        content=[*result.content, {"type": "text", "text": json.dumps(error_data)}],
+        is_error=True,
+        meta={
+            key: value
+            for key, value in (result.meta or {}).items()
+            if key != MCP_PAYMENT_RESPONSE_META_KEY
+        },
+        structured_content=error_data,
     )
 
 
