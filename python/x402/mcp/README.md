@@ -99,8 +99,10 @@ next payment. Exact and upto payments are never retried solely because another
 402 arrived.
 
 A tool result's `payment_made` records that a payload was submitted, including
-pending or failed settlement. It does not prove settlement and remains true if
-a corrective retry is denied. `payment_response` and the async client's
+pending or failed settlement. It does not prove settlement. When a corrective
+retry is denied, `x402MCPClientSync` returns the earlier result with
+`payment_made=True`; the async `x402MCPClient` raises `PaymentRequiredError`.
+`payment_response` and the async client's
 `AfterPaymentContext.settle_response` contain only successful receipts after
 core response processing. Failed receipt details remain in `raw_result` and
 reach core response hooks for recovery.
@@ -172,6 +174,9 @@ amount within its verified ceiling. Amounts accept ASCII decimal strings or
 nonnegative integers; integers become decimal strings. Booleans, floats,
 negative amounts, and amounts above the ceiling are rejected. Only the amount
 is applied: other verified terms and advertised accepts remain unchanged.
+Invalid amounts use the same cancellation and error handling in either hook.
+Cancellation hooks receive the original verified terms, even when the
+settlement amount was reduced by a metering hook.
 
 Execution-hook aborts, metering failures, and explicit pre-submission settlement
 aborts dispatch cancellation with `after_verify_aborted`. Handler exceptions
@@ -180,6 +185,11 @@ uncertain settlement exceptions do not trigger cancellation. Invalid metering
 never falls back to charging the ceiling. Generic wrappers preserve completed
 upfront receipts when cancellation fails; failed cancellation receipts remain
 in the error body with deposit recovery details, never in success metadata.
+
+Failed `settle_on_cancel` receipts are returned in `structuredContent` and a
+text fallback. Python clients read both for recovery. The current TypeScript
+MCP client reads receipts only from `_meta`, so it does not automatically
+process these failed cancellation receipts from third-party schemes.
 
 ### Utilities
 

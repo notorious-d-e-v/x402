@@ -714,11 +714,17 @@ async def test_all_wrappers_preserve_failed_receipt_only_in_error_body(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["fast-async", "fast-sync", "async", "sync"])
+@pytest.mark.parametrize("hook", ["on_before_execution", "on_after_execution"])
 @pytest.mark.parametrize(
     "amount", [True, False, -1, 200.0, 1001, "1001", "-1", "1.0", "1e2", "١", "", " 1"]
 )
-async def test_invalid_metering_amount_cancels_before_settlement(kind, amount):
+async def test_invalid_metering_amount_cancels_before_settlement(kind, hook, amount):
     from x402.mcp.types import PaymentWrapperHooks
+    from x402.mcp.utils import (
+        convert_mcp_result,
+        extract_payment_required_from_result,
+        extract_payment_response_from_result,
+    )
 
     server = _generic_server(kind)
     requirements = _cash_requirements()
@@ -726,11 +732,22 @@ async def test_invalid_metering_amount_cancels_before_settlement(kind, amount):
     def meter(context):
         # Hooks are Python callbacks: Pydantic assignment validation is not enabled.
         context.payment_requirements.amount = amount
+        return True
 
-    result = await _run_generic_wrapper(
-        kind, server, requirements, lambda: "ok", PaymentWrapperHooks(on_after_execution=meter)
+    handler = Mock(return_value="ok")
+    result = convert_mcp_result(
+        await _run_generic_wrapper(
+            kind, server, requirements, handler, PaymentWrapperHooks(**{hook: meter})
+        )
     )
-    assert getattr(result, "isError", getattr(result, "is_error", False))
+    assert result.is_error
+    assert handler.call_count == (hook == "on_after_execution")
+    assert extract_payment_required_from_result(result) is not None
+    receipt = extract_payment_response_from_result(result)
+    assert receipt is not None and not receipt.success
+    assert receipt.error_reason == "Payment metering failed"
+    assert receipt.transaction == ""
+    assert MCP_PAYMENT_RESPONSE_META_KEY not in result.meta
     server.settle_payment.assert_not_called()
     dispatcher = server.create_payment_cancellation_dispatcher.return_value
     cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
@@ -740,10 +757,11 @@ async def test_invalid_metering_amount_cancels_before_settlement(kind, amount):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("hook", ["on_before_execution", "on_after_execution"])
 @pytest.mark.parametrize(
     "outcome", ["released", "upfront", "unknown", "upfront-unknown", "no-dispatcher"]
 )
-async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, outcome):
+async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, hook, outcome):
     from x402.mcp.types import PaymentWrapperHooks
     from x402.mcp.utils import (
         convert_mcp_result,
@@ -761,19 +779,22 @@ async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, o
     elif outcome == "no-dispatcher":
         server.create_payment_cancellation_dispatcher.return_value = None
 
-    def meter(_):
-        raise ValueError("meter unavailable")
+    def meter(context):
+        context.payment_requirements.amount = "1001"
+        return True
 
+    handler = Mock(return_value="ok")
     result = convert_mcp_result(
         await _run_generic_wrapper(
             kind,
             server,
             _cash_requirements(),
-            lambda: "ok",
-            PaymentWrapperHooks(on_after_execution=meter),
+            handler,
+            PaymentWrapperHooks(**{hook: meter}),
         )
     )
     assert result.is_error
+    assert handler.call_count == (hook == "on_after_execution")
     receipt = extract_payment_response_from_result(result)
     if outcome == "released":
         assert receipt is not None and not receipt.success
@@ -786,6 +807,11 @@ async def test_metering_failure_reports_only_known_cancellation_outcomes(kind, o
         assert receipt.success
         server.settle_payment.assert_called_once()
         assert server.settle_payment.call_args.kwargs["phase"] == "before-handler"
+        if outcome == "upfront-unknown":
+            assert any(
+                item.get("text") == "Payment cancellation outcome unknown"
+                for item in result.content
+            )
     else:
         assert receipt is None
         assert extract_payment_required_from_result(result) is None
@@ -879,10 +905,14 @@ async def test_before_execution_failure_cancels_without_running_handler(kind, fa
             handler,
             PaymentWrapperHooks(on_before_execution=before),
         )
-    except (KeyError, ValueError):
-        assert kind.startswith("fast") and failure != "denied"
+    except KeyError as error:
+        assert kind.startswith("fast") and failure == "exception"
+        assert error is cause
     else:
         assert getattr(result, "isError", getattr(result, "is_error", False))
+        if failure == "exception":
+            assert not kind.startswith("fast")
+            assert result.content == [{"type": "text", "text": "Internal Server Error"}]
     handler.assert_not_called()
     server.settle_payment.assert_not_called()
     dispatcher = server.create_payment_cancellation_dispatcher.return_value
@@ -971,6 +1001,7 @@ async def test_before_handler_settlement_preserves_uncertain_outcomes(kind, outc
     [
         "before-denied",
         "before-exception",
+        "before-invalid-amount",
         "meter",
         "settle-abort",
         "handler-threw",
@@ -1003,9 +1034,11 @@ async def test_aborted_execution_preserves_deposit_and_cancel_receipts(kind, fai
             error_reason=None if cancellation == "refunded" else "refund_failed",
         )
 
-    def before(_):
+    def before(context):
         if failure == "before-exception":
             raise ValueError("execution denied")
+        if failure == "before-invalid-amount":
+            context.payment_requirements.amount = "1001"
         return failure != "before-denied"
 
     def meter(_):
@@ -1046,3 +1079,111 @@ async def test_aborted_execution_preserves_deposit_and_cancel_receipts(kind, fai
             result.structured_content[MCP_PAYMENT_RESPONSE_META_KEY]["errorReason"]
             == "refund_failed"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fast-async", "fast-sync"])
+@pytest.mark.parametrize("hook", ["on_before_execution", "on_after_execution"])
+async def test_fastmcp_invalid_metering_preserves_unknown_cancellation(kind, hook):
+    from x402.mcp.types import PaymentWrapperHooks
+
+    server = _generic_server(kind)
+    dispatcher = server.create_payment_cancellation_dispatcher.return_value
+    cancel = dispatcher.cancel if kind == "fast-async" else dispatcher.cancel_sync
+    cause = TimeoutError("cancellation outcome unknown")
+    cancel.side_effect = cause
+
+    def meter(context):
+        context.payment_requirements.amount = "1001"
+        return True
+
+    handler = Mock(return_value="ok")
+    with pytest.raises(TimeoutError) as raised:
+        await _run_generic_wrapper(
+            kind, server, _cash_requirements(), handler, PaymentWrapperHooks(**{hook: meter})
+        )
+    assert raised.value is cause
+    assert handler.call_count == (hook == "on_after_execution")
+    server.settle_payment.assert_not_called()
+    cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("hook", ["on_before_execution", "on_after_execution", "both"])
+async def test_settlement_abort_refunds_original_escrow_terms(kind, hook):
+    from x402 import x402ResourceServerSync
+    from x402.mcp.types import PaymentWrapperHooks
+    from x402.mcp.utils import convert_mcp_result, extract_payment_response_from_result
+
+    requirements = _cash_requirements()
+    requirements.extra = {"paymentFlow": "escrow", "nested": {"immutable": True}}
+    original = requirements.model_dump()
+    canceled_terms = []
+    settlement_attempts = []
+    transfers = []
+
+    class RefundOnCancelScheme(_MockSchemeNetworkServer):
+        payment_flows = {"default": {"supported": ("escrow",), "default": "escrow"}}
+
+        def settle_on_cancel(self, context):
+            assert context.settled_phases == ("before-handler",)
+            canceled_terms.append(context.requirements.model_dump())
+            # A third-party escrow scheme refunds the deposited amount in these terms.
+            return context.requirements.model_copy(deep=True)
+
+    def settle(_payload, terms):
+        transfers.append(terms.model_dump())
+        return SettleResponse(
+            success=True,
+            transaction="deposit" if len(transfers) == 1 else "refund",
+            network=terms.network,
+            amount=terms.amount,
+        )
+
+    facilitator = _MockFacilitatorClient()
+    facilitator.settle = (
+        AsyncMock(side_effect=settle) if kind == "async" else Mock(side_effect=settle)
+    )
+    if kind == "sync":
+        facilitator.verify = Mock(return_value=VerifyResponse(is_valid=True))
+    server = (x402ResourceServer if kind == "async" else x402ResourceServerSync)(facilitator)
+    server.register("x402:cash", RefundOnCancelScheme())
+    server.initialize()
+
+    def abort_capture(context):
+        settlement_attempts.append((context.phase, context.requirements.amount))
+        if context.phase == "after-handler":
+            return AbortResult(reason="capture disallowed")
+        return None
+
+    server.on_before_settle(abort_capture)
+
+    def meter(context):
+        context.payment_requirements.amount = "200"
+        context.payment_requirements.pay_to = "unrelated-payee"
+        context.payment_requirements.extra["nested"]["immutable"] = False
+        return True
+
+    hooks = PaymentWrapperHooks(
+        on_before_execution=meter if hook in ("on_before_execution", "both") else None,
+        on_after_execution=meter if hook in ("on_after_execution", "both") else None,
+    )
+    handler = Mock(return_value="ok")
+    result = convert_mcp_result(
+        await _run_generic_wrapper(kind, server, requirements, handler, hooks)
+    )
+    assert result.is_error
+    handler.assert_called_once()
+    assert settlement_attempts == [
+        ("before-handler", "1000"),
+        ("after-handler", "200"),
+        ("cancel", "1000"),
+    ]
+    assert canceled_terms == [original]
+    assert transfers == [original, original]
+    assert requirements.model_dump() == original
+    receipt = extract_payment_response_from_result(result)
+    assert receipt is not None and receipt.success
+    assert receipt.transaction == "refund"
+    assert receipt.amount == "1000"
