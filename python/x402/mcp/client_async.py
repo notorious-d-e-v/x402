@@ -165,6 +165,7 @@ class x402MCPClient:
 
         Raises:
             PaymentRequiredError: If payment required but auto_payment disabled
+            PaymentResponseError: If receipt reconciliation fails; ``result`` retains tool output
         """
         # First attempt without payment
         call_params = {"name": name, "arguments": args}
@@ -303,14 +304,14 @@ class x402MCPClient:
                     and not response_error
                     else None
                 ),
-                payment_made=settle_response is None or settle_response.success,
+                payment_made=True,
                 raw_result=result,
             )
             after_context = AfterPaymentContext(
                 tool_name=name,
                 payment_payload=payload,
                 result=result,
-                settle_response=settle_response if response_error is None else None,
+                settle_response=response.payment_response,
             )
             # Observers still receive paid output after validation fails. Never
             # present the rejected receipt as validated or hide the primary error.
@@ -325,7 +326,9 @@ class x402MCPClient:
             if response_error is not None:
                 raise PaymentResponseError(str(response_error), response) from response_error
             if observer_error is not None:
-                raise PaymentResponseError(str(observer_error), response) from observer_error
+                # Preserve callers' exception handlers for application observers.
+                observer_error.mcp_result = response
+                raise observer_error
 
             if (
                 attempt == 0

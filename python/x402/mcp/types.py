@@ -106,7 +106,7 @@ class AfterPaymentContext:
             tool_name: Name of the tool
             payment_payload: Payment payload that was used
             result: Tool result
-            settle_response: Optional settlement response
+            settle_response: Successful receipt after core response processing, if available
         """
         self.tool_name = tool_name
         self.payment_payload = payment_payload
@@ -176,8 +176,8 @@ class MCPToolCallResult:
             content: Content items
             is_error: Whether this is an error result
             payment_response: Successful settlement response, if available
-            payment_made: Payment submitted without an explicit settlement failure;
-                this alone does not confirm settlement
+            payment_made: Whether a payment payload was submitted, including failed
+                or pending settlement; this alone does not confirm settlement
             raw_result: Original tool result, including failed settlement details
         """
         self.content = content

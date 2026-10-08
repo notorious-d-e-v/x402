@@ -59,8 +59,8 @@ class MCPToolCallResult:
         content: List of MCP content items from the tool response.
         is_error: Whether the tool returned an error.
         payment_response: Successful settlement response, if available.
-        payment_made: Payment submitted without an explicit settlement failure;
-            this alone does not confirm settlement.
+        payment_made: Whether a payment payload was submitted, including failed
+            or pending settlement; this alone does not confirm settlement.
         raw_result: The raw MCP CallToolResult for advanced use.
     """
 
@@ -196,7 +196,7 @@ class x402MCPSession:
             payment_response=payment_response
             if payment_response and payment_response.success
             else None,
-            payment_made=payment_made and (payment_response is None or payment_response.success),
+            payment_made=payment_made,
             raw_result=result,
         )
 
@@ -312,7 +312,7 @@ class x402MCPClientSync:
                     PaymentRequiredContext(name, args, payment_required)
                 )
                 if not approved:
-                    return self._build_result(mcp_result, payment_made=False)
+                    return self._build_result(mcp_result, payment_made=attempt > 0)
             payment_payload = self._payment_client.create_payment_payload(payment_required)
             accepted = payment_payload.accepted
             paid_timeout = paid_read_timeout_seconds(
@@ -368,7 +368,7 @@ class x402MCPClientSync:
             payment_response=payment_response
             if payment_response and payment_response.success
             else None,
-            payment_made=payment_made and (payment_response is None or payment_response.success),
+            payment_made=payment_made,
             raw_result=mcp_result,
         )
 
