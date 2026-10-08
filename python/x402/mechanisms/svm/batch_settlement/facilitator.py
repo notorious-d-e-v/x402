@@ -171,16 +171,27 @@ class BatchSvmScheme:
         floor = self._confirmation_slots.get(network)
         for attempt in range(5):
             try:
-                account = self.signer.get_account_info(channel_id, network, min_context_slot=floor)
+                contextual_read = getattr(self.signer, "get_account_info_with_context", None)
+                if callable(contextual_read):
+                    result = contextual_read(channel_id, network, min_context_slot=floor)
+                    account, context_slot = result["account"], result["context_slot"]
+                else:
+                    account = self.signer.get_account_info(
+                        channel_id, network, min_context_slot=floor
+                    )
+                    context_slot = account.get("context_slot") if account is not None else None
+                if floor is not None and (type(context_slot) is not int or context_slot < floor):
+                    raise RuntimeError("account read precedes confirmed transaction slot")
                 if account is None:
                     return None
-                if floor is not None and account.get("context_slot", -1) < floor:
-                    raise RuntimeError("account read precedes confirmed transaction slot")
                 if account["owner"] != PAYMENT_CHANNELS_PROGRAM_ID or account.get("executable"):
                     raise BatchError(
                         BatchError.CHANNEL_STATE, "channel has wrong owner or is executable"
                     )
-                channel = decode_channel_account(account["data"])
+                try:
+                    channel = decode_channel_account(account["data"])
+                except ValueError as error:
+                    raise BatchError(BatchError.CHANNEL_STATE, str(error)) from error
                 if (
                     find_payment_channel_pda(
                         payer=channel.payer,
@@ -237,9 +248,12 @@ class BatchSvmScheme:
                     continue
         return list(channels.items())
 
-    def _terms(
-        self, config: dict[str, Any], requirements: PaymentRequirements, *, lifecycle: bool = False
+    @staticmethod
+    def _channel_id(
+        config: dict[str, Any], requirements: PaymentRequirements, *, lifecycle: bool = False
     ) -> str:
+        if not isinstance(config, dict):
+            raise BatchError(BatchError.PAYLOAD_TYPE)
         if lifecycle:
             extra = dict(requirements.extra or {})
             extra["voucherSigner"] = config.get("voucherSigner", "client")
@@ -248,7 +262,12 @@ class BatchSvmScheme:
             else:
                 extra.pop("operator", None)
             requirements = requirements.model_copy(update={"extra": extra})
-        channel_id = validate_channel_config(config, requirements)
+        return validate_channel_config(config, requirements)
+
+    def _terms(
+        self, config: dict[str, Any], requirements: PaymentRequirements, *, lifecycle: bool = False
+    ) -> str:
+        channel_id = self._channel_id(config, requirements, lifecycle=lifecycle)
         extra = requirements.extra or {}
         if extra["feePayer"] not in self.signer.get_addresses():
             raise BatchError(BatchError.FEE_PAYER_MISMATCH)
@@ -497,21 +516,32 @@ class BatchSvmScheme:
                 raise BatchError(BatchError.CHANNEL_STATE, "accepted requirements do not match")
 
     @staticmethod
-    def _key(raw: dict[str, Any], requirements: PaymentRequirements) -> str:
+    def _key(
+        raw: dict[str, Any], requirements: PaymentRequirements, *, request_close: bool = False
+    ) -> str:
         kind = raw["type"]
-        if kind == "deposit" or (
-            kind == "refund" and raw.get("transaction") and not raw.get("closeAuthorization")
-        ):
-            wire = raw["deposit"]["transaction"] if kind == "deposit" else raw["transaction"]
-            transaction = VersionedTransaction.from_bytes(base64.b64decode(wire, validate=True))
-            transaction.sanitize()
+        if kind == "deposit" or request_close:
+            try:
+                wire = raw["deposit"]["transaction"] if kind == "deposit" else raw["transaction"]
+                transaction = VersionedTransaction.from_bytes(base64.b64decode(wire, validate=True))
+                transaction.sanitize()
+            except Exception as error:
+                reason = (
+                    BatchError.SETUP_TRANSACTION
+                    if kind == "deposit"
+                    else BatchError.REFUND_TRANSACTION
+                )
+                raise BatchError(reason, str(error)) from error
             # The sponsor signature may still be a placeholder. Signing the same
             # message produces the same transaction regardless of refreshed proofs.
             identity = hashlib.sha256(to_bytes_versioned(transaction.message)).hexdigest()
             return f"batch:{kind}:{requirements.network}:{identity}"
         if kind in ("seal", "refund"):
-            voucher = raw.get("voucher") or {}
-            target = atomic(voucher.get("maxClaimableAmount"), "maxClaimableAmount")
+            try:
+                voucher = raw["voucher"]
+                target = atomic(voucher["maxClaimableAmount"], "maxClaimableAmount")
+            except (KeyError, TypeError, ValueError) as error:
+                raise BatchError(BatchError.VOUCHER_SIGNATURE, str(error)) from error
             return f"batch:close:{requirements.network}:{voucher.get('channelId')}:{target}"
         content = {
             "payload": raw,
@@ -530,23 +560,22 @@ class BatchSvmScheme:
         raw: dict[str, Any],
         requirements: PaymentRequirements,
         context: Any,
+        *,
+        request_close: bool = False,
     ) -> None:
         if raw["type"] not in ("deposit", "seal", "refund"):
             return
+        if request_close:
+            kinds = ("request_close",)
+        elif raw["type"] in ("seal", "refund"):
+            kinds = ("seal", "refund")
+        else:
+            kinds = ("deposit",)
+        if record.kind not in kinds:
+            raise BatchError(BatchError.CHANNEL_STATE, "cached transaction operation differs")
         config = raw.get("channelConfig")
-        channel_requirements = requirements
-        if raw["type"] == "seal" and isinstance(config, dict):
-            extra = {
-                **(requirements.extra or {}),
-                "voucherSigner": config.get("voucherSigner", "client"),
-            }
-            if extra["voucherSigner"] == "server":
-                extra["operator"] = config["payerAuthorizer"]
-            else:
-                extra.pop("operator", None)
-            channel_requirements = requirements.model_copy(update={"extra": extra})
-        channel_id = validate_channel_config(config, channel_requirements)
-        if record.channel_ids != (channel_id,) or record.metadata.get("configs") != [config]:
+        channel_id = self._channel_id(config, requirements, lifecycle=raw["type"] == "seal")
+        if tuple(record.channel_ids) != (channel_id,) or record.metadata.get("configs") != [config]:
             raise BatchError(BatchError.CHANNEL_STATE, "cached transaction channel terms differ")
         original = PaymentRequirements.model_validate(record.metadata["requirements"])
         # Config equality and validation bind receiver, authorizers, mode, and delay.
@@ -590,7 +619,10 @@ class BatchSvmScheme:
                 "refund",
             ):
                 raise BatchError(BatchError.PAYLOAD_TYPE)
-            payer = raw.get("channelConfig", {}).get("payer", "")
+            config = raw.get("channelConfig")
+            payer = config.get("payer", "") if isinstance(config, dict) else ""
+            if raw["type"] in ("seal", "refund"):
+                return self._settle_close(raw, requirements, context)
             key = self._key(raw, requirements)
             _, existing = self._operation_attempt(key)
             if existing:
@@ -602,7 +634,6 @@ class BatchSvmScheme:
                 return self._settle_deposit(key, raw, requirements, context)
             if raw["type"] in ("claim", "settle"):
                 return self._settle_batch(key, raw, requirements)
-            return self._settle_close(key, raw, requirements, context)
         except Exception as error:
             return _failure(
                 requirements.network,
@@ -907,10 +938,10 @@ class BatchSvmScheme:
         return record
 
     def _settle_close(
-        self, key: str, raw: dict[str, Any], requirements: PaymentRequirements, context: Any
+        self, raw: dict[str, Any], requirements: PaymentRequirements, context: Any
     ) -> SettleResponse:
         config = raw.get("channelConfig")
-        channel_id = self._terms(config, requirements, lifecycle=raw["type"] == "seal")
+        channel_id = self._channel_id(config, requirements, lifecycle=raw["type"] == "seal")
         if raw["type"] == "seal" and raw.get("channelId") != channel_id:
             raise BatchError(BatchError.CHANNEL_ID_MISMATCH)
         if "amount" in raw:
@@ -921,6 +952,20 @@ class BatchSvmScheme:
         bound = binding.receiver_authorizer if binding else ""
         if bound and bound != config["receiverAuthorizer"]:
             raise BatchError(BatchError.RECEIVER_AUTHORIZER_MISMATCH)
+        request_close = raw["type"] == "refund" and (
+            not bound
+            or (isinstance(raw.get("transaction"), str) and not raw.get("closeAuthorization"))
+        )
+        if request_close and not isinstance(raw.get("transaction"), str):
+            raise BatchError(BatchError.RECEIVER_BINDING_UNAVAILABLE)
+        key = self._key(raw, requirements, request_close=request_close)
+        _, existing = self._operation_attempt(key)
+        if existing:
+            self._check_cached_request(
+                existing, raw, requirements, context, request_close=request_close
+            )
+            return self._reconcile(existing, requirements)
+        self._terms(config, requirements, lifecycle=raw["type"] == "seal")
         channel = self.assert_channel(
             self.read_channel(requirements.network, channel_id),
             config,
@@ -928,13 +973,8 @@ class BatchSvmScheme:
             (ChannelStatus.OPEN, ChannelStatus.CLOSING),
         )
         # Payer-signed forced close remains available when receiver/caller authentication is lost.
-        if raw["type"] == "refund" and (
-            not bound
-            or (isinstance(raw.get("transaction"), str) and not raw.get("closeAuthorization"))
-        ):
-            transaction = raw.get("transaction")
-            if not isinstance(transaction, str):
-                raise BatchError(BatchError.RECEIVER_BINDING_UNAVAILABLE)
+        if request_close:
+            transaction = raw["transaction"]
             try:
                 verify_request_close_transaction(
                     transaction,
@@ -1248,20 +1288,20 @@ class BatchSvmScheme:
     def _confirmed_response(
         self, record: PendingSettlement, requirements: PaymentRequirements
     ) -> SettleResponse:
-        channels = [
-            self.read_channel(record.network, channel_id) for channel_id in record.channel_ids
-        ]
-        configs = record.metadata.get("configs", [])
-        for channel, config in zip(channels, configs, strict=False):
-            if channel:
-                try:
+        try:
+            channels = [
+                self.read_channel(record.network, channel_id) for channel_id in record.channel_ids
+            ]
+            configs = record.metadata.get("configs", [])
+            for channel, config in zip(channels, configs, strict=False):
+                if channel:
                     self.assert_channel(channel, config, requirements, tuple(ChannelStatus))
-                except BatchError as error:
-                    if record.kind != "deposit":
-                        raise
-                    return _failure(
-                        record.network, error.reason, record.payer, record.signature, str(error)
-                    )
+        except BatchError as error:
+            if record.kind != "deposit":
+                raise
+            return _failure(
+                record.network, error.reason, record.payer, record.signature, str(error)
+            )
         response = SettleResponse(
             success=True,
             network=record.network,

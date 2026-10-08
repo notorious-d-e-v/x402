@@ -145,6 +145,15 @@ Reconcile the durable accounting state before restarting; restarting alone does
 not recover an unrecorded charge. Missing optional close snapshots stop new
 payments while the channel manager reconciles the final watermark.
 
+Server crash recovery is application-managed. Keep the original payment,
+requirements, and settlement outcome in a durable request log. Reconcile escrow
+with the merchant's accepted voucher ledger, then use `ChannelStore.update` to
+restore the accounting state and remove only resolved reservations; retain
+consumed request IDs in `BatchOperationStore`. Restart affected server instances
+after that repair to clear their local failure guards. A reservation deadline
+alone does not prove that a transaction failed. There is no automatic server
+reservation recovery worker in this implementation.
+
 Redeem regularly using the enhanced requirements for those channels:
 
 ```python
@@ -190,6 +199,12 @@ The facilitator validates complete client transactions before co-signing and
 simulates setup plus close/distribution readiness. It persists signed bytes and
 channel reservations before broadcast. Unknown outcomes remain pending until
 confirmed or proven expired; retries reconcile the recorded transaction.
+
+Custom signers should expose `get_account_info_with_context`, returning
+`{"context_slot": slot, "account": account_or_none}` and honoring
+`min_context_slot`. The bundled signer does this even for absent accounts.
+A bare `None` from a legacy signer cannot prove absence after confirmation;
+the facilitator keeps that outcome pending until it receives a fresh read.
 
 Configure an explicit binding store or history reader. `MemoryPaymentChannelStorage`
 and `MemoryBatchPendingSettlementStore` are suitable for development; replace

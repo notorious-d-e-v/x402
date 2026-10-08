@@ -3,6 +3,7 @@ import { join } from 'path';
 import { TestDiscovery } from './discovery';
 import { GenericClientProxy } from './clients/generic-client';
 import { getNetworkSet } from './networks/networks';
+import { filterScenarios } from './cli/filters';
 import type { DiscoveredFacilitator } from './types';
 
 afterEach(() => {
@@ -50,6 +51,20 @@ describe('Python SVM batch scenarios', () => {
 
   it('still rejects unknown internal SDK implementations', () => {
     expect(scenarios(['batch-settlement'], false)).toEqual([]);
+  });
+
+  it('requires explicit external facilitator selection before running discovered scenarios', () => {
+    const external = scenarios(['batch-settlement']);
+    const internal = external.map(scenario => ({
+      ...scenario,
+      facilitator: { ...scenario.facilitator!, name: 'python', isExternal: false },
+    }));
+    const discovered = [...internal, ...external];
+    for (const filters of [{}, { facilitators: [] }, { protocolFamilies: ['svm'] }]) {
+      expect(filterScenarios(discovered, filters)).toEqual(internal);
+    }
+    expect(filterScenarios(discovered, { facilitators: ['external-fixture'] })).toEqual(external);
+    expect(filterScenarios(discovered, { facilitators: ['different-proxy'] })).toEqual([]);
   });
 });
 

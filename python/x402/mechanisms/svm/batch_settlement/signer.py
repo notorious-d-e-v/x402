@@ -29,6 +29,14 @@ class BatchFacilitatorKeypairSigner(FacilitatorKeypairSigner):
     def get_account_info(
         self, address: str, network: str, *, min_context_slot: int | None = None
     ) -> dict[str, Any] | None:
+        return self.get_account_info_with_context(
+            address, network, min_context_slot=min_context_slot
+        )["account"]
+
+    def get_account_info_with_context(
+        self, address: str, network: str, *, min_context_slot: int | None = None
+    ) -> dict[str, Any]:
+        """Preserve the RPC context even when the account is absent."""
         config = RpcAccountInfoConfig(
             encoding=UiAccountEncoding.Base64,
             commitment=CommitmentLevel.Confirmed,
@@ -39,13 +47,16 @@ class BatchFacilitatorKeypairSigner(FacilitatorKeypairSigner):
         )
         if min_context_slot is not None and response.context.slot < min_context_slot:
             raise RuntimeError("RPC account context precedes the confirmed transaction")
-        if response.value is None:
-            return None
         return {
-            "data": bytes(response.value.data),
-            "owner": str(response.value.owner),
-            "executable": response.value.executable,
             "context_slot": response.context.slot,
+            "account": {
+                "data": bytes(response.value.data),
+                "owner": str(response.value.owner),
+                "executable": response.value.executable,
+                "context_slot": response.context.slot,
+            }
+            if response.value is not None
+            else None,
         }
 
     def get_latest_blockhash(self, network: str) -> dict[str, Any]:

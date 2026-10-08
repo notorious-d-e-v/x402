@@ -45,6 +45,21 @@ def test_account_read_passes_confirmation_slot_and_preserves_owner():
         value.get_account_info(str(PAYER.pubkey()), NETWORK, min_context_slot=100)
 
 
+def test_absent_account_preserves_context_and_rejects_stale_rpc():
+    value, rpc = signer()
+    rpc._provider.make_request.return_value = SimpleNamespace(
+        context=SimpleNamespace(slot=99),
+        value=None,
+    )
+    assert value.get_account_info_with_context(
+        str(PAYER.pubkey()), NETWORK, min_context_slot=99
+    ) == {"context_slot": 99, "account": None}
+    assert value.get_account_info(str(PAYER.pubkey()), NETWORK, min_context_slot=99) is None
+    for read in (value.get_account_info, value.get_account_info_with_context):
+        with pytest.raises(RuntimeError, match="precedes"):
+            read(str(PAYER.pubkey()), NETWORK, min_context_slot=100)
+
+
 def test_confirmed_failed_transaction_is_never_success():
     value, rpc = signer()
     response = {

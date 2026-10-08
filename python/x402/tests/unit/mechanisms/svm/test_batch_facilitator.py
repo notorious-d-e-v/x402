@@ -155,6 +155,13 @@ class Transport:
             "context_slot": 1000,
         }
 
+    def get_account_info_with_context(self, address, network, *, min_context_slot=None):
+        account = self.get_account_info(address, network, min_context_slot=min_context_slot)
+        return {
+            "context_slot": account["context_slot"] if account is not None else 1000,
+            "account": account,
+        }
+
     def sign_transaction(self, wire, fee_payer, network):
         self.signed.append(wire)
         tx = VersionedTransaction.from_bytes(base64.b64decode(wire))
@@ -725,7 +732,6 @@ def test_close_retries_with_refreshed_authorization_recover_same_result(fixture,
     )
     # Restore through the same JSON representation a durable store would use.
     stored = json.loads(json.dumps(asdict(pending)))
-    stored["channel_ids"] = tuple(stored["channel_ids"])
     scheme.pending_store._records[pending.key] = PendingSettlement(**stored)
     retry = close_payload(kind, req, cfg, cid, 30, validity=50)
     assert retry["closeAuthorization"] != raw["closeAuthorization"]
@@ -976,3 +982,164 @@ def test_stale_post_confirmation_read_cannot_release_deposit_reservation(fixture
     assert final.transaction == result.transaction
     assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
     assert len(rpc.sent) == 1
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_forced_refund_with_close_authorization_cannot_occupy_cooperative_key(fixture, expired):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = channel
+    closing = replace(channel, status=ChannelStatus.CLOSING, closure_started_at=int(time.time()))
+    raw = close_payload("refund", req, cfg, cid, 30)
+    raw["transaction"] = build_request_close_transaction(
+        payer=PAYER,
+        channel_id=cid,
+        fee_payer=req.extra["feePayer"],
+        blockhash=str(Hash.default()),
+        memo="order",
+    )
+    if expired:
+        rpc.status, rpc.height, rpc.hash_valid = None, 501, False
+    else:
+        rpc.on_send = lambda: setattr(rpc, "channel", closing)
+    result = scheme.settle(payment(req, raw), req)
+    assert result.success is not expired
+    if expired:
+        assert result.error_reason == "transaction_expired"
+    else:
+        assert result.extra["channelState"]["totalClaimed"] == "0"
+    assert scheme.settle(payment(req, raw), req) == result
+    assert len(rpc.sent) == 1
+
+    # Even after binding recovery, a forged seal cannot reuse the initiation result.
+    scheme.channel_storage.record(
+        PaymentChannelRecord(
+            NETWORK,
+            cid,
+            req.pay_to,
+            TOKEN_PROGRAM_ADDRESS,
+            receiver_authorizer=cfg["receiverAuthorizer"],
+        )
+    )
+    rpc.channel = closing
+    seal = close_payload("seal", req, cfg, cid, 30)
+    forged = {**seal, "closeAuthorization": {**seal["closeAuthorization"], "signature": "invalid"}}
+    assert scheme.settle(payment(req, forged), req).error_reason == BatchError.CLOSE_AUTHORIZATION
+    assert len(rpc.sent) == 1
+    forced_key = scheme._key(raw, req, request_close=True)
+    assert scheme.pending_store.get(forced_key).kind == "request_close"
+    assert scheme.pending_store.get(scheme._key(raw, req)) is None
+    rpc.status = {"err": None, "confirmation_status": "confirmed", "slot": 1000}
+    rpc.on_send = lambda: setattr(rpc, "channel", None)
+    final = scheme.settle(payment(req, seal), req)
+    assert final.success and final.transaction != result.transaction
+    assert final.extra["channelState"]["totalClaimed"] == "30"
+    assert len(rpc.sent) == len(rpc.signed) == 2
+
+
+def test_cooperative_cache_rejects_legacy_forced_close_record(fixture):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = channel
+    raw = close_payload("refund", req, cfg, cid, 30)
+    raw["transaction"] = build_request_close_transaction(
+        payer=PAYER,
+        channel_id=cid,
+        fee_payer=req.extra["feePayer"],
+        blockhash=str(Hash.default()),
+        memo="order",
+    )
+    rpc.on_send = lambda: setattr(
+        rpc,
+        "channel",
+        replace(channel, status=ChannelStatus.CLOSING, closure_started_at=int(time.time())),
+    )
+    assert scheme.settle(payment(req, raw), req).success
+    record = scheme.pending_store.get(scheme._key(raw, req, request_close=True))
+    # A durable store can still contain an incorrectly keyed record from an older version.
+    legacy_key = scheme._key(raw, req)
+    scheme.pending_store._records[legacy_key] = replace(record, key=legacy_key)
+    seal = close_payload("seal", req, cfg, cid, 30)
+    assert scheme.settle(payment(req, seal), req).error_reason == BatchError.CHANNEL_STATE
+    assert len(rpc.sent) == 1
+
+
+@pytest.mark.parametrize("kind", ["deposit", "seal", "refund"])
+@pytest.mark.parametrize("malformed", [None, [], "invalid", {}])
+def test_malformed_settlement_payload_preserves_validation_error(fixture, kind, malformed):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    rpc.channel = channel
+    if kind == "deposit":
+        raw = deposit(req, cfg, cid).payload
+        raw["deposit"] = {"amount": "100", "transaction": malformed}
+        expected = BatchError.SETUP_TRANSACTION
+    else:
+        raw = close_payload(kind, req, cfg, cid, 30)
+        raw["voucher"] = malformed
+        expected = (
+            BatchError.CHANNEL_ID_MISMATCH
+            if kind == "refund" and malformed == {}
+            else BatchError.VOUCHER_SIGNATURE
+        )
+    assert scheme.settle(payment(req, raw), req).error_reason == expected
+    assert not rpc.sent and not rpc.signed
+
+
+@pytest.mark.parametrize("context", [None, 999])
+def test_unproven_absence_retains_confirmed_deposit_until_fresh_read(fixture, monkeypatch, context):
+    scheme, rpc, req, cfg, cid, _ = fixture
+    if context is None:
+        # Legacy custom signers may ignore min_context_slot and return an ambiguous None.
+        rpc.get_account_info_with_context = None
+    else:
+        rpc.get_account_info_with_context = lambda *args, **kwargs: {
+            "account": None,
+            "context_slot": context,
+        }
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    payload = deposit(req, cfg, cid)
+    result = scheme.settle(payload, req)
+    assert result.error_reason == "settlement_pending"
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is not None
+    rpc.get_account_info_with_context = lambda *args, **kwargs: {
+        "account": None,
+        "context_slot": 1000,
+    }
+    final = BatchSvmScheme(rpc, scheme.config).settle(payload, req)
+    assert final.error_reason == BatchError.CHANNEL_STATE
+    assert final.transaction == result.transaction
+    assert scheme.pending_store.find_pending(NETWORK, [cid]) is None
+    assert len(rpc.sent) == len(rpc.signed) == 1
+
+
+@pytest.mark.parametrize("invalid", ["owner", "executable", "pda", "data"])
+def test_confirmed_deposit_fresh_invalid_account_releases_reservation(fixture, invalid):
+    scheme, rpc, req, cfg, cid, channel = fixture
+    original_read = rpc.get_account_info
+
+    def invalid_read(address, network, *, min_context_slot=None):
+        account = original_read(address, network, min_context_slot=min_context_slot)
+        if address == cid:
+            assert min_context_slot == 1000
+            if invalid == "owner":
+                # A reclaimed PDA can receive lamports and become a System Program account.
+                account["owner"] = "11111111111111111111111111111111"
+            elif invalid == "executable":
+                account["executable"] = True
+            elif invalid == "pda":
+                account["data"] = account_bytes(replace(channel, salt=8))
+            else:
+                account["data"] = b"invalid"
+        return account
+
+    def landed():
+        rpc.channel = channel
+        rpc.get_account_info = invalid_read
+
+    rpc.on_send = landed
+    payload = deposit(req, cfg, cid)
+    result = scheme.settle(payload, req)
+    assert result.error_reason == (
+        BatchError.CHANNEL_ID_MISMATCH if invalid == "pda" else BatchError.CHANNEL_STATE
+    )
+    assert result.transaction and scheme.pending_store.find_pending(NETWORK, [cid]) is None
+    assert scheme.settle(payload, req) == result
+    assert len(rpc.sent) == len(rpc.signed) == 1
