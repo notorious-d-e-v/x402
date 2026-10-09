@@ -2,7 +2,7 @@
 
 import json
 
-from client import create_e2e_client, run_client_scenario_sync
+from client import create_e2e_client, refund_batch_channel, run_client_scenario_sync
 
 from x402.http import decode_payment_response_header
 from x402.http.clients import x402_requests
@@ -35,7 +35,7 @@ def main():
         run_client_scenario_sync(
             ctx,
             issue_request,
-            refund=(lambda url: ctx.batch_scheme.refund(url)),
+            refund=(lambda url: refund_batch_channel(ctx, url)),
         )
     except Exception as e:
         error_result = {

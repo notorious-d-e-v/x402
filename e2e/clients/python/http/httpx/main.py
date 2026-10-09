@@ -5,7 +5,7 @@ import json
 import logging
 
 import httpx
-from client import create_e2e_client, run_client_scenario
+from client import create_e2e_client, refund_batch_channel, run_client_scenario
 
 from x402.http import decode_payment_response_header
 from x402.http.clients import x402_httpx_transport
@@ -48,7 +48,7 @@ async def main():
             return result
 
         async def refund(url: str):
-            return await asyncio.to_thread(ctx.batch_scheme.refund, url)
+            return await asyncio.to_thread(refund_batch_channel, ctx, url)
 
         try:
             await run_client_scenario(ctx, issue_request, refund=refund)

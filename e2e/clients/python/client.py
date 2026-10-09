@@ -212,6 +212,18 @@ def _refund_failure(error: Exception) -> dict[str, Any]:
     return {"success": False, "status_code": 500, "error": str(error)}
 
 
+def refund_batch_channel(ctx: ClientContext, url: str) -> Any:
+    """Allow remote SVM refunds the same response time as ordinary E2E requests."""
+    if isinstance(ctx.batch_scheme, BatchSvmClientScheme):
+        import httpx
+
+        def fetch(url: str, headers: dict[str, str]) -> Any:
+            return httpx.get(url, headers=headers, timeout=httpx.Timeout(30.0, connect=10.0))
+
+        return ctx.batch_scheme.refund(url, fetch=fetch)
+    return ctx.batch_scheme.refund(url)
+
+
 def _refund_result(settle: Any) -> dict[str, Any]:
     return {
         "success": settle.success,

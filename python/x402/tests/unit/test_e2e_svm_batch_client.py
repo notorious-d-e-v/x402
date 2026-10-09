@@ -437,6 +437,59 @@ async def test_http_entrypoints_report_non_2xx_as_failure(e2e, monkeypatch, caps
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["httpx", "requests"])
+async def test_http_refund_uses_plain_fetch_with_confirmation_timeout(e2e, monkeypatch, transport):
+    import httpx
+
+    ctx = e2e.create_e2e_client(sync=transport == "requests")
+    url = ctx.base_url + ctx.endpoint_path
+    headers = {"PAYMENT-SIGNATURE": "signed-refund"}
+    response = SimpleNamespace(headers={"PAYMENT-RESPONSE": "refund-receipt"}, status_code=200)
+    plain_get = MagicMock(return_value=response)
+    monkeypatch.setattr(httpx, "get", plain_get)
+
+    def refund(request_url, *, fetch):
+        assert request_url == url
+        assert fetch(request_url, headers) is response
+        return "settled"
+
+    monkeypatch.setattr(ctx.batch_scheme, "refund", refund)
+    monkeypatch.setitem(sys.modules, "client", e2e)
+    entry = load_module(
+        monkeypatch, "_e2e_refund_" + transport, CLIENT_DIR / "http" / transport / "main.py"
+    )
+    monkeypatch.setattr(entry, "create_e2e_client", lambda **kwargs: ctx)
+
+    if transport == "httpx":
+
+        async def scenario(context, issue_request, refund):
+            assert await refund(url) == "settled"
+
+        monkeypatch.setattr(entry, "run_client_scenario", scenario)
+        await entry.main()
+    else:
+
+        def scenario(context, issue_request, refund):
+            assert refund(url) == "settled"
+
+        monkeypatch.setattr(entry, "run_client_scenario_sync", scenario)
+        entry.main()
+
+    plain_get.assert_called_once()
+    assert plain_get.call_args.args == (url,)
+    assert plain_get.call_args.kwargs["headers"] == headers
+    timeout = plain_get.call_args.kwargs["timeout"]
+    assert timeout.read == 30.0 and timeout.connect == 10.0
+
+
+def test_http_refund_preserves_evm_call_signature(e2e):
+    scheme = MagicMock(spec=BatchSettlementEvmScheme)
+    ctx = SimpleNamespace(batch_scheme=scheme)
+    assert e2e.refund_batch_channel(ctx, "https://merchant.invalid") is scheme.refund.return_value
+    scheme.refund.assert_called_once_with("https://merchant.invalid")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("server_mode", [False, True])
 async def test_mcp_svm_refund_uses_existing_transport_adapter(e2e, monkeypatch, server_mode):
     from x402.mcp.constants import MCP_PAYMENT_META_KEY, MCP_PAYMENT_RESPONSE_META_KEY

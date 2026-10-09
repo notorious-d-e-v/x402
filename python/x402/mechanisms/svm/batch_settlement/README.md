@@ -106,6 +106,19 @@ Refunds close the whole channel. If the receiver binding is unavailable, the
 client can submit a payer-signed `request_close`, then wait for the advertised
 grace period. `create_refund_payload(requirements, with_transaction=True)` is
 available for custom transports. Automatic HTTP refunds use `httpx`.
+For remote facilitators, allow time for on-chain confirmation with a plain fetch:
+
+```python
+import httpx
+
+result = scheme.refund(
+    resource_url,
+    fetch=lambda url, headers: httpx.get(url, headers=headers, timeout=30.0),
+)
+```
+
+A timeout leaves the transaction outcome unknown; check the channel on-chain
+before retrying.
 
 ## Resource server
 
