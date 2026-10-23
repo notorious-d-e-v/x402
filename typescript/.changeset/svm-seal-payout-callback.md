@@ -2,4 +2,4 @@
 "@x402/svm": patch
 ---
 
-Report cooperative seal and refund payouts to the receiver through `onDistributionConfirmed`, once per close, and return `settlement_pending` when the callback fails so a retry can record the payout without rebroadcasting.
+Fixed missing receiver payout callbacks for cooperative seals and refunds. Coalesced overlapping accounting within a shared store instance and returned `settlement_pending` on recording failure so retries can recover without rebroadcasting. Callbacks must still atomically deduplicate by transaction across processes and crash recovery.

@@ -45,7 +45,7 @@ import {
   type BatchSvmFacilitatorConfig,
   type ChannelBinding,
 } from "./bindingSource";
-import type { BatchPendingSettlementStore } from "./recovery";
+import { distributionsForStore, type BatchPendingSettlementStore } from "./recovery";
 import {
   CHANNEL_BUSY,
   refundResponse,
@@ -125,7 +125,7 @@ export interface SealDependencies {
 }
 
 /**
- * Notify the operator once for a durable close result.
+ * Notify the operator unless the durable close result is already recorded.
  *
  * @param deps - Scheme internals containing the optional payout callback
  * @param key - Durable close operation key
@@ -174,16 +174,26 @@ async function completeSealDistribution(
   requirements: PaymentRequirements,
   intent: CloseIntent,
 ): Promise<SettleResponse> {
+  // Share in-flight accounting across schemes using this store, as for sweeps.
+  // Cross-process retries still require transaction-idempotent callbacks.
+  const passes = distributionsForStore(deps.pendingStore);
+  const active = passes.get(key);
+  if (active) return active;
+  const pass = notifySealDistribution(deps, key, response, requirements, intent).then(
+    () => response,
+    error =>
+      settlementPending(
+        response.network,
+        response.payer ?? "",
+        response.transaction,
+        String(error),
+      ),
+  );
+  passes.set(key, pass);
   try {
-    await notifySealDistribution(deps, key, response, requirements, intent);
-    return response;
-  } catch (error) {
-    return settlementPending(
-      response.network,
-      response.payer ?? "",
-      response.transaction,
-      String(error),
-    );
+    return await pass;
+  } finally {
+    if (passes.get(key) === pass) passes.delete(key);
   }
 }
 
