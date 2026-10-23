@@ -3,6 +3,7 @@ import { fetchMint } from "@solana-program/token-2022";
 import type { PaymentRequirements } from "@x402/core/types";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { verifyBatchAuthorization } from "../../src/batch-settlement/authorization";
 import { BatchChannelTracker } from "../../src/batch-settlement/client/channel";
 import { NoBatchChannelToRefundError } from "../../src/batch-settlement/client/refund";
 import {
@@ -99,9 +100,13 @@ function internals(client: BatchSvmScheme): ClientInternals {
 }
 
 describe("batch client lifecycle", () => {
-  it.each([false, true])(
-    "commits a signed server voucher without allocating again (restart=%s)",
-    async restart => {
+  it.each(
+    [false, true].flatMap(restart =>
+      (["binary", "text-v1"] as const).map(format => ({ restart, format })),
+    ),
+  )(
+    "commits a signed server voucher without allocating again (restart=$restart, format=$format)",
+    async ({ restart, format }) => {
       const operator = await generateKeyPairSigner();
       const { records, storage } = memoryStorage();
       const trust = { allowedOperators: [operator.address] };
@@ -116,11 +121,19 @@ describe("batch client lifecycle", () => {
           ...requirements().extra,
           operator: operator.address,
           voucherSigner: "server",
+          ...(format === "text-v1" ? { authorizationFormat: format } : {}),
         },
       });
       const opened = await client.createPaymentPayload(2, serverRequirements);
       expect(opened.payload).toMatchObject({ type: "deposit" });
       expect("maxClaimableAmount" in opened.payload).toBe(false);
+      const assertProof = async (payment: typeof opened, amount: string) => {
+        const proof = payment.payload.authorization!;
+        expect(proof.format).toBe(format === "text-v1" ? format : undefined);
+        expect(proof.authorizedAmount).toBe(amount);
+        expect(await verifyBatchAuthorization(proof, operator.address)).toBe(true);
+      };
+      await assertProof(opened, "1000");
       const channelId = opened.payload.authorization!.channelId;
       const signature = await signVoucher(operator, {
         channelId,
@@ -158,6 +171,7 @@ describe("batch client lifecycle", () => {
         /pending request/,
       );
       expect(first.payload).toMatchObject({ type: "authorization" });
+      await assertProof(first, "1000");
       if (first.payload.type !== "authorization") {
         throw new Error("expected server-mode authorization payload");
       }
@@ -202,6 +216,18 @@ describe("batch client lifecycle", () => {
         settleResponse: await response(900n, 300n, 1_200n),
       } as never);
       expect([...records.values()][0]).toMatchObject({ chargedCumulativeAmount: "1200" });
+      const topUpRequirements = { ...serverRequirements, amount: "2000" };
+      const topUp = await client.createPaymentPayload(2, topUpRequirements);
+      expect(topUp.payload).toMatchObject({ type: "deposit" });
+      await assertProof(topUp, "2000");
+      await client.schemeHooks.onPaymentResponse!({
+        paymentPayload: { accepted: topUpRequirements, ...topUp },
+        requirements: topUpRequirements,
+        settleResponse: await response(1_200n, 2_000n, 3_200n),
+      } as never);
+      const refund = await client.createRefundPayload(2, serverRequirements);
+      expect(refund.payload).toMatchObject({ type: "refund" });
+      await assertProof(refund, "0");
     },
   );
 

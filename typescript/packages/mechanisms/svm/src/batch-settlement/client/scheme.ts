@@ -67,6 +67,8 @@ import type {
   ResolvedTerms,
 } from "./types";
 
+import { resolveBatchAuthorizationFormat } from "../authorization";
+
 /** A serializable, confirmed client channel allocation. */
 export interface BatchClientChannelRecord {
   channelConfig: OpenChannel["tracker"]["channelConfig"];
@@ -233,6 +235,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
                   await credentialFor("server", existing.tracker, charge, {
                     requestId,
                     expiresAt: authorizationExpiresAt,
+                    format: terms.authorizationFormat,
                   })
                 ).authorization,
                 channelConfig: existing.tracker.channelConfig,
@@ -284,6 +287,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
           ? await credentialFor("server", existing.tracker, charge, {
               requestId: topUpRequestId,
               expiresAt: authorizationExpiresAt,
+              format: terms.authorizationFormat,
             })
           : await credentialFor("client", existing.tracker, charge);
       const payment: PendingPayment = {
@@ -352,6 +356,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       tokenProgram: terms.tokenProgram,
       withdrawDelay: terms.withdrawDelay,
       voucherSigner: terms.voucherSigner,
+      authorizationFormat: terms.authorizationFormat,
       ...(terms.voucherSigner === "server" ? { authorizationExpiresAt } : {}),
       ...(terms.operator ? { operator: terms.operator } : {}),
     });
@@ -425,6 +430,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       ? await credentialFor("server", existing.tracker, 0n, {
           requestId: crypto.randomUUID(),
           expiresAt,
+          format: terms.authorizationFormat,
         })
       : await credentialFor("client", existing.tracker, 0n, undefined, true);
     return {
@@ -948,17 +954,13 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     cached?: OpenChannel,
   ): Promise<ResolvedTerms> {
     if (cached?.tracker.channelConfig.voucherSigner === "server") {
-      const clientProbed: PaymentRequirements = {
-        ...probed,
-        extra: {
-          ...probed.extra,
-          operator: undefined,
-          voucherSigner: "client",
-        },
-      };
-      const terms = await this.resolveTerms(clientProbed);
+      const authorizationFormat = resolveBatchAuthorizationFormat(
+        probed.extra?.authorizationFormat,
+      );
+      const terms = await this.resolveTerms(clientSignedRefundRequirements(probed));
       return {
         ...terms,
+        authorizationFormat,
         operator: cached.tracker.channelConfig.payerAuthorizer,
         voucherSigner: "server",
       };
@@ -1101,6 +1103,10 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     if (voucherSigner !== "client" && voucherSigner !== "server") {
       throw new Error('extra.voucherSigner must be "client" or "server"');
     }
+    const authorizationFormat = resolveBatchAuthorizationFormat(extra.authorizationFormat);
+    if (voucherSigner !== "server" && authorizationFormat !== "binary") {
+      throw new Error("text authorization requires server-signed channels");
+    }
     const operator = extra.operator;
     if (voucherSigner === "server" && (typeof operator !== "string" || operator.length === 0)) {
       throw new Error("extra.operator is required for operator voucher signing");
@@ -1120,6 +1126,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       tokenProgram,
       withdrawDelay,
       voucherSigner,
+      authorizationFormat,
       ...(typeof operator === "string" ? { operator } : {}),
       ...(trust ? { trust } : {}),
     };

@@ -7,6 +7,8 @@ import {
 } from "@x402/core/http";
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 
+import { resolveBatchAuthorizationFormat } from "../authorization";
+import type { BatchAuthorizationFormat } from "../types";
 import { BatchError } from "../errors";
 import { BATCH_SETTLEMENT_SCHEME, isBatchPayload, type BatchChannelConfig } from "../types";
 
@@ -47,8 +49,9 @@ export function alignRefundRequirements(
       },
     };
   }
-  const { operator: _operator, ...clientExtra } = extra ?? {};
+  const { operator: _operator, authorizationFormat: _format, ...clientExtra } = extra ?? {};
   void _operator;
+  void _format;
   return { ...probed, extra: { ...clientExtra, voucherSigner: "client" } };
 }
 
@@ -83,24 +86,36 @@ function batchSolanaAccepts(accepts: readonly PaymentRequirements[]): PaymentReq
  * @param accepts - Every accept from the unpaid 402
  * @param channelConfig - Channel configuration carried by the refund payload
  * @param probed - First Solana batch accept from the probe, for single-accept fallback
+ * @param format - Actual format of the refund payer proof, when server-signed
  * @returns The advertised requirement to bind in PAYMENT-SIGNATURE
  */
 export function selectRefundAccept(
   accepts: readonly PaymentRequirements[],
   channelConfig: BatchChannelConfig,
   probed?: PaymentRequirements,
+  format?: BatchAuthorizationFormat,
 ): PaymentRequirements {
   const mode = channelConfig.voucherSigner ?? "client";
   const match = batchSolanaAccepts(accepts).find(accept => {
     const signer = accept.extra?.voucherSigner ?? "client";
     if (signer !== mode) return false;
+    if (
+      format !== undefined &&
+      resolveBatchAuthorizationFormat(accept.extra?.authorizationFormat) !== format
+    )
+      return false;
     if (mode === "server") {
       return accept.extra?.operator === channelConfig.payerAuthorizer;
     }
     return accept.extra?.operator === undefined;
   });
   if (match) return match;
-  if (probed) return alignRefundRequirements(probed, channelConfig);
+  if (
+    probed &&
+    (format === undefined ||
+      resolveBatchAuthorizationFormat(probed.extra?.authorizationFormat) === format)
+  )
+    return alignRefundRequirements(probed, channelConfig);
   throw new Error(`no ${mode}-signed batch-settlement accept advertised for refund`);
 }
 
@@ -198,7 +213,14 @@ export async function refundBatchChannel(
     if (!isBatchPayload(raw) || raw.type !== "refund") {
       throw new Error("refund builder must return a batch-settlement refund payload");
     }
-    const accepted = selectRefundAccept(probed.accepts, raw.channelConfig, probed.requirements);
+    const accepted = selectRefundAccept(
+      probed.accepts,
+      raw.channelConfig,
+      probed.requirements,
+      raw.channelConfig.voucherSigner === "server"
+        ? (raw.authorization?.format ?? "binary")
+        : undefined,
+    );
     const response = await fetchImpl(url, {
       headers: {
         "PAYMENT-SIGNATURE": encodePaymentSignatureHeader({
