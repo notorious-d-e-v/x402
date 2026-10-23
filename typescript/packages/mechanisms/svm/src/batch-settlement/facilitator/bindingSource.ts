@@ -41,6 +41,8 @@ export interface BatchSvmFacilitatorConfig {
         | undefined
       >)
     | undefined;
+  /** Explicitly enabled payer proof formats. Omitted means binary only. */
+  authorizationFormats?: readonly import("../types").BatchAuthorizationFormat[] | undefined;
   /**
    * Durable record of pending signatures and completed operation outcomes, so
    * retries — including after a restart — reconcile instead of rebroadcasting.
