@@ -439,19 +439,29 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     // Exhaust cached/stored channels before scanning. Reuse one payer-account
     // snapshot for every candidate in this refund, rather than scanning per accept.
     const passes = this.config.discoverChannels === false ? [false] : [false, true];
+    let lookupFailure: { error: unknown } | undefined;
     for (const discover of passes) {
       for (const candidate of candidates) {
-        const cached = this.findCachedChannelForRoute(candidate);
-        located = await this.locateRefundChannel(candidate, cached, {
-          discover,
-          discoveryCache,
-          mintCache,
-        });
+        try {
+          const cached = this.findCachedChannelForRoute(candidate);
+          located = await this.locateRefundChannel(candidate, cached, {
+            discover,
+            discoveryCache,
+            mintCache,
+          });
+        } catch (error) {
+          // A malformed later accept must not prevent discovery for an earlier
+          // compatible one. Preserve the first error if no channel can be found.
+          lookupFailure ??= { error };
+        }
         if (located) break;
       }
       if (located) break;
     }
-    if (!located) throw new NoBatchChannelToRefundError();
+    if (!located) {
+      if (lookupFailure) throw lookupFailure.error;
+      throw new NoBatchChannelToRefundError();
+    }
     const { existing } = located;
     // A probe may list client mode first even when the open channel uses server
     // mode. Select its actual advertised format before prompting the wallet.
@@ -1163,6 +1173,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       mintPromise = fetchMint(rpc, requirements.asset as Address);
       mintCache?.set(mintKey, mintPromise);
     }
+    // A failed snapshot also belongs to this build. All candidates share the
+    // same route asset; a later refund attempt gets a fresh map and can retry.
     const mint = await mintPromise;
     if (mint.programAddress.toString() !== tokenProgram) {
       throw new Error("extra.tokenProgram does not own requirements.asset");
