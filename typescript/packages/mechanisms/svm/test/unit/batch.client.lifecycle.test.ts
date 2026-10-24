@@ -160,6 +160,7 @@ describe("batch client lifecycle", () => {
           channelId: RECEIVER,
           chargedCumulativeAmount: "1000",
           deposit: "5000",
+          hasConfirmedState: true,
         });
       } else {
         internals(client).channels.set(key, {
