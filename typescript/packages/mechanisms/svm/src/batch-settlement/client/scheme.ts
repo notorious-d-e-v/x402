@@ -65,6 +65,9 @@ import type {
 
 import { resolveBatchAuthorizationFormat } from "../authorization";
 
+type ChannelDiscoveryCache = Map<string, ReturnType<typeof discoverChannelsByPayer>>;
+type RefundLookupOptions = { discover: boolean; discoveryCache: ChannelDiscoveryCache };
+
 /** A serializable, confirmed client channel allocation. */
 export interface BatchClientChannelRecord {
   channelConfig: OpenChannel["tracker"]["channelConfig"];
@@ -415,9 +418,15 @@ export class BatchSvmScheme implements SchemeNetworkClient {
           accept.extra.authorizationFormat === "text-v1"),
     ) ?? [requirements];
     let located: Awaited<ReturnType<BatchSvmScheme["locateRefundChannel"]>> = undefined;
-    for (const candidate of candidates) {
-      const cached = this.findCachedChannelForRoute(candidate);
-      located = await this.locateRefundChannel(candidate, cached);
+    const discoveryCache: ChannelDiscoveryCache = new Map();
+    // Exhaust cached/stored channels before scanning. Reuse one payer-account
+    // snapshot for every candidate in this refund, rather than scanning per accept.
+    for (const discover of [false, true]) {
+      for (const candidate of candidates) {
+        const cached = this.findCachedChannelForRoute(candidate);
+        located = await this.locateRefundChannel(candidate, cached, { discover, discoveryCache });
+        if (located) break;
+      }
       if (located) break;
     }
     if (!located) throw new NoBatchChannelToRefundError();
@@ -570,10 +579,12 @@ export class BatchSvmScheme implements SchemeNetworkClient {
    * @param terms.receiverAuthorizer
    * @param terms.voucherSigner
    * @param terms.operator
+   * @param cache - Optional payer-scan snapshot shared within one refund
    */
   private async discoverChannel(
     requirements: PaymentRequirements,
     terms: ResolvedTerms,
+    cache?: ChannelDiscoveryCache,
   ): Promise<OpenChannel | undefined> {
     if (this.config.discoverChannels === false) return undefined;
     const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
@@ -587,7 +598,12 @@ export class BatchSvmScheme implements SchemeNetworkClient {
         .send()) as never;
     let found;
     try {
-      found = await discoverChannelsByPayer(scan, this.signer.address);
+      let snapshot = cache?.get(requirements.network);
+      if (!snapshot) {
+        snapshot = discoverChannelsByPayer(scan, this.signer.address);
+        cache?.set(requirements.network, snapshot);
+      }
+      found = await snapshot;
     } catch {
       // Discovery is an optimization over opening a new channel, never a
       // precondition for paying.
@@ -982,7 +998,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
 
   private async locateRefundChannel(
     requirements: PaymentRequirements,
-    cached?: OpenChannel,
+    cached: OpenChannel | undefined,
+    options: RefundLookupOptions,
   ): Promise<
     | { existing: OpenChannel; lookupRequirements: PaymentRequirements; terms: ResolvedTerms }
     | undefined
@@ -996,7 +1013,8 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     }
 
     let terms = await this.resolveRefundTerms(searchLookup, cached);
-    let existing = (await this.loadRefundChannel(searchLookup, terms, cached)) ?? undefined;
+    let existing =
+      (await this.loadRefundChannel(searchLookup, terms, cached, options)) ?? undefined;
     if (existing) {
       if (!cached) {
         lookupRequirements = this.requirementsForRefund(requirements, existing);
@@ -1008,7 +1026,12 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     if (!cached && (requirements.extra?.voucherSigner ?? "client") === "server") {
       try {
         const serverTerms = await this.resolveTerms(requirements);
-        const serverChannel = await this.loadRefundChannel(requirements, serverTerms);
+        const serverChannel = await this.loadRefundChannel(
+          requirements,
+          serverTerms,
+          undefined,
+          options,
+        );
         if (serverChannel) {
           lookupRequirements = this.requirementsForRefund(requirements, serverChannel);
           terms = await this.resolveRefundTerms(lookupRequirements, serverChannel);
@@ -1026,12 +1049,15 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     lookupRequirements: PaymentRequirements,
     terms: ResolvedTerms,
     cached?: OpenChannel,
+    options?: RefundLookupOptions,
   ): Promise<OpenChannel | null> {
     const key = this.channelKey(lookupRequirements, terms.feePayer, terms.withdrawDelay);
     return (
       (await this.loadChannel(key)) ??
       cached ??
-      (await this.discoverChannel(lookupRequirements, terms)) ??
+      (options?.discover !== false
+        ? await this.discoverChannel(lookupRequirements, terms, options?.discoveryCache)
+        : undefined) ??
       null
     );
   }
