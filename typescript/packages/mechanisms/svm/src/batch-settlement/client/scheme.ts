@@ -66,7 +66,12 @@ import type {
 import { resolveBatchAuthorizationFormat } from "../authorization";
 
 type ChannelDiscoveryCache = Map<string, ReturnType<typeof discoverChannelsByPayer>>;
-type RefundLookupOptions = { discover: boolean; discoveryCache: ChannelDiscoveryCache };
+type MintCache = Map<string, ReturnType<typeof fetchMint>>;
+type RefundLookupOptions = {
+  discover: boolean;
+  discoveryCache: ChannelDiscoveryCache;
+  mintCache: MintCache;
+};
 
 /** A serializable, confirmed client channel allocation. */
 export interface BatchClientChannelRecord {
@@ -419,12 +424,18 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     ) ?? [requirements];
     let located: Awaited<ReturnType<BatchSvmScheme["locateRefundChannel"]>> = undefined;
     const discoveryCache: ChannelDiscoveryCache = new Map();
+    const mintCache: MintCache = new Map();
     // Exhaust cached/stored channels before scanning. Reuse one payer-account
     // snapshot for every candidate in this refund, rather than scanning per accept.
-    for (const discover of [false, true]) {
+    const passes = this.config.discoverChannels === false ? [false] : [false, true];
+    for (const discover of passes) {
       for (const candidate of candidates) {
         const cached = this.findCachedChannelForRoute(candidate);
-        located = await this.locateRefundChannel(candidate, cached, { discover, discoveryCache });
+        located = await this.locateRefundChannel(candidate, cached, {
+          discover,
+          discoveryCache,
+          mintCache,
+        });
         if (located) break;
       }
       if (located) break;
@@ -437,7 +448,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       ? selectRefundAccept(candidates, existing.tracker.channelConfig)
       : located.lookupRequirements;
     const terms = options?.accepts
-      ? await this.resolveRefundTerms(lookupRequirements, existing)
+      ? await this.resolveRefundTerms(lookupRequirements, existing, mintCache)
       : located.terms;
     const blockhash = options?.withTransaction
       ? await resolveBlockhash(
@@ -976,16 +987,18 @@ export class BatchSvmScheme implements SchemeNetworkClient {
    *
    * @param probed
    * @param cached
+   * @param mintCache - Mint snapshot shared only within this refund build
    */
   private async resolveRefundTerms(
     probed: PaymentRequirements,
     cached?: OpenChannel,
+    mintCache?: MintCache,
   ): Promise<ResolvedTerms> {
     if (cached?.tracker.channelConfig.voucherSigner === "server") {
       const authorizationFormat = resolveBatchAuthorizationFormat(
         probed.extra?.authorizationFormat,
       );
-      const terms = await this.resolveTerms(clientSignedRefundRequirements(probed));
+      const terms = await this.resolveTerms(clientSignedRefundRequirements(probed), mintCache);
       return {
         ...terms,
         authorizationFormat,
@@ -993,7 +1006,7 @@ export class BatchSvmScheme implements SchemeNetworkClient {
         voucherSigner: "server",
       };
     }
-    return this.resolveTerms(probed);
+    return this.resolveTerms(probed, mintCache);
   }
 
   private async locateRefundChannel(
@@ -1012,20 +1025,20 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       searchLookup = clientSignedRefundRequirements(searchLookup);
     }
 
-    let terms = await this.resolveRefundTerms(searchLookup, cached);
+    let terms = await this.resolveRefundTerms(searchLookup, cached, options.mintCache);
     let existing =
       (await this.loadRefundChannel(searchLookup, terms, cached, options)) ?? undefined;
     if (existing) {
       if (!cached) {
         lookupRequirements = this.requirementsForRefund(requirements, existing);
-        terms = await this.resolveRefundTerms(lookupRequirements, existing);
+        terms = await this.resolveRefundTerms(lookupRequirements, existing, options.mintCache);
       }
       return { existing, lookupRequirements, terms };
     }
 
     if (!cached && (requirements.extra?.voucherSigner ?? "client") === "server") {
       try {
-        const serverTerms = await this.resolveTerms(requirements);
+        const serverTerms = await this.resolveTerms(requirements, options.mintCache);
         const serverChannel = await this.loadRefundChannel(
           requirements,
           serverTerms,
@@ -1034,7 +1047,11 @@ export class BatchSvmScheme implements SchemeNetworkClient {
         );
         if (serverChannel) {
           lookupRequirements = this.requirementsForRefund(requirements, serverChannel);
-          terms = await this.resolveRefundTerms(lookupRequirements, serverChannel);
+          terms = await this.resolveRefundTerms(
+            lookupRequirements,
+            serverChannel,
+            options.mintCache,
+          );
           return { existing: serverChannel, lookupRequirements, terms };
         }
       } catch (error) {
@@ -1100,7 +1117,10 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     ].join(":");
   }
 
-  private async resolveTerms(requirements: PaymentRequirements): Promise<ResolvedTerms> {
+  private async resolveTerms(
+    requirements: PaymentRequirements,
+    mintCache?: MintCache,
+  ): Promise<ResolvedTerms> {
     const extra = requirements.extra;
     if (!extra) throw new Error("requirements.extra is required");
     if (extra.paymentFlow !== undefined && extra.paymentFlow !== "authorization") {
@@ -1125,7 +1145,13 @@ export class BatchSvmScheme implements SchemeNetworkClient {
       "extra.tokenProgram is not a supported SPL token program",
     );
     const rpc = createRpcClient(requirements.network, this.config.rpcUrl);
-    const mint = await fetchMint(rpc, requirements.asset as Address);
+    const mintKey = `${requirements.network}:${requirements.asset}`;
+    let mintPromise = mintCache?.get(mintKey);
+    if (!mintPromise) {
+      mintPromise = fetchMint(rpc, requirements.asset as Address);
+      mintCache?.set(mintKey, mintPromise);
+    }
+    const mint = await mintPromise;
     if (mint.programAddress.toString() !== tokenProgram) {
       throw new Error("extra.tokenProgram does not own requirements.asset");
     }

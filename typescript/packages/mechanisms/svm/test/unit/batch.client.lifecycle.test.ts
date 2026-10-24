@@ -234,6 +234,7 @@ describe("batch client lifecycle", () => {
   );
 
   it("scans once per refund after exhausting saved channels across repeated accepts", async () => {
+    vi.mocked(fetchMint).mockClear();
     const operator = await generateKeyPairSigner();
     const getProgramAccounts = vi.fn(() => ({ send: vi.fn().mockResolvedValue([]) }));
     vi.mocked(createRpcClient).mockReturnValue({ getProgramAccounts } as never);
@@ -246,10 +247,13 @@ describe("batch client lifecycle", () => {
     });
     const text = { ...binary, extra: { ...binary.extra, authorizationFormat: "text-v1" } };
     const accepts = [requirements(), binary, text, requirements(), binary, text];
-    await expect(client.createRefundPayload(2, accepts[0], { accepts })).rejects.toBeInstanceOf(
-      NoBatchChannelToRefundError,
-    );
-    expect(getProgramAccounts).toHaveBeenCalledTimes(1);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await expect(client.createRefundPayload(2, accepts[0], { accepts })).rejects.toBeInstanceOf(
+        NoBatchChannelToRefundError,
+      );
+      expect(getProgramAccounts).toHaveBeenCalledTimes(attempt);
+      expect(fetchMint).toHaveBeenCalledTimes(attempt);
+    }
   });
 
   it.each(
