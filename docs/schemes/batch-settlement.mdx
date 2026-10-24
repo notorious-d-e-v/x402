@@ -872,3 +872,5 @@ Register `BatchSvmScheme` for `solana:*`. The SDK opens or tops up the channel o
 * [Payment schemes overview](/schemes/overview)
 * [Exact](/schemes/exact)
 * [Upto](/schemes/upto)
+
+The browser client selects the channel’s advertised refund format before prompting the wallet, including after a restart. Native off-chain signing remains a future compatibility option: the tested installed MetaMask and Phantom wallets did not expose `solana:signOffchainMessage`, and an OCMS v1 envelope through `solana:signMessage` failed. See the [browser diagnostic and signing evidence](https://github.com/x402-foundation/x402/tree/main/examples/typescript/clients/solana-batch-wallet). Signing tests do not establish full payment lifecycle compatibility.

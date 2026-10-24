@@ -97,13 +97,22 @@ export function selectRefundAccept(
 ): PaymentRequirements {
   const mode = channelConfig.voucherSigner ?? "client";
   const match = batchSolanaAccepts(accepts).find(accept => {
-    const signer = accept.extra?.voucherSigner ?? "client";
-    if (signer !== mode) return false;
     if (
-      format !== undefined &&
-      resolveBatchAuthorizationFormat(accept.extra?.authorizationFormat) !== format
+      accept.asset !== channelConfig.token ||
+      accept.payTo !== channelConfig.receiver ||
+      (probed && accept.network !== probed.network)
     )
       return false;
+    const signer = accept.extra?.voucherSigner ?? "client";
+    if (signer !== mode) return false;
+    let advertisedFormat: BatchAuthorizationFormat;
+    try {
+      advertisedFormat = resolveBatchAuthorizationFormat(accept.extra?.authorizationFormat);
+    } catch {
+      // A future format must not hide a later compatible accept.
+      return false;
+    }
+    if (format !== undefined && advertisedFormat !== format) return false;
     if (mode === "server") {
       return accept.extra?.operator === channelConfig.payerAuthorizer;
     }
@@ -131,6 +140,8 @@ export interface BatchRefundOptions {
 export interface RefundPayloadOptions {
   /** Include a payer-signed `request_close` for a facilitator that cannot close cooperatively. */
   withTransaction?: boolean | undefined;
+  /** All advertised accepts, so the channel's requirements are selected before signing. */
+  accepts?: readonly PaymentRequirements[] | undefined;
 }
 
 /** Builds the payer-signed close payload for a set of requirements. */
@@ -208,7 +219,10 @@ export async function refundBatchChannel(
     : await probeBatchRequirements(url, fetchImpl);
 
   const send = async (withTransaction: boolean) => {
-    const payload = await build(probed.x402Version, probed.requirements, { withTransaction });
+    const payload = await build(probed.x402Version, probed.requirements, {
+      withTransaction,
+      accepts: probed.accepts,
+    });
     const raw = payload.payload;
     if (!isBatchPayload(raw) || raw.type !== "refund") {
       throw new Error("refund builder must return a batch-settlement refund payload");
