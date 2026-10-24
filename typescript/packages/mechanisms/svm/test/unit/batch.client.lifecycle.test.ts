@@ -116,6 +116,8 @@ describe("batch client lifecycle", () => {
     async ({ restart, serverFirst, forcedClose }) => {
       const operator = await generateKeyPairSigner();
       const { records, storage } = memoryStorage();
+      const getProgramAccounts = vi.fn(() => ({ send: vi.fn().mockResolvedValue([]) }));
+      vi.mocked(createRpcClient).mockReturnValue({ getProgramAccounts } as never);
       const prompts: string[] = [];
       const wallet = {
         ...payer,
@@ -130,7 +132,6 @@ describe("batch client lifecycle", () => {
       };
       const client = new BatchSvmScheme(wallet, {
         channelStorage: storage,
-        discoverChannels: false,
         serverSignedChannelsPolicy: { allowedOperators: [operator.address] },
       });
       const clientRequirements = requirements();
@@ -228,8 +229,28 @@ describe("batch client lifecycle", () => {
       expect(prompts).toEqual(forcedClose ? ["text-v1", "text-v1"] : ["text-v1"]);
       expect(sends).toBe(forcedClose ? 2 : 1);
       expect(fetchImpl).toHaveBeenCalledTimes(forcedClose ? 3 : 2);
+      expect(getProgramAccounts).not.toHaveBeenCalled();
     },
   );
+
+  it("scans once per refund after exhausting saved channels across repeated accepts", async () => {
+    const operator = await generateKeyPairSigner();
+    const getProgramAccounts = vi.fn(() => ({ send: vi.fn().mockResolvedValue([]) }));
+    vi.mocked(createRpcClient).mockReturnValue({ getProgramAccounts } as never);
+    const client = new BatchSvmScheme(payer, {
+      channelStorage: memoryStorage().storage,
+      serverSignedChannelsPolicy: { allowedOperators: [operator.address] },
+    });
+    const binary = requirements({
+      extra: { ...requirements().extra, voucherSigner: "server", operator: operator.address },
+    });
+    const text = { ...binary, extra: { ...binary.extra, authorizationFormat: "text-v1" } };
+    const accepts = [requirements(), binary, text, requirements(), binary, text];
+    await expect(client.createRefundPayload(2, accepts[0], { accepts })).rejects.toBeInstanceOf(
+      NoBatchChannelToRefundError,
+    );
+    expect(getProgramAccounts).toHaveBeenCalledTimes(1);
+  });
 
   it.each(
     [false, true].flatMap(restart =>
