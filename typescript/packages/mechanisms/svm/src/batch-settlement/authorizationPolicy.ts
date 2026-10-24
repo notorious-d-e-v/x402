@@ -15,7 +15,12 @@ export function assertBatchAuthorizationFormat(
   requirements: PaymentRequirements,
   allowed: readonly BatchAuthorizationFormat[] = ["binary"],
 ): void {
-  const expected = resolveBatchAuthorizationFormat(requirements.extra?.authorizationFormat);
+  let expected: BatchAuthorizationFormat;
+  try {
+    expected = resolveBatchAuthorizationFormat(requirements.extra?.authorizationFormat);
+  } catch {
+    throw new Error(`${BatchError.VOUCHER_SIGNATURE}: unsupported batch authorization format`);
+  }
   if (!allowed.includes(expected))
     throw new Error(`${BatchError.VOUCHER_SIGNATURE}: authorization format is not enabled`);
   if (payload.channelConfig.voucherSigner !== "server") {

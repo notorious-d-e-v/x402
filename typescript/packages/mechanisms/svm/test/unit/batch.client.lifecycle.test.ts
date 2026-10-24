@@ -1,6 +1,11 @@
 import { generateKeyPairSigner } from "@solana/kit";
 import { fetchMint } from "@solana-program/token-2022";
 import type { PaymentRequirements } from "@x402/core/types";
+import {
+  decodePaymentSignatureHeader,
+  encodePaymentRequiredHeader,
+  encodePaymentResponseHeader,
+} from "@x402/core/http";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyBatchAuthorization } from "../../src/batch-settlement/authorization";
@@ -100,6 +105,132 @@ function internals(client: BatchSvmScheme): ClientInternals {
 }
 
 describe("batch client lifecycle", () => {
+  it.each(
+    [false, true].flatMap(restart =>
+      [false, true].flatMap(serverFirst =>
+        [false, true].map(forcedClose => ({ restart, serverFirst, forcedClose })),
+      ),
+    ),
+  )(
+    "selects readable refund requirements before signing (restart=$restart, serverFirst=$serverFirst, forcedClose=$forcedClose)",
+    async ({ restart, serverFirst, forcedClose }) => {
+      const operator = await generateKeyPairSigner();
+      const { records, storage } = memoryStorage();
+      const prompts: string[] = [];
+      const wallet = {
+        ...payer,
+        signMessages: async (...args: Parameters<typeof payer.signMessages>) => {
+          const readable = new TextDecoder()
+            .decode(args[0][0].content)
+            .startsWith("x402-batch-authorization-text-v1\n");
+          prompts.push(readable ? "text-v1" : "binary");
+          if (!readable) throw new Error("wallet fixture rejects binary messages");
+          return payer.signMessages(...args);
+        },
+      };
+      const client = new BatchSvmScheme(wallet, {
+        channelStorage: storage,
+        discoverChannels: false,
+        serverSignedChannelsPolicy: { allowedOperators: [operator.address] },
+      });
+      const clientRequirements = requirements();
+      const serverRequirements = requirements({
+        extra: {
+          ...clientRequirements.extra,
+          voucherSigner: "server",
+          operator: operator.address,
+          authorizationFormat: "text-v1",
+        },
+      });
+      const config: BatchChannelConfig = {
+        openSlot: 123,
+        payer: payer.address,
+        payerAuthorizer: operator.address,
+        receiver: RECEIVER,
+        receiverAuthorizer: receiverAuthorizer.address,
+        salt: "0",
+        token: MINT,
+        voucherSigner: "server",
+        withdrawDelay: 900,
+      };
+      const key = internals(client).channelKey(serverRequirements, feePayer.address, 900);
+      if (restart) {
+        records.set(key, {
+          channelConfig: config,
+          channelId: RECEIVER,
+          chargedCumulativeAmount: "1000",
+          deposit: "5000",
+        });
+      } else {
+        internals(client).channels.set(key, {
+          deposit: 5000n,
+          tracker: new BatchChannelTracker(RECEIVER, config, wallet, 1000n),
+        });
+      }
+      const unknown = {
+        ...serverRequirements,
+        extra: { ...serverRequirements.extra, authorizationFormat: "future-format" },
+      };
+      const accepts = serverFirst
+        ? [unknown, serverRequirements, clientRequirements]
+        : [clientRequirements, unknown, serverRequirements];
+      let sends = 0;
+      const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const credential = new Headers(init?.headers).get("PAYMENT-SIGNATURE");
+        if (!credential) {
+          return new Response("", {
+            status: 402,
+            headers: {
+              "PAYMENT-REQUIRED": encodePaymentRequiredHeader({
+                x402Version: 2,
+                resource: { url: "https://example.test/paid", description: "", mimeType: "" },
+                accepts,
+              }),
+            },
+          });
+        }
+        sends++;
+        const payment = decodePaymentSignatureHeader(credential);
+        expect(payment.accepted).toEqual(serverRequirements);
+        const proof = (
+          payment.payload as { authorization: Parameters<typeof verifyBatchAuthorization>[0] }
+        ).authorization;
+        expect(proof.format).toBe("text-v1");
+        expect(proof.authorizedAmount).toBe("0");
+        expect(await verifyBatchAuthorization(proof, operator.address)).toBe(true);
+        if (forcedClose && sends === 1) {
+          return new Response("", {
+            status: 402,
+            headers: {
+              "PAYMENT-RESPONSE": encodePaymentResponseHeader({
+                success: false,
+                network: NETWORK,
+                transaction: "",
+                errorReason: "invalid_batch_settlement_svm_receiver_binding_unavailable",
+              }),
+            },
+          });
+        }
+        if (forcedClose) expect(payment.payload).toHaveProperty("transaction");
+        return new Response("", {
+          headers: {
+            "PAYMENT-RESPONSE": encodePaymentResponseHeader({
+              success: true,
+              network: NETWORK,
+              transaction: "offline-close",
+            }),
+          },
+        });
+      });
+      await expect(
+        client.refund("https://example.test/paid", { fetch: fetchImpl }),
+      ).resolves.toMatchObject({ success: true });
+      expect(prompts).toEqual(forcedClose ? ["text-v1", "text-v1"] : ["text-v1"]);
+      expect(sends).toBe(forcedClose ? 2 : 1);
+      expect(fetchImpl).toHaveBeenCalledTimes(forcedClose ? 3 : 2);
+    },
+  );
+
   it.each(
     [false, true].flatMap(restart =>
       (["binary", "text-v1"] as const).map(format => ({ restart, format })),

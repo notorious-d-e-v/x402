@@ -28,7 +28,7 @@ const scheme = new BatchSvmScheme({
 });
 ```
 
-The resource server refuses to advertise the text format if its facilitator does not advertise support. Each validator checks the proof format against the accepted requirements. Binary remains the default, and unknown formats are rejected.
+Resource-server requirement initialization throws if its facilitator does not advertise the configured format; it does not silently fall back to binary. Each validator checks the proof format against the accepted requirements. Binary remains the default, and unknown formats are rejected.
 
 ## Connect a browser signer to the shared client
 
@@ -51,7 +51,7 @@ function batchClient(wallet: TransactionSigner & MessageSigner, trustedOperator:
 
 Register this scheme with your normal x402 client for the chosen Solana network. Obtain the trusted operator key out of band: a readable prompt does not remove the operator's existing authority over the escrow. The shared client uses the format advertised in `extra.authorizationFormat` for deposit, top-up, steady-state authorization, and refund. Custom controllers can pass that same format to `buildDepositPayload({ authorizationFormat, ... })` and `tracker.authorization(requestId, amount, expiry, authorizationFormat)`.
 
-`toBatchClientSigner` supports Kit partial and modifying message signers. It forwards independent copies of the message and verifies the Ed25519 signature against the original bytes. Both a changed returned message and a signature over different bytes cause an error. There is no automatic text retry following a failed binary prompt.
+`toBatchClientSigner` supports Kit partial and modifying message signers. It exposes only the verified `signMessages` method for message signing, forwards independent copies of the message, and verifies the Ed25519 signature against the original bytes. Both a changed returned message and a signature over different bytes cause an error. There is no automatic text retry following a failed binary prompt.
 
 ## Run the expired-proof diagnostic
 
@@ -73,7 +73,7 @@ The capture records original and returned bytes, input after the wallet call, si
 
 | Wallet | Existing binary payer proof | Draft readable proof |
 | --- | --- | --- |
-| MetaMask 13.53.0 | [Reporter capture](https://github.com/MetaMask/internal-snaps/issues/506) independently verifies only against the lossy UTF-8 candidate, while returned bytes equal input. Official release locks Snap 7.0.0; runtime Snap version unqueried. | Passes the source-behavior simulation; installed-wallet test pending. |
+| MetaMask 13.53.0 (Blockrun binary capture) | [Reporter capture](https://github.com/MetaMask/internal-snaps/issues/506) independently verifies only against the lossy UTF-8 candidate, while returned bytes equal input. Official release locks Snap 7.0.0; runtime Snap version unqueried. | A separate installed-wallet capture below passes; versions for that capture remain unconfirmed. |
 | Solflare 2.40.1 | Reporter says original-byte signing works, with an unreadable-message warning. Independent capture pending. | Installed-wallet test pending. |
 | Phantom 26.34.0 (Chrome) | Local canonical binary proof rejected through Wallet Standard and the direct provider with a hex display hint. | Live expired text-v1 proof signs with unchanged bytes; independent Node crypto verification passes. |
 | Phantom 25.16.0 (Firefox) | Local Wallet Standard test rejects the canonical binary proof with `You cannot sign solana transactions using sign message`. | Local expired-proof capture passes; returned bytes match the original and the signature independently verifies with Node crypto. |
@@ -84,3 +84,16 @@ Phantom 26.34.0 was also tested live on supported Chrome. The canonical binary p
 Phantom no longer supports Firefox; its older 25.16.0 result is retained separately from the Chrome result. See [Phantom supported platforms](https://help.phantom.com/articles/48456789393811).
 
 Wallet documentation: [Solflare signing](https://docs.solflare.com/solflare/technical/deeplinks/provider-methods/signmessage), [Backpack signing](https://docs.backpack.app/deeplinks/provider-methods/signmessage). Their `display` hint controls presentation, not a conversion of the signed proof into hex text. General signing documentation does not establish compatibility with every binary proof, extension version, hardware wallet, or adapter.
+
+## Standard off-chain envelope tests (October 23, 2026)
+
+Neither installed MetaMask nor Phantom exposed `solana:signOffchainMessage`, including after connection. Passing a Solana standard off-chain message (OCMS) v1 envelope to `solana:signMessage` did not provide a working alternative:
+
+| Installed wallet | OCMS v1 through `solana:signMessage` | Matching `text-v1` authorization |
+| --- | --- | --- |
+| MetaMask (extension/Snap versions unconfirmed for this capture) | Returned the original 437 bytes, but its signature verified only against the 459-byte lossy UTF-8 conversion. Verification against the original and returned bytes failed. | Preserved all 387 bytes; signature verified against both original and returned bytes. The authorization fields were identical to the envelope test. |
+| Phantom (extension version unconfirmed for this capture) | Rejected with `You cannot sign solana transactions using sign message`. | Earlier Chrome text-proof results are recorded separately above. |
+
+Independent Node.js Ed25519 verification confirmed the captured signatures. Every authorization expired at Unix time 1 and used a random nonexistent channel. These tests made no payment, transaction, RPC, or facilitator calls. They establish signing behavior only; exact extension/Snap versions and full payment lifecycle compatibility still require confirmation. Wallet Standard feature versions are not extension versions.
+
+Keep `text-v1` opt-in. Native off-chain signing is a future compatibility option once wallets expose a compatible feature; sending its binary envelope through `signMessage` is not a working replacement on these installed wallets. Refunds use the matching advertised accept before signing, including when client mode is listed first or channel state is restored after a restart.
