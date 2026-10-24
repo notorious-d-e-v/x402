@@ -105,6 +105,73 @@ function internals(client: BatchSvmScheme): ClientInternals {
 }
 
 describe("batch client lifecycle", () => {
+  it.each(["client-text", "missing-operator"])(
+    "does not let a later malformed %s accept hide a discoverable channel",
+    async invalidKind => {
+      const operator = await generateKeyPairSigner();
+      const valid = requirements({
+        extra: {
+          ...requirements().extra,
+          voucherSigner: "server",
+          operator: operator.address,
+          authorizationFormat: "text-v1",
+        },
+      });
+      const invalid = {
+        ...valid,
+        extra: {
+          ...valid.extra,
+          operator: undefined,
+          voucherSigner: invalidKind === "client-text" ? "client" : "server",
+        },
+      };
+      const client = new BatchSvmScheme(payer, {
+        channelStorage: memoryStorage().storage,
+        serverSignedChannelsPolicy: { allowedOperators: [operator.address] },
+      });
+      const config: BatchChannelConfig = {
+        openSlot: 123,
+        payer: payer.address,
+        payerAuthorizer: operator.address,
+        receiver: RECEIVER,
+        receiverAuthorizer: receiverAuthorizer.address,
+        salt: "0",
+        token: MINT,
+        voucherSigner: "server",
+        withdrawDelay: 900,
+      };
+      internals(client).discoverChannel = vi.fn(async (_requirements, terms) =>
+        (terms as { voucherSigner: string }).voucherSigner === "server"
+          ? { deposit: 5000n, tracker: new BatchChannelTracker(RECEIVER, config, payer, 1000n) }
+          : undefined,
+      );
+      const refund = await client.createRefundPayload(2, valid, { accepts: [valid, invalid] });
+      expect(refund.payload).toMatchObject({
+        type: "refund",
+        authorization: { format: "text-v1", authorizedAmount: "0" },
+      });
+      const proof = (
+        refund.payload as { authorization: Parameters<typeof verifyBatchAuthorization>[0] }
+      ).authorization;
+      expect(await verifyBatchAuthorization(proof, operator.address)).toBe(true);
+      vi.mocked(fetchMint).mockClear();
+      vi.mocked(fetchMint).mockRejectedValueOnce(new Error("temporary mint read failure"));
+      await expect(
+        client.createRefundPayload(2, valid, { accepts: [valid, invalid] }),
+      ).rejects.toThrow("temporary mint read failure");
+      expect(fetchMint).toHaveBeenCalledTimes(1);
+      await expect(
+        client.createRefundPayload(2, valid, { accepts: [valid, invalid] }),
+      ).resolves.toMatchObject({
+        payload: { type: "refund", authorization: { format: "text-v1" } },
+      });
+      expect(fetchMint).toHaveBeenCalledTimes(2);
+      await expect(client.createRefundPayload(2, invalid)).rejects.toThrow(
+        invalidKind === "client-text" ? /text authorization requires/ : /operator is required/,
+      );
+    },
+  );
+
   it.each(
     [false, true].flatMap(restart =>
       [false, true].flatMap(serverFirst =>
