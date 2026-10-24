@@ -176,3 +176,5 @@ The TypeScript SDK adds an opt-in `text-v1` payer-proof format and a Kit browser
 | Feature | TypeScript | Go | Python |
 |---------|------------|-----|--------|
 | spendControls (asset allowlist + USD cap) | ✅ | ✅ | ✅ |
+
+The proposed TypeScript Solana `text-v1` browser integration selects refund requirements before requesting a signature, including after channel restoration. The adapter exposes only its verified message-signing path. Installed-wallet OCMS envelope tests do not replace this opt-in format; see the [browser diagnostic evidence](https://github.com/x402-foundation/x402/tree/main/examples/typescript/clients/solana-batch-wallet#standard-off-chain-envelope-tests-october-23-2026).

@@ -12,8 +12,16 @@ import type { BatchClientSigner } from "./channel";
  */
 export function toBatchClientSigner(wallet: TransactionSigner & MessageSigner): BatchClientSigner {
   const address = wallet.address;
+  // Preserve at least one required transaction capability without spreading an
+  // unverified message method (including methods defined on a class prototype).
+  const transactions: TransactionSigner =
+    "signTransactions" in wallet
+      ? { address, signTransactions: wallet.signTransactions.bind(wallet) }
+      : "modifyAndSignTransactions" in wallet
+        ? { address, modifyAndSignTransactions: wallet.modifyAndSignTransactions.bind(wallet) }
+        : { address, signAndSendTransactions: wallet.signAndSendTransactions.bind(wallet) };
   return {
-    ...wallet,
+    ...transactions,
     address,
     ...("signTransactions" in wallet
       ? { signTransactions: wallet.signTransactions.bind(wallet) }

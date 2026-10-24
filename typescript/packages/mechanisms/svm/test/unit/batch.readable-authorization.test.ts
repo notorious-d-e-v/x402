@@ -8,6 +8,8 @@ import {
   getBase58Encoder,
   createSignableMessage,
   generateKeyPairSigner,
+  isMessageModifyingSigner,
+  isMessagePartialSigner,
   getBase58Decoder,
   getUtf8Codec,
 } from "@solana/kit";
@@ -322,6 +324,17 @@ describe("readable payer authorizations", () => {
     expect((await enabled.settle(mismatched, payment.accepted)).errorMessage).toMatch(
       /does not match/,
     );
+    const unknown = requirements("future-format" as never);
+    expect(await enabled.verify(payment, unknown)).toMatchObject({
+      isValid: false,
+      invalidReason: "invalid_batch_settlement_svm_voucher_signature",
+    });
+    expect(await enabled.settle(payment, unknown)).toMatchObject({
+      success: false,
+      errorReason: "invalid_batch_settlement_svm_voucher_signature",
+    });
+    expect(signer.getAccountInfo).not.toHaveBeenCalled();
+    expect(signer.sendTransaction).not.toHaveBeenCalled();
   });
   it("runs a readable deposit and metered authorization through merchant hooks", async () => {
     const store = new MemoryChannelStore();
@@ -390,6 +403,54 @@ describe("readable payer authorizations", () => {
 });
 
 describe("connected browser signer", () => {
+  it("binds prototype transaction and message methods to the connected wallet", async () => {
+    class Wallet {
+      readonly address = payer.address;
+      readonly #signer = payer;
+      signTransactions(...args: Parameters<typeof payer.signTransactions>) {
+        return this.#signer.signTransactions(...args);
+      }
+      async modifyAndSignMessages(messages: readonly ReturnType<typeof createSignableMessage>[]) {
+        const signatures = await this.#signer.signMessages(messages);
+        return messages.map((message, i) => ({ ...message, signatures: signatures[i] }));
+      }
+    }
+    const adapted = toBatchClientSigner(new Wallet());
+    expect("modifyAndSignMessages" in adapted).toBe(false);
+    expect("signTransactions" in adapted).toBe(true);
+    if ("signTransactions" in adapted) {
+      await expect(adapted.signTransactions([])).resolves.toEqual([]);
+    }
+    await expect(
+      adapted.signMessages([createSignableMessage(encodeBatchAuthorizationMessage(fields()))]),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("exposes only the independently verified message path to Kit dispatch", async () => {
+    const bytes = encodeBatchAuthorizationMessage({ ...fields(), format: "binary" });
+    const wallet = {
+      address: payer.address,
+      signTransactions: payer.signTransactions,
+      modifyAndSignMessages: async (
+        messages: readonly ReturnType<typeof createSignableMessage>[],
+      ) => {
+        const signatures = await payer.signMessages(
+          messages.map(message =>
+            createSignableMessage(snapConvert(new Uint8Array(message.content))),
+          ),
+        );
+        return messages.map((message, i) => ({ ...message, signatures: signatures[i] }));
+      },
+    };
+    const adapted = toBatchClientSigner(wallet);
+    expect("modifyAndSignMessages" in adapted).toBe(false);
+    expect(isMessageModifyingSigner(adapted)).toBe(false);
+    expect(isMessagePartialSigner(adapted)).toBe(true);
+    await expect(adapted.signMessages([createSignableMessage(bytes)])).rejects.toThrow(
+      /original batch/,
+    );
+  });
+
   it("rejects the actual captured MetaMask signature despite an unchanged returned message", async () => {
     const fixture = metamaskCapture;
     const original = Buffer.from(fixture.originalHex, "hex");

@@ -52,6 +52,7 @@ import {
   NoBatchChannelToRefundError,
   type RefundPayloadOptions,
   refundBatchChannel,
+  selectRefundAccept,
 } from "./refund";
 import {
   type BatchServerSignedChannelsPolicy,
@@ -414,10 +415,33 @@ export class BatchSvmScheme implements SchemeNetworkClient {
     // Fail closed before any channel work when the facilitator accepts no
     // transaction version this client can build (deposit, top-up, close).
     resolveTransactionVersion(requirements.extra);
-    const cached = this.findCachedChannelForRoute(requirements);
-    const located = await this.locateRefundChannel(requirements, cached);
+    const candidates = options?.accepts?.filter(
+      accept =>
+        accept.scheme === BATCH_SETTLEMENT_SCHEME &&
+        accept.network === requirements.network &&
+        accept.asset === requirements.asset &&
+        accept.payTo === requirements.payTo &&
+        (accept.extra?.authorizationFormat === undefined ||
+          accept.extra.authorizationFormat === "binary" ||
+          accept.extra.authorizationFormat === "text-v1"),
+    ) ?? [requirements];
+    let located: Awaited<ReturnType<BatchSvmScheme["locateRefundChannel"]>> = undefined;
+    for (const candidate of candidates) {
+      const cached = this.findCachedChannelForRoute(candidate);
+      located = await this.locateRefundChannel(candidate, cached);
+      if (located) break;
+    }
     if (!located) throw new NoBatchChannelToRefundError();
-    const { existing, lookupRequirements, terms } = located;
+    const { existing } = located;
+    // A probe may list client mode first even when the open channel uses server
+    // mode. Select its actual advertised format before prompting the wallet.
+    const lookupRequirements = options?.accepts
+      ? selectRefundAccept(candidates, existing.tracker.channelConfig)
+      : located.lookupRequirements;
+    resolveTransactionVersion(lookupRequirements.extra);
+    const terms = options?.accepts
+      ? await this.resolveRefundTerms(lookupRequirements, existing)
+      : located.terms;
     const blockhash = options?.withTransaction
       ? await resolveBlockhash(
           createRpcClient(lookupRequirements.network, this.config.rpcUrl),
