@@ -1656,9 +1656,9 @@ duplicate request from executing but is not an HTTP response-recovery protocol:
   `(channelId, requestId)` MUST be rejected with `duplicate_settlement`, or
   `invalid_batch_settlement_svm_operation_ceiling_changed` when it carries a
   different ceiling; the scheme MUST NOT rebuild or re-sign a settlement
-  response for it, or execute the handler. Applications that need to recover a resource body after a lost
-  response SHOULD use the payment identifier extension, whose lookup runs
-  before Phase 3
+  response for it, or execute the handler. Applications that need to recover
+  a resource body after a lost response SHOULD use the payment identifier
+  extension, whose lookup runs before Phase 3
   ([Recovering a Lost Response](../../extensions/payment_identifier.md#recovering-a-lost-response)).
   Returning the response it stored is not a scheme replay. A resource server
   that returns stored responses for server-mode requests MUST return one only
@@ -1666,8 +1666,12 @@ duplicate request from executing but is not an HTTP response-recovery protocol:
   signature and expiry checks. It MUST store the `SettlementResponse` exactly
   as sent, since the client advances its watermark only from that response's
   operator voucher. It SHOULD store the response atomically with completing
-  the operation, and SHOULD keep it until the next server-mode operation on the
-  channel completes. If the original request is still running, the server
+  the operation. Retention is a SHOULD so that operators can bound storage; the
+  default is to keep the response until the next server-mode operation on the
+  channel completes, which covers a client that resends before sending anything
+  else on the channel. A server that discards it sooner leaves a later resend
+  to Phase 3, where it is rejected and the original outcome stays unknown to
+  the client. If the original request is still running, the server
   SHOULD answer the resend with the original's response once it completes, or
   with a retryable error other than `duplicate_settlement`. A resend that gets
   no stored response goes through Phase 3 like any other request. Its
@@ -1913,13 +1917,20 @@ Standard x402 codes apply. The facilitator reports verification failures in
   single-use request identifier, amount ceiling, and expiry under a versioned
   domain. It MUST NOT be logged or sent to any origin other than the authorized
   resource server. The request binding limits a stolen proof to one bounded
-  request, while `expiresAt` limits how long it can be presented. An identical
-  resend after `expiresAt` can still retrieve a response the server stored for
-  the proof (Phase 5), for as long as the server keeps it; the request is never
-  executed or charged again. Servers MAY additionally require an
+  request, while `expiresAt` limits how long it can be presented, except for
+  retrieving a stored response (below). Servers MAY additionally require an
   authenticated session, audience binding, or a per-request payer signature.
   Proof expiry does not remove the operator's onchain signing authority;
   closing the channel is the only protocol-level revocation mechanism.
+- **Stored-response retrieval.** A response stored under the payment
+  identifier extension (Phase 5) is returned only to an identical
+  `PaymentPayload`, so retrieving it takes the payer's signed proof; the
+  payment identifier alone is not enough. After `expiresAt`, the proof can
+  still retrieve that response, settlement data included, for as long as the
+  server keeps it, but the request is never executed or charged again. A leaked
+  proof therefore exposes one stored response until the server discards it.
+  Servers that store responses SHOULD protect them as they protect the proof,
+  and MAY require the authenticated session above for retrieval.
 - **No redirection.** `distribution_hash` is fixed at `open` and re-checked at
   `distribute`; the derived distribution sends settled funds to `payTo`.
 - **Authenticated vouchers.** The wire `extra.feePayer` address is recorded as
