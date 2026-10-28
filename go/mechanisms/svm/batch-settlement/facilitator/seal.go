@@ -51,6 +51,7 @@ type SealDependencies struct {
 	CompleteOrPending        func(context.Context, string, string, string, string) (*x402.SettleResponse, error)
 	NowSeconds               func() int64
 	SettlementCache          interface{ IsDuplicate(string) bool }
+	OnDistributionConfirmed  OnDistributionConfirmed
 	// PrepareRefund, when set, replaces PrepareRefund on the refund settle path.
 	PrepareRefund func(context.Context, batchsettlement.BatchRefundPayload, types.PaymentRequirements, RefundLimits, any) (PreparedRefund, error)
 }
@@ -104,7 +105,7 @@ func SettleSeal(
 		if err := json.Unmarshal([]byte(previous), &stored); err != nil {
 			return nil, err
 		}
-		return &stored, nil
+		return completeSealDistribution(ctx, deps.PendingStore, deps.OnDistributionConfirmed, key, &stored, requirements, intent), nil
 	}
 	channel, err := deps.FetchChannel(ctx, network, channelID)
 	if err != nil {
@@ -199,7 +200,7 @@ func SettleSeal(
 	if err := deps.PendingStore.Set(ctx, key+":result", string(encoded)); err != nil {
 		return nil, err
 	}
-	return sealed, nil
+	return completeSealDistribution(ctx, deps.PendingStore, deps.OnDistributionConfirmed, key, sealed, requirements, intent), nil
 }
 
 // PrepareRefund validates a refund and picks the cooperative close or the payer-signed request_close.
@@ -330,6 +331,84 @@ func SettleCooperativeRefund(
 		CloseAuthorization: payload.CloseAuthorization,
 	}
 	return SettleSeal(ctx, deps, seal, requirements, CloseIntentRefund, facilitatorContext)
+}
+
+func notifySealDistribution(
+	ctx context.Context,
+	store PendingSettlementStore,
+	hook OnDistributionConfirmed,
+	key string,
+	response *x402.SettleResponse,
+	requirements types.PaymentRequirements,
+	intent CloseIntent,
+) error {
+	if hook == nil {
+		return nil
+	}
+	recorded, ok, err := store.Get(ctx, key+":recorded")
+	if err != nil {
+		return err
+	}
+	if ok && recorded != "" {
+		return nil
+	}
+	merchant, found := response.Extra[extraPaidToReceiver].(string)
+	switch intent {
+	case CloseIntentSeal:
+		if !found {
+			merchant = response.Amount
+		}
+	case CloseIntentRefund:
+		if !found {
+			return fmt.Errorf("durable refund response is missing extra.paidToReceiver")
+		}
+	default:
+		return fmt.Errorf("unknown close intent %q", intent)
+	}
+	view := *response
+	view.Amount = merchant
+	if err := hook(ctx, &view, requirements); err != nil {
+		return err
+	}
+	return store.Set(ctx, key+":recorded", "1")
+}
+
+func completeSealDistribution(
+	ctx context.Context,
+	store PendingSettlementStore,
+	hook OnDistributionConfirmed,
+	key string,
+	response *x402.SettleResponse,
+	requirements types.PaymentRequirements,
+	intent CloseIntent,
+) *x402.SettleResponse {
+	passes := passesFor(store)
+	passes.mu.Lock()
+	if existing := passes.inflight[key]; existing != nil {
+		passes.mu.Unlock()
+		<-existing.done
+		return existing.response
+	}
+	pass := &distributionPass{done: make(chan struct{})}
+	passes.inflight[key] = pass
+	passes.mu.Unlock()
+	defer func() {
+		if pass.response == nil {
+			pass.response = SettlementPending(response.Network, response.Payer, response.Transaction, "seal payout accounting stopped")
+		}
+		close(pass.done)
+		passes.mu.Lock()
+		if passes.inflight[key] == pass {
+			delete(passes.inflight, key)
+		}
+		passes.mu.Unlock()
+	}()
+	if err := notifySealDistribution(ctx, store, hook, key, response, requirements, intent); err != nil {
+		pass.response = SettlementPending(response.Network, response.Payer, response.Transaction, err.Error())
+		return pass.response
+	}
+	pass.response = response
+	return response
 }
 
 func verifyCloseVoucher(voucher batchsettlement.BatchVoucher, config batchsettlement.BatchChannelConfig, channelID string) (uint64, error) {

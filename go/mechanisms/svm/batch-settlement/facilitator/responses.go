@@ -19,6 +19,8 @@ var (
 	transientPattern  = regexp.MustCompile(`(?i)\b429\b|\b503\b|too many requests`)
 )
 
+const extraPaidToReceiver = "paidToReceiver"
+
 // PendingSignatureOf returns the signature carried by an error that means the
 // broadcast's outcome is unknown.
 func PendingSignatureOf(err error) (string, bool) {
@@ -116,18 +118,20 @@ func RecoveredRefundResponse(channelID, payer string, network x402.Network, tran
 
 // SealResponse is a successful seal: the final voucher was applied and the sealed distribute paid the receiver.
 func SealResponse(channelID, payer string, network x402.Network, transaction string, paidToReceiver, deposit, finalSettled uint64) *x402.SettleResponse {
+	credit := strconv.FormatUint(paidToReceiver, 10)
 	return &x402.SettleResponse{
 		Success:     true,
 		Payer:       payer,
 		Transaction: transaction,
 		Network:     network,
-		Amount:      strconv.FormatUint(paidToReceiver, 10),
+		Amount:      credit,
 		Extra: map[string]any{
 			"channelState": batchsettlement.BatchChannelState{
 				ChannelID:    channelID,
 				Balance:      strconv.FormatUint(deposit, 10),
 				TotalClaimed: strconv.FormatUint(finalSettled, 10),
 			},
+			extraPaidToReceiver: credit,
 		},
 	}
 }

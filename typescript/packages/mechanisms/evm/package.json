@@ -6,7 +6,7 @@
   "types": "./dist/cjs/index.d.ts",
   "scripts": {
     "start": "tsx --env-file=.env index.ts",
-    "build": "tsup && node ../../../scripts/mirror-cjs-dts.mjs",
+    "build": "NODE_OPTIONS=--max-old-space-size=4096 tsup && node ../../../scripts/mirror-cjs-dts.mjs",
     "test": "vitest run --coverage",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "setup:smart-accounts": "tsx scripts/setup-smart-accounts.ts",
@@ -245,6 +245,7 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "NOTICE"
   ]
 }

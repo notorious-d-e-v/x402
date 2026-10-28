@@ -103,6 +103,7 @@ from .schemas import (
     X402_VERSION,
     # Hooks
     AbortResult,
+    AfterSettleAbortError,
     AssetAmount,
     CompletedSettlement,
     # Errors
@@ -277,6 +278,7 @@ __all__ = [
     "SettleError",
     "SchemeNotFoundError",
     "NoMatchingRequirementsError",
+    "AfterSettleAbortError",
     "PaymentAbortedError",
     "FacilitatorCapabilityError",
     # Types - Helpers

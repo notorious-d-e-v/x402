@@ -1,7 +1,11 @@
 """Tests for SVM signer implementations."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
+from solana.rpc.commitment import Confirmed
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 
 from x402.mechanisms.svm import SOLANA_DEVNET_CAIP2
 from x402.mechanisms.svm.signers import FacilitatorKeypairSigner, KeypairSigner
@@ -196,6 +200,57 @@ class TestFacilitatorKeypairSigner:
         assert callable(signer.simulate_transaction)
         assert callable(signer.send_transaction)
         assert callable(signer.confirm_transaction)
+
+    def test_get_account_info_returns_none_when_account_is_missing(self):
+        signer = FacilitatorKeypairSigner(Keypair())
+        address = str(Keypair().pubkey())
+        client = MagicMock()
+        client.get_account_info.return_value = MagicMock(value=None)
+
+        with patch.object(signer, "_get_client", return_value=client) as get_client:
+            assert signer.get_account_info(address, SOLANA_DEVNET_CAIP2) is None
+
+        get_client.assert_called_once_with(SOLANA_DEVNET_CAIP2)
+        client.get_account_info.assert_called_once_with(
+            Pubkey.from_string(address),
+            commitment=Confirmed,
+        )
+
+    def test_get_account_info_returns_owner_base58(self):
+        signer = FacilitatorKeypairSigner(Keypair())
+        address = str(Keypair().pubkey())
+        owner = Keypair().pubkey()
+        account = MagicMock()
+        account.owner = owner
+        client = MagicMock()
+        client.get_account_info.return_value = MagicMock(value=account)
+
+        with patch.object(signer, "_get_client", return_value=client) as get_client:
+            assert signer.get_account_info(address, SOLANA_DEVNET_CAIP2) == str(owner)
+
+        get_client.assert_called_once_with(SOLANA_DEVNET_CAIP2)
+        client.get_account_info.assert_called_once_with(
+            Pubkey.from_string(address),
+            commitment=Confirmed,
+        )
+
+    def test_get_account_info_propagates_rpc_errors(self):
+        signer = FacilitatorKeypairSigner(Keypair())
+        address = str(Keypair().pubkey())
+        client = MagicMock()
+        client.get_account_info.side_effect = RuntimeError("rpc unavailable")
+
+        with (
+            patch.object(signer, "_get_client", return_value=client) as get_client,
+            pytest.raises(RuntimeError, match="rpc unavailable"),
+        ):
+            signer.get_account_info(address, SOLANA_DEVNET_CAIP2)
+
+        get_client.assert_called_once_with(SOLANA_DEVNET_CAIP2)
+        client.get_account_info.assert_called_once_with(
+            Pubkey.from_string(address),
+            commitment=Confirmed,
+        )
 
 
 class TestSignerProtocols:

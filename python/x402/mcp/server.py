@@ -582,8 +582,18 @@ def _create_settlement_failed_result(
         )
     if extensions:
         error_data["extensions"] = extensions
+    meta = (
+        {
+            MCP_PAYMENT_RESPONSE_META_KEY: settle_response.model_dump(
+                by_alias=True, exclude_none=True
+            )
+        }
+        if settle_response is not None and settle_response.after_settle_aborted
+        else None
+    )
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(error_data))],
         structuredContent=error_data,
         isError=True,
+        _meta=meta,
     )

@@ -8,6 +8,7 @@ try:
     from solana.rpc.commitment import Confirmed
     from solana.rpc.types import TxOpts
     from solders.keypair import Keypair
+    from solders.pubkey import Pubkey
     from solders.signature import Signature
     from solders.transaction import VersionedTransaction
 except ImportError as e:
@@ -279,6 +280,22 @@ class FacilitatorKeypairSigner:
 
         if result.value.err:
             raise RuntimeError(f"Simulation failed: {result.value.err}")
+
+    def get_account_info(self, address: str, network: str) -> str | None:
+        """Read an account owner at confirmed commitment.
+
+        Args:
+            address: Account address (base58).
+            network: CAIP-2 network identifier.
+
+        Returns:
+            Owner base58 text, or None when the account does not exist.
+        """
+        client = self._get_client(network)
+        result = client.get_account_info(Pubkey.from_string(address), commitment=Confirmed)
+        if result.value is None:
+            return None
+        return str(result.value.owner)
 
     def send_transaction(self, tx_base64: str, network: str) -> str:
         """Send a transaction.

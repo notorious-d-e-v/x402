@@ -682,8 +682,14 @@ def _create_settlement_failed_result_sync(
 
     content_text = json.dumps(error_data)
 
+    meta = (
+        {MCP_PAYMENT_RESPONSE_META_KEY: _settle_meta_sync(settle_response)}
+        if settle_response is not None and settle_response.after_settle_aborted
+        else None
+    )
     return MCPToolResult(
         structured_content=error_data,
         content=[{"type": "text", "text": content_text}],
         is_error=True,
+        meta=meta,
     )

@@ -102,9 +102,8 @@ A tool result's `payment_made` records that a payload was submitted, including
 pending or failed settlement. It does not prove settlement. When a corrective
 retry is denied, `x402MCPClientSync` returns the earlier result with
 `payment_made=True`; the async `x402MCPClient` raises `PaymentRequiredError`.
-`payment_response` and the async client's
-`AfterPaymentContext.settle_response` contain only successful receipts after
-core response processing. Failed receipt details remain in `raw_result` and
+`payment_response` and `AfterPaymentContext.settle_response` contain only
+successful receipts after core response processing. Failed receipt details remain in `raw_result` and
 reach core response hooks for recovery.
 
 `call_tool` and `call_tool_with_payment` raise `PaymentResponseError` when core
