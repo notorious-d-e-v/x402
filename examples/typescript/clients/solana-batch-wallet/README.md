@@ -97,3 +97,9 @@ Neither installed MetaMask nor Phantom exposed `solana:signOffchainMessage`, inc
 Independent Node.js Ed25519 verification confirmed the captured signatures. Every authorization expired at Unix time 1 and used a random nonexistent channel. These tests made no payment, transaction, RPC, or facilitator calls. They establish signing behavior only; exact extension/Snap versions and full payment lifecycle compatibility still require confirmation. Wallet Standard feature versions are not extension versions.
 
 Keep `text-v1` opt-in. Native off-chain signing is a future compatibility option once wallets expose a compatible feature; sending its binary envelope through `signMessage` is not a working replacement on these installed wallets. Refunds use the matching advertised accept before signing, including when client mode is listed first or channel state is restored after a restart.
+
+## Blockrun follow-up
+
+In an [October 27 report](https://github.com/x402-foundation/x402/pull/3905#issuecomment-6436981573), Blockrun says MetaMask, Solflare, and Phantom all preserved the expired `text-v1` message bytes and passed independent Node.js Ed25519 verification, including matching the public key to the payer address. The raw captures and exact installed extension/Snap versions remain to be collected; this is reporter evidence, not a new author-run test. Backpack and funded lifecycle tests remain pending.
+
+Blockrun is building Franklin Agent, a browser AI chat application where users pay for model and tool calls with USDC. Batch channels avoid an onchain transaction for every call. The current client still signs a fresh payer authorization for each paid request; one approval covering multiple requests would require a separate session-authorization design. Readable proofs change the signed representation, not how many requests a proof authorizes.
