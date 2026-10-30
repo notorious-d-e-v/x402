@@ -7,6 +7,10 @@
 
 ## 1. Purpose
 
+For the proposed opt-in conversation-budget authorization mode and recovery via
+the existing refund flow, see the [draft supplement](scheme_batch_settlement_svm_conversation_budget.md).
+That proposal leaves legacy behavior unchanged and contains no implementation.
+
 `batch-settlement` is the high-throughput x402 scheme: a client deposits once
 into an escrow channel, then authorizes cumulative Ed25519 vouchers for
 individual requests. By default the client signs each voucher. An optional
