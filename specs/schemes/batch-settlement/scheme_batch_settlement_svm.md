@@ -1817,7 +1817,7 @@ that advertises `extra.maxIdleSecs` MAY, once an `Open` channel has seen no
 facilitator-visible lifecycle activity for that many seconds, close it at the
 current onchain `settled` watermark with `settle_and_seal` (`has_voucher =
 0`), then `distribute` and `reclaim`. Facilitator-visible activity is any
-`deposit`, `claim` or `settle` the facilitator processed for the channel;
+`deposit`, `budget-deposit`, `claim` or `settle` the facilitator processed for the channel;
 offchain voucher acceptance on the server does not reset the clock. Closing at
 the watermark forfeits every voucher the server has not claimed, so the server
 MUST treat `maxIdleSecs` as a second clock it races against, and SHOULD claim
@@ -1981,7 +1981,8 @@ Standard x402 codes apply. The facilitator reports verification failures in
 - `invalid_batch_settlement_svm_payment_flow` - `extra.paymentFlow` is present
   and is invalid for the selected authorization mode: legacy mode permits only
   `"authorization"`; `"conversation-budget-v1"` requires `"escrow"` and server
-  voucher signing. Unknown selected modes fail closed.
+  voucher signing. Unknown selected modes fail closed with
+  `invalid_batch_settlement_svm_budget_mode`.
 - `invalid_batch_settlement_svm_token_program` - `extra.tokenProgram` is not a
   supported SPL token program or does not own the selected mint.
 - `invalid_batch_settlement_svm_voucher_signature` - signature invalid or

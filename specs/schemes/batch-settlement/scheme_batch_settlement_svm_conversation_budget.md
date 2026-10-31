@@ -40,6 +40,10 @@ Proposed capability and requirement fields:
 | Same requirements extra | `paymentFlow` | MUST be `"escrow"` for budget-funded resource requests. |
 | Merchant 402 `accepts[i].extra` | `budgetOffer` | A retained, single-use offer as defined below; not authority merely because a client echoes it. |
 
+`authorizationModes` is a JSON array of case-sensitive strings. Absence or
+omission of this mode means unsupported. A malformed capability value MUST NOT
+be used to advertise budget mode.
+
 All three roles MUST support the selected mode. A client considering a list of
 accepts MUST skip modes it does not support without invalidating other supported
 accepts. It MUST NOT reinterpret an unknown mode as legacy authorization.
@@ -191,8 +195,8 @@ revocation of the operator's existing onchain authority over the deposit.
 
 `expiresAt` bounds admission; it does not guarantee that a native channel stays
 open until then. An idle close can end a zero-spend channel earlier. The idle
-gap is measured since the last facilitator-visible `deposit`, `claim` or
-`settle` activity under the parent binding; merchant resource requests do not
+gap is measured since the last facilitator-visible `deposit`/`budget-deposit`,
+`claim` or `settle` activity under the parent binding; merchant resource requests do not
 reset it. If that gap reaches `maxIdleSecs`, or its last activity time is unknown,
 the merchant MUST obtain a fresh trusted channel read before admitting work.
 An observed non-open channel cannot
