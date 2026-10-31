@@ -18,8 +18,9 @@ The key words MUST, MUST NOT, SHOULD and MAY indicate requirements as defined
 by [BCP 14](https://www.rfc-editor.org/rfc/rfc8174). This supplement defines the
 selected mode's message formats, validation and observable behavior. Storage,
 locking, SDK APIs and framework configuration are implementation choices.
-The parent binding applies except for the explicit mode-specific flow, payer
-proof, Memo and retry rules below. Core message types and the
+The parent binding applies except for the explicit mode-specific flow,
+client/facilitator payload variants, payer proof, Memo and retry rules below.
+Core message types and the
 [HTTP transport](../../transports-v2/http.md) are reused without new headers.
 
 ## 1. Scope and negotiation
@@ -143,6 +144,12 @@ The merchant retains an offer before wallet approval:
 | `maximumAmount` | Positive canonical decimal u64 atomic amount, at least the first request's quoted ceiling. |
 | `expiresAt` | Positive safe-integer Unix seconds, within the merchant's configured budget lifetime. |
 
+The audience uses origin determination and ASCII serialization from
+[RFC 6454 sections 4 and 6.2](https://www.rfc-editor.org/rfc/rfc6454#section-6.2):
+lowercase HTTPS scheme/host, ASCII IDNA A-labels, default port `443` omitted and
+no trailing slash. Opaque origins are rejected. Comparison is exact after this
+serialization; no domain-suffix or Unicode-display comparison is permitted.
+
 The offer is also bound to the route's network, asset, receiver, operator,
 sponsor, receiver authorizer and withdrawal delay. The merchant MUST retain
 these bindings and the application/request context; it MUST NOT adopt a
@@ -169,8 +176,8 @@ exactly 64 lowercase hex characters, fresh for each budget. `credentialHash` is
 lowercase hex SHA-256 of the ASCII credential string. Only the hash is public.
 The merchant stores the hash and grant; it MUST NOT persist the raw credential.
 
-Before wallet approval or disclosure of a credential, the client MUST require
-`budgetOffer.audience` to equal the canonical HTTPS origin of the resource URL
+Before approving a budget opening or disclosing its credential, the client MUST
+require `budgetOffer.audience` to equal the canonical HTTPS origin of the resource URL
 it intended to request. The URL is client-trusted input; echoed `resource.url`
 metadata does not establish that origin. The client MUST send credential-bearing
 payloads only to that origin and MUST NOT forward them across an origin-changing
@@ -183,9 +190,12 @@ operator trust and how to stop/refund. Budget expiry is distinct from the HTTP
 revocation of the operator's existing onchain authority over the deposit.
 
 `expiresAt` bounds admission; it does not guarantee that a native channel stays
-open until then. An idle close can end a zero-spend channel earlier. After an
-idle gap reaching the advertised `maxIdleSecs`, the merchant MUST obtain a fresh
-trusted channel read before admitting work. An observed non-open channel cannot
+open until then. An idle close can end a zero-spend channel earlier. The idle
+gap is measured since the last facilitator-visible `deposit`, `claim` or
+`settle` activity under the parent binding; merchant resource requests do not
+reset it. If that gap reaches `maxIdleSecs`, or its last activity time is unknown,
+the merchant MUST obtain a fresh trusted channel read before admitting work.
+An observed non-open channel cannot
 be made spendable by a still-unexpired budget.
 
 ## 3. Opening commitment and payload
@@ -202,7 +212,7 @@ order is required; hashes commit the explicit text encoding in section 3.2.
 | `budgetId` | String equal to the retained offer/grant ID. |
 | `credential`, `credentialHash` | Strings with the syntax below; the hash commits the ASCII credential string. |
 | `requestId` | Nonempty string of 1–256 UTF-8 bytes, binding one logical resource operation. |
-| `channelConfig` | The existing `ChannelConfig`, with `voucherSigner: "server"`; all fields must match the retained grant. |
+| `channelConfig` | The existing `ChannelConfig`, with `voucherSigner: "server"`; satisfy the opening bindings initially and match the activated grant on later operations. |
 | `deposit.amount` | Positive decimal u64 string equal to the approved `maximumAmount`. |
 | `deposit.transaction` | Existing Base64 native-transaction encoding, validated under section 3.2. |
 
@@ -415,6 +425,10 @@ facilitator logs, traces or transaction metadata. The facilitator's
 `budget-deposit` input contains the public fields above but no `credential`;
 the merchant constructs it from a validated public-field allowlist rather than
 forwarding the original header object or request body.
+The forwarded `paymentRequirements` MUST be the merchant-retained accept bound
+to `budget.id`, including its original `budgetOffer`. The merchant MUST set the
+sanitized `paymentPayload.accepted` to that same retained accept. It MUST NOT
+substitute newly generated requirements or forward unvalidated client extras.
 The facilitator validates the digest/native envelope, sponsors and confirms the open.
 The signed Memo commits the public hash, so the facilitator need not know its
 preimage. Only this funding variant is a facilitator budget-operation input.
@@ -485,8 +499,15 @@ spent + reserved + next request ceiling <= approved maximum
 
 Each request ID binds the channel, request fingerprint, quote, reservation and
 terminal outcome. Conflicting reuse MUST fail. Identical retries MUST NOT repeat
-work or charges: return a durable status/receipt or a
-duplicate/pending outcome. A stored application result requires application-level
+work or charges. Their payment receipts use `PAYMENT-RESPONSE`. An unresolved
+operation returns `duplicate_settlement` or
+`settlement_pending` with its known reconciliation facts; a completed operation
+returns its retained payment receipt. A terminally canceled operation returns
+`success: false`, `errorReason: "invalid_batch_settlement_svm_budget_operation_canceled"` and current
+`extra.budget`. It MUST NOT be reported as still pending. This resolves the
+logical operation; it does not authorize automatic re-execution of the original
+application action under a fresh payment ID. A stored application result requires
+application-level
 idempotency as well; a payment receipt alone cannot recreate an AI response.
 
 V1 clients MUST keep at most one logical paid operation in flight per channel,
@@ -518,6 +539,9 @@ from committing a charge or voucher. Time passage alone MUST NOT release a
 reservation or allow its operation to run again. Following downtime, the merchant
 MUST finalize overdue reservations before admitting new work or completing a
 refund. External work may continue, but cannot resurrect a canceled payment.
+Merchants SHOULD choose a handler timeout that leaves enough time to commit
+before the advertised deadline; execution finishing at the deadline does not
+create a right to charge afterward.
 
 Funding remains durable if the first handler fails after the opening confirms.
 Preserve its channel/grant and expose or reconcile the funding transaction and
@@ -590,10 +614,21 @@ The normal server-mode refund remains:
    admitted work finishes or is terminally canceled under section 4's deadline
    before the final accepted voucher is used. An unauthenticated probe MUST NOT
    stop a budget.
+   The accepted close intent and its authenticated channel/payer bindings MUST
+   be retained with the stop. Proof expiry is checked at initial acceptance;
+   later expiry MUST NOT revoke that accepted, irreversible close intent.
+   A newly submitted payer proof still requires normal expiry validation; this
+   rule authorizes continuation of the retained close, not new expired proofs.
 3. The merchant injects its stored final operator voucher and existing
    receiver-authorizer `CloseAuthorization`; it does not trust a payer-supplied
    voucher in server mode. It submits the existing enriched `refund` to its
    facilitator's `/settle`, or performs the same work locally.
+   Once reservations resolve, the merchant MUST automatically attempt and
+   reconcile this close under the existing retry rules, without requiring another
+   payer proof or client request. Any newly generated
+   receiver `CloseAuthorization` still obeys its own validity window. A fresh
+   proof on a client status retry authenticates the retry; it is not needed to
+   keep the already-authorized close progressing.
 4. The existing cooperative `settle_and_seal` plus sealed `distribute` pays the
    final accepted charges and returns the remaining escrow to the payer. Keep
    the existing receiver-binding, delegated-authorizer, simulation and retry rules.
@@ -610,11 +645,15 @@ second close. `PAYMENT-RESPONSE` uses the existing settlement fields:
 
 | Outcome | Required receipt |
 | --- | --- |
-| Admission stopped, reservations or unconfirmed close remain | `settlement_pending`, `extra.budget.status: "closing"`; no claimed refund amount. |
+| Admission stopped, reservations remain and nothing was broadcast | `success: false`, `errorReason: "duplicate_settlement"`, empty `transaction` and `amount`, `extra.budget.status: "closing"`. |
+| Close broadcast, confirmation unresolved | `success: false`, `errorReason: "settlement_pending"`, `transaction` contains the broadcast signature, empty `amount`, `extra.budget.status: "closing"`. |
 | Confirmed `request_close`, grace/distribution still pending | Existing initiation receipt: its confirmed transaction signature, empty `amount`, `extra.budget.status: "closing"`. |
 | Confirmed final distribution | Retained terminal receipt: `transaction` identifies the confirmed distribution (the cooperative close transaction when combined), `amount` is confirmed unused escrow returned, and `extra.budget.status` is `"closed"`. |
 
 These receipts retain the channel snapshot and applicable budget accounting.
+A known close/distribution broadcast signature MUST survive every pending/error
+response and be reconciled before rebroadcast; it MUST NOT be replaced with an
+empty transaction.
 A terminal retry returns the same confirmed transaction and refund amount;
 reporting a known outcome does not rebroadcast or charge again. If confirmation
 cannot be established, return pending rather than inventing a terminal receipt.
@@ -700,6 +739,27 @@ Proposed mode-specific invalid reasons are `invalid_batch_settlement_svm_budget_
 `invalid_batch_settlement_svm_budget_offer`, `invalid_batch_settlement_svm_budget_credential`,
 `invalid_batch_settlement_svm_budget_expired`, `invalid_batch_settlement_svm_budget_stopped`,
 `invalid_batch_settlement_svm_budget_exhausted`, and `invalid_batch_settlement_svm_budget_state`.
+`invalid_batch_settlement_svm_budget_operation_canceled` identifies a terminally
+canceled resource operation. For mode-specific failures use the following
+mapping; cryptographic/native-transaction and other existing failures retain
+the parent codes.
+
+| Condition | Reason suffix after `invalid_batch_settlement_svm_` |
+| --- | --- |
+| Unknown selected mode, legacy paid payload on a budget channel, or refund under the budget escrow accept | `budget_mode` |
+| Selected budget mode with an invalid flow/signer combination | `payment_flow` |
+| Invalid/changed/unknown opening offer, audience or offer-field syntax | `budget_offer` |
+| Merchant grant lookup, credential syntax/hash or bound channel/configuration mismatch | `budget_credential` |
+| New spending after grant expiry | `budget_expired` |
+| New spending against stopped, closing or closed admission | `budget_stopped` |
+| New reservation exceeds the approved cap | `budget_exhausted` |
+| Missing/inconsistent accounting or funding state cannot safely establish authorization | `budget_state` |
+| Retry of a terminally canceled operation | `budget_operation_canceled` |
+
+Once an operation is identified and authenticated, its retained terminal outcome
+takes precedence over new-work expiry/Stop checks; returning that outcome grants
+no new work. A client rejecting an offer before submission uses the same local
+reason without sending a payment request.
 Keep existing invalid transaction/refund/replay reasons and `settlement_pending`
 semantics; no error implies that a broadcast failed or funds were refunded.
 
@@ -725,12 +785,15 @@ Before implementation is enabled, require conformance coverage for:
 | Credential lost, stopped or expired budget | Existing payer-authenticated refund works without the bearer. |
 | Refund while stolen credential submits concurrent work | Durably stop before checking busy; no later admission, including on retries. |
 | Orphaned reservation or late worker after cancellation | Reconcile by deadline; terminal cancellation prevents every late charge. |
+| Retry after terminal operation cancellation | Fixed canceled reason and budget state; no pending loop or automatic second work. |
 | Refund presented under budget escrow accept | Reject without funding; select the advertised conventional refund accept. |
 | Both refund/budget accept orders, original settings changed | Select original channel's conventional accept independent of position. |
 | Legacy top-up/paid proof against a budget channel | Reject without growing escrow, spending, or restoring admission. |
 | Credential-only Stop/reactivate request | Reject; payer refund or merchant administrative Stop is required. |
 | Partial or ambiguous close/forced close | Correct pending/grace status; never claim an unconfirmed refund. |
 | Fresh payer-authenticated retry after confirmed close | Return retained transaction/refund receipt without requiring an open account. |
+| Refund proof expires after accepted Stop | Merchant completes the retained close without another payer prompt. |
+| Pending close before/after broadcast | Empty transaction only before broadcast; retain its signature thereafter. |
 | Reopen after refund | Fresh explicit approval/credential; old ledger and application outcomes remain consumed. |
 | External and self-facilitating merchants | Same browser contract; no direct facilitator calls. |
 | Ledger loss/restore, idle close, late completion | Hold admission and reconcile; never reset to zero spending. |

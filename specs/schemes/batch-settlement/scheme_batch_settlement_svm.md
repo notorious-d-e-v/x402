@@ -10,8 +10,9 @@
 For the proposed opt-in conversation-budget authorization mode and recovery via
 the existing refund flow, see the [draft supplement](scheme_batch_settlement_svm_conversation_budget.md).
 For `extra.authorizationMode: "conversation-budget-v1"`, that supplement defines
-the exceptions to this binding's flow, request proof, seller Memo and retry
-rules. Other rules still apply. Absence of `authorizationMode` retains the
+the exceptions to this binding's flow, client/facilitator payload variants,
+request proof, seller Memo and retry rules. Other rules still apply. Absence of
+`authorizationMode` retains the
 behavior below. The proposal contains no implementation.
 
 `batch-settlement` is the high-throughput x402 scheme: a client deposits once
@@ -493,6 +494,13 @@ four variants. `/settle` accepts `deposit` and `refund` directly. The server
 enriches `refund` with a `CloseAuthorization` before forwarding it as
 specified in section 4.5. A `voucher` is accepted offchain by the server.
 
+The selected `conversation-budget-v1` mode replaces the paid client variants
+with the supplement's `budget-deposit` and merchant-only `budget-authorization`.
+Its public, merchant-sanitized `budget-deposit` is also accepted by facilitator
+`/verify` (read-only) and `/settle` (`open` only). `budget-authorization` MUST NOT
+be sent to or accepted by those facilitator endpoints. Refund retains its
+existing payload under the conventional authorization accept.
+
 **`deposit`** opens a channel or tops up an existing channel and authorizes the
 current request:
 
@@ -747,7 +755,10 @@ The standard x402 `POST /verify` and `POST /settle` request envelope contains
 #### `POST /verify`
 
 `paymentPayload.payload` MUST be one of the client-authored `deposit`, `voucher`,
-`authorization`, or `refund` variants in section 4.3. The facilitator validates the wire fields,
+`authorization`, or `refund` variants in section 4.3, or the public
+`budget-deposit` under the selected mode. That variant uses the supplement's
+native opening proof and validation rules instead of `BatchAuthorization`;
+verification remains read-only. The facilitator validates the wire fields,
 voucher signature, derived channel PDA, and onchain channel state and, for
 `deposit` and `refund`, the client-signed transaction. For `authorization`, and
 for a `deposit` whose `channelConfig` selects server mode, it MUST also verify
@@ -798,6 +809,7 @@ instruction it invokes:
 | Wire `payload.type` | Author | Effect | SVM program instruction |
 |---|---|---|---|
 | `deposit` | Client | Open a channel or add escrow. | `open` / `top_up` |
+| `budget-deposit` | Client, merchant-sanitized | Selected `conversation-budget-v1` mode only: fund the dedicated approved budget under the supplement's opening/Memo rules. | `open` only |
 | `voucher` | Client | Accept an offchain authorization; no funds move. | None |
 | `authorization` | Client | Ask the operator to accept and sign the next cumulative voucher; no funds move. | None |
 | `claim` | Server | Advance accounting; no funds move to the receiver. | `settle` |
