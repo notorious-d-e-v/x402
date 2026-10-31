@@ -1082,28 +1082,69 @@ async def test_aborted_execution_preserves_deposit_and_cancel_receipts(kind, fai
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["fast-async", "fast-sync"])
-@pytest.mark.parametrize("hook", ["on_before_execution", "on_after_execution"])
-async def test_fastmcp_invalid_metering_preserves_unknown_cancellation(kind, hook):
+@pytest.mark.parametrize(
+    ("kind", "failure"),
+    [
+        (kind, failure)
+        for kind in ("fast-async", "fast-sync", "async", "sync")
+        for failure in (
+            "on_before_execution",
+            "on_after_execution",
+            "handler_failed",
+            "handler_threw",
+        )
+        # Generic wrappers re-raise when the handler itself throws and nothing settled upfront.
+        if kind.startswith("fast") or failure != "handler_threw"
+    ],
+)
+async def test_unknown_cancellation_returns_error_without_new_offer(kind, failure):
+    from mcp.types import CallToolResult, TextContent
     from x402.mcp.types import PaymentWrapperHooks
+    from x402.mcp.utils import (
+        convert_mcp_result,
+        extract_payment_required_from_result,
+        extract_payment_response_from_result,
+    )
 
     server = _generic_server(kind)
     dispatcher = server.create_payment_cancellation_dispatcher.return_value
-    cancel = dispatcher.cancel if kind == "fast-async" else dispatcher.cancel_sync
-    cause = TimeoutError("cancellation outcome unknown")
-    cancel.side_effect = cause
+    cancel = dispatcher.cancel if kind in ("fast-async", "async") else dispatcher.cancel_sync
+    cancel.side_effect = TimeoutError("cancellation outcome unknown")
 
     def meter(context):
         context.payment_requirements.amount = "1001"
         return True
 
-    handler = Mock(return_value="ok")
-    with pytest.raises(TimeoutError) as raised:
-        await _run_generic_wrapper(
-            kind, server, _cash_requirements(), handler, PaymentWrapperHooks(**{hook: meter})
+    hooks = PaymentWrapperHooks(**{failure: meter}) if failure.startswith("on_") else None
+    if failure == "handler_failed":
+        failed = (
+            CallToolResult(content=[TextContent(type="text", text="tool failed")], isError=True)
+            if kind.startswith("fast")
+            else {"content": [{"type": "text", "text": "tool failed"}], "isError": True}
         )
-    assert raised.value is cause
-    assert handler.call_count == (hook == "on_after_execution")
+        handler = Mock(return_value=failed)
+    elif failure == "handler_threw":
+        handler = Mock(side_effect=RuntimeError("tool failed"))
+    else:
+        handler = Mock(return_value="ok")
+
+    result = convert_mcp_result(
+        await _run_generic_wrapper(kind, server, _cash_requirements(), handler, hooks)
+    )
+    texts = [
+        item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+        for item in result.content
+    ]
+    assert result.is_error
+    assert "Payment cancellation outcome unknown" in texts
+    if failure.startswith("on_"):
+        assert "Payment metering failed" in texts
+    else:
+        assert any("tool failed" in (text or "") for text in texts)
+    # The authorization may still be open: no new offer and no receipt.
+    assert extract_payment_required_from_result(result) is None
+    assert extract_payment_response_from_result(result) is None
+    assert handler.call_count == (failure != "on_before_execution")
     server.settle_payment.assert_not_called()
     cancel.assert_called_once()
 

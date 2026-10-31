@@ -330,10 +330,8 @@ def _process_paid_tool_call_sync(
                     cancellation_completed = True
         except Exception:
             cancel_settlement = None
-            if before_handler_settlement is None:
-                raise
-            # Upfront payment is still a known fact even if cancellation failed.
-            # Surface its original receipt without claiming a completed refund.
+            # Report the failure without claiming a refund or offering another
+            # payment. Any upfront receipt is still a known fact and is attached below.
             result.content.append({"type": "text", "text": "Payment cancellation outcome unknown"})
         failure_receipt = resolve_failure_path_settlement(
             cancel_settlement, before_handler_settlement, payment_payload

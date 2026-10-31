@@ -155,8 +155,8 @@ class x402MCPSession:
         if not self._auto_payment:
             return self._build_result(result, payment_made=False)
 
+        payment_payload = await self._x402_client.create_payment_payload(payment_required)
         for attempt in range(2):
-            payment_payload = await self._x402_client.create_payment_payload(payment_required)
             accepted = payment_payload.accepted
             paid_timeout = paid_read_timeout_seconds(
                 read_timeout_seconds,
@@ -194,6 +194,14 @@ class x402MCPSession:
                 and corrective is not None
                 and getattr(recovered, "recovered", False) is True
             ):
+                try:
+                    payment_payload = await self._x402_client.create_payment_payload(
+                        payment_required
+                    )
+                except Exception as error:
+                    # The first payload was already submitted; keep its result.
+                    error.mcp_result = response
+                    raise
                 continue
             break
 
@@ -508,6 +516,9 @@ class x402MCPClientSync:
                 except PaymentRequiredError:
                     # A denied corrective retry returns the submitted payment's result.
                     return response
+                except Exception as error:
+                    error.mcp_result = response
+                    raise
                 continue
 
             break

@@ -497,8 +497,12 @@ async def test_corrective_retry_reruns_every_payment_gate(gate):
     required = AsyncMock(side_effect=[None, PaymentRequiredHookResult(abort=gate == "required")])
     client = x402MCPClient(transport, payment, on_payment_requested=approval)
     client.on_before_payment(before).on_payment_required(required)
-    with pytest.raises(ValueError if gate == "before" else PaymentRequiredError):
+    with pytest.raises(ValueError if gate == "before" else PaymentRequiredError) as raised:
         await client.call_tool("paid_tool", {"input": 1})
+    # The first payload was already submitted; the error keeps its result.
+    paid = raised.value.mcp_result if gate == "before" else raised.value.result
+    assert paid.payment_made is True
+    assert paid.is_error
     assert required.call_count == 2
     assert approval.call_count == (1 if gate == "required" else 2)
     assert before.call_count == (2 if gate == "before" else 1)
@@ -526,6 +530,41 @@ def test_sync_corrective_retry_rechecks_approval():
     assert result.payment_made is True
     assert approval.call_count == 2
     payment.create_payment_payload.assert_called_once()
+    assert transport.call_tool.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["session", "sync"])
+async def test_failed_corrective_retry_keeps_paid_result_on_error(client_kind):
+    from x402.schemas.hooks import RecoveredResponseResult
+
+    result_type = _SessionResult if client_kind == "session" else _McpResult
+    mock_type = Mock if client_kind == "sync" else AsyncMock
+    transport = SimpleNamespace(
+        call_tool=mock_type(
+            side_effect=[
+                result_type(is_error=True, text=_payment_required_text()) for _ in range(3)
+            ]
+        )
+    )
+    cause = ValueError("retry refused")
+    payment = SimpleNamespace(
+        create_payment_payload=mock_type(return_value=_payload()),
+        handle_payment_response=mock_type(return_value=RecoveredResponseResult()),
+    )
+    if client_kind == "session":
+        payment.create_payment_payload.side_effect = [_payload(), cause]
+        client = x402MCPSession(transport, payment)
+    else:
+        client = x402MCPClientSync(transport, payment)
+        client.on_before_payment(Mock(side_effect=[None, cause]))
+    with pytest.raises(ValueError) as raised:
+        outcome = client.call_tool("paid_tool", {})
+        if client_kind != "sync":
+            await outcome
+    assert raised.value is cause
+    assert raised.value.mcp_result.payment_made is True
+    assert raised.value.mcp_result.is_error
     assert transport.call_tool.call_count == 2
 
 

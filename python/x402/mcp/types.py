@@ -366,19 +366,26 @@ DynamicPrice = Callable[[MCPToolContext], Price]
 
 
 class PaymentRequiredError(Exception):
-    """Error indicating payment is required."""
+    """Error indicating payment is required.
+
+    ``result`` is set when a payload was already submitted, for example when a
+    corrective retry is refused; it carries that paid attempt's tool result.
+    """
 
     def __init__(
         self,
         message: str,
         payment_required: Any | None = None,  # PaymentRequired
+        result: Any | None = None,  # MCPToolCallResult
     ):
         """Initialize payment required error.
 
         Args:
             message: Error message
             payment_required: Optional payment required response
+            result: Tool result of an already submitted payment, if any
         """
         super().__init__(message)
         self.code = MCP_PAYMENT_REQUIRED_CODE
         self.payment_required = payment_required
+        self.result = result

@@ -93,18 +93,24 @@ x402_mcp = create_x402_mcp_client_from_config(
 
 Corrective payment retries require explicit recovery from the core payment
 response hook and are limited to one retry. Like the Python HTTP client, MCP
-reruns approval and signs the original approved terms; corrective terms are
-provided to the core hook for state reconciliation, not substituted into the
-next payment. Exact and upto payments are never retried solely because another
-402 arrived.
+signs the original approved terms; corrective terms are provided to the core
+hook for state reconciliation, not substituted into the next payment. Unlike
+the HTTP client, `x402MCPClient` and `x402MCPClientSync` rerun approval before
+the retry: `on_payment_required` hooks, `on_payment_requested` and
+`on_before_payment` hooks. `x402MCPSession` has no approval callback and signs
+the retry whenever the core hook reports recovery. Exact and upto payments are
+never retried solely because another 402 arrived.
 
 A tool result's `payment_made` records that a payload was submitted, including
 pending or failed settlement. It does not prove settlement. When a corrective
 retry is denied, `x402MCPClientSync` returns the earlier result with
-`payment_made=True`; the async `x402MCPClient` raises `PaymentRequiredError`.
+`payment_made=True`; the async `x402MCPClient` raises `PaymentRequiredError`
+with that earlier result in `result`. If anything else stops the retry, such as
+a raising `on_before_payment` hook or payload creation, the exception keeps its
+original type and exposes the earlier result as `mcp_result`.
 `payment_response` and `AfterPaymentContext.settle_response` contain only
-successful receipts after core response processing. Failed receipt details remain in `raw_result` and
-reach core response hooks for recovery.
+successful receipts after core response processing. Failed receipt details
+remain in `raw_result` and reach core response hooks for recovery.
 
 `call_tool` and `call_tool_with_payment` raise `PaymentResponseError` when core
 receipt processing fails. Its `result` retains the paid tool output and its
@@ -184,6 +190,15 @@ uncertain settlement exceptions do not trigger cancellation. Invalid metering
 never falls back to charging the ceiling. Generic wrappers preserve completed
 upfront receipts when cancellation fails; failed cancellation receipts remain
 in the error body with deposit recovery details, never in success metadata.
+
+If cancellation itself fails after a metering failure or a failed tool result,
+the outcome is unknown and the authorization may still be open. All wrappers,
+including FastMCP, then return an error result that adds `Payment cancellation
+outcome unknown` and keeps the tool's own error output. It carries no
+payment-required offer, so clients are not invited to pay again, and only
+receipts that are already known. Cancel receipts appear only when a
+before-handler settlement exists, so FastMCP, which settles after the handler,
+never reports one.
 
 Failed `settle_on_cancel` receipts are returned in `structuredContent` and a
 text fallback. Python clients read both for recovery. The current TypeScript

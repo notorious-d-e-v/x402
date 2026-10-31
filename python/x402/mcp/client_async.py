@@ -341,7 +341,15 @@ class x402MCPClient:
                     resource=payload.resource,
                     extensions=payload.extensions,
                 )
-                payload = await self._create_approved_payment(name, args, original)
+                try:
+                    payload = await self._create_approved_payment(name, args, original)
+                except PaymentRequiredError as error:
+                    # The first payload was already submitted; keep its result.
+                    error.result = response
+                    raise
+                except Exception as error:
+                    error.mcp_result = response
+                    raise
                 continue
 
             break
